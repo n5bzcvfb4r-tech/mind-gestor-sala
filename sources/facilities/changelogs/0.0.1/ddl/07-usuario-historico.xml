@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-07-01" author="MIND">
+        <comment>Historico inmutable de rol y de estado de cuenta (ARC-116): traza append-only con actor y fecha</comment>
+        <!--
+            Las columnas FISICAS de escritura son las del DoD de TSK-050 (change_type,
+            previous_role_code, new_role_code, previous_status, new_status): desdoblan el valor
+            anterior y el nuevo para poder declarar FK reales contra cat_rol, cosa imposible con una
+            unica columna de texto.
+
+            event_type, previous_value y new_value son columnas VIRTUALES de solo lectura que
+            publican los nombres del inventario T.5 ARC-116 sobre esas mismas columnas fisicas;
+            misma tecnica que usuario.is_active. Oracle responde ORA-54013 si alguien intenta
+            escribirlas.
+
+            Semantica temporal (T.5: valid_to es el "cierre de la asignacion de rol ANTERIOR"): en
+            una fila de cambio de rol, valid_to marca el instante en que se cierra la asignacion de
+            previous_role_code y valid_from el instante en que se abre la de new_role_code; ambos
+            coinciden, porque ocurren en el mismo instante. La fila de alta no cierra ninguna
+            asignacion previa: valid_to va nulo.
+
+            changed_at usa DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la misma marca naive en UTC que
+            usuario.created_at, convencion del proyecto para toda marca de auditoria.
+        -->
+        <sql>CREATE TABLE usuario_historico (
+    history_id         NUMBER GENERATED ALWAYS AS IDENTITY,
+    user_id            NUMBER NOT NULL,
+    change_type        VARCHAR2(20 CHAR) NOT NULL,
+    previous_role_code VARCHAR2(32 CHAR),
+    new_role_code      VARCHAR2(32 CHAR),
+    previous_status    VARCHAR2(10 CHAR),
+    new_status         VARCHAR2(10 CHAR),
+    reason_code        VARCHAR2(30 CHAR),
+    note               VARCHAR2(500 CHAR),
+    valid_from         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    valid_to           TIMESTAMP(6),
+    changed_by         NUMBER NOT NULL,
+    changed_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    event_type         GENERATED ALWAYS AS (CAST(change_type AS VARCHAR2(20 CHAR))) VIRTUAL,
+    previous_value     GENERATED ALWAYS AS (COALESCE(previous_role_code, previous_status)) VIRTUAL,
+    new_value          GENERATED ALWAYS AS (COALESCE(new_role_code, new_status)) VIRTUAL,
+    CONSTRAINT pk_usuario_historico PRIMARY KEY (history_id),
+    CONSTRAINT fk_usuario_hist_user FOREIGN KEY (user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_hist_changed_by FOREIGN KEY (changed_by) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_hist_prev_role FOREIGN KEY (previous_role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_usuario_hist_new_role FOREIGN KEY (new_role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_usuario_hist_reason FOREIGN KEY (reason_code) REFERENCES cat_motivo_desactivacion (reason_code)
+)</sql>
+        <rollback>
+            <dropTable tableName="usuario_historico"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-02" author="MIND">
+        <comment>Reglas de coherencia del historico: enumerados, valor anterior distinto del nuevo y motivo de baja</comment>
+        <!--
+            ck_usuario_hist_coherencia es la que materializa "previous_* solo nulo en la entrada de
+            alta" en su vertiente de FORMA: una fila sin valor anterior no cierra nada y por eso
+            lleva valid_to nulo. La UNICIDAD de esa entrada de alta no se puede expresar con una
+            CHECK y la impone el indice ux_usuario_hist_alta del changeset 07-03.
+
+            ck_usuario_hist_motivo: reason_code es obligatorio al desactivar y vacio tanto en la
+            reactivacion como en los cambios de rol, segun T.5 ARC-116.
+        -->
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_change_type CHECK (change_type IN ('ROL','ESTADO'))</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_status_enum CHECK (
+    (previous_status IS NULL OR previous_status IN ('ACTIVO','INACTIVO'))
+AND (new_status IS NULL OR new_status IN ('ACTIVO','INACTIVO'))
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_coherencia CHECK (
+    (change_type = 'ROL'
+        AND new_role_code IS NOT NULL
+        AND previous_status IS NULL
+        AND new_status IS NULL
+        AND reason_code IS NULL
+        AND ((previous_role_code IS NULL AND valid_to IS NULL)
+          OR (previous_role_code IS NOT NULL AND valid_to = valid_from)))
+ OR (change_type = 'ESTADO'
+        AND new_status IS NOT NULL
+        AND previous_role_code IS NULL
+        AND new_role_code IS NULL)
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_valor_distinto CHECK (
+    (previous_role_code IS NULL OR previous_role_code &lt;&gt; new_role_code)
+AND (previous_status IS NULL OR previous_status &lt;&gt; new_status)
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_motivo CHECK (
+    (new_status = 'INACTIVO' AND reason_code IS NOT NULL)
+ OR (new_status = 'ACTIVO' AND reason_code IS NULL)
+ OR (change_type = 'ROL' AND reason_code IS NULL)
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_motivo</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_valor_distinto</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_coherencia</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_status_enum</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_change_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-03" author="MIND">
+        <comment>Invariantes de unicidad: una sola entrada de alta por usuario y una sola asignacion de rol vigente</comment>
+        <!--
+            Son indices unicos FUNCIONALES sobre expresiones CASE, misma tecnica que
+            ux_configuracion_smtp_una_activa: la expresion vale NULL en las filas que no interesan y
+            Oracle no las indexa, de modo que la unicidad solo aplica al subconjunto relevante.
+
+            ux_usuario_hist_alta deja pasar una unica fila por usuario sin valor anterior, que es por
+            definicion la entrada de alta.
+
+            ux_usuario_hist_rol_sin_cierre deja pasar una unica fila de rol por usuario que NO
+            cierra una asignacion anterior (valid_to nulo), que es de nuevo la de alta. Como el resto
+            de filas de rol cierran la anterior en el mismo instante en que abren la nueva
+            (valid_to = valid_from, impuesto por ck_usuario_hist_coherencia), la cadena de
+            asignaciones queda contigua y sin huecos: es IMPOSIBLE que dos asignaciones de rol esten
+            vigentes a la vez (T.5 ARC-116, REQ-005 RN-02). La consulta de solapamiento del changeset
+            ddl-0.0.1-07-06 lo demuestra devolviendo 0 filas.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_usuario_hist_alta ON usuario_historico (CASE WHEN previous_role_code IS NULL AND previous_status IS NULL THEN user_id END)</sql>
+        <sql>CREATE UNIQUE INDEX ux_usuario_hist_rol_sin_cierre ON usuario_historico (CASE WHEN change_type = 'ROL' AND valid_to IS NULL THEN user_id END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_usuario_hist_rol_sin_cierre</sql>
+            <sql>DROP INDEX ux_usuario_hist_alta</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-04" author="MIND">
+        <comment>Indice de la consulta del historico: por usuario y orden cronologico descendente</comment>
+        <!--
+            Sirve a REQ-008 y REQ-085, que leen el historico de un usuario ordenado por changed_at
+            descendente y paginado: el indice cubre a la vez el filtro por user_id y el orden, por lo
+            que la paginacion no necesita ordenacion adicional.
+        -->
+        <sql>CREATE INDEX ix_usuario_hist_user_changed_at ON usuario_historico (user_id, changed_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_usuario_hist_user_changed_at</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-05" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad del historico (REQ-015, REQ-065, REQ-077): UPDATE y DELETE rechazados con ORA-20001</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW): se dispara una vez por sentencia y rechaza
+            el UPDATE o el DELETE incluso cuando no afecta a ninguna fila, de modo que no hay forma
+            de alterar ni de borrar una entrada ya escrita.
+
+            La entrada solo admite INSERT. La retencion de 2 anios (REQ-015) se apoya en esta
+            garantia.
+
+            El texto del error es exactamente el que exige el DoD de TSK-050.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_usuario_historico_inmutable
+BEFORE UPDATE OR DELETE ON usuario_historico
+BEGIN
+    RAISE_APPLICATION_ERROR(-20001, 'El histórico es inmutable');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_usuario_historico_inmutable</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-06" author="MIND" runAlways="true">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0"><![CDATA[SELECT COUNT(*)
+  FROM (SELECT user_id,
+               valid_from AS vigente_desde,
+               LEAD(valid_to) OVER (PARTITION BY user_id ORDER BY valid_from, history_id) AS vigente_hasta
+          FROM usuario_historico
+         WHERE change_type = 'ROL') a
+  JOIN (SELECT user_id,
+               valid_from AS vigente_desde,
+               LEAD(valid_to) OVER (PARTITION BY user_id ORDER BY valid_from, history_id) AS vigente_hasta
+          FROM usuario_historico
+         WHERE change_type = 'ROL') b
+    ON b.user_id = a.user_id
+   AND b.vigente_desde > a.vigente_desde
+   AND (a.vigente_hasta IS NULL OR a.vigente_hasta > b.vigente_desde)]]></sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-005 RN-02: la consulta de solapamiento de asignaciones de rol devuelve 0 filas</comment>
+        <!--
+            Esta es la "consulta de solapamiento" que exige el DoD. Reconstruye con LEAD el intervalo
+            de vigencia de cada asignacion de rol: una fila abre la asignacion de su new_role_code en
+            valid_from y la cierra el valid_to de la SIGUIENTE fila de rol del mismo usuario
+            (semantica T.5: valid_to cierra la asignacion ANTERIOR).
+
+            Cuenta los pares de asignaciones del mismo usuario que se pisan: una que empieza antes y
+            sigue abierta, o que termina despues de que empiece la siguiente. Debe devolver 0
+            siempre.
+
+            Se declara con runAlways="true" y preCondition onFail="HALT" para que sea una GUARDIA
+            PERMANENTE de verdad: la consulta se reevalua en CADA despliegue, no solo en el primero,
+            de modo que si una carga futura introdujese un solapamiento el despliegue se detiene. Sobre la tabla recien
+            creada y vacia el resultado es 0 de forma trivial; la demostracion con datos reales la
+            hace el oraculo de ciclo de vida.
+        -->
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-07" author="MIND">
+        <comment>Oraculo AC-ROL-05 / AC-USU-04: alta, cambio de rol, baja y reactivacion dejan 4 entradas con actor y fecha</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO que exige el DoD, y se ejecuta contra el motor Oracle
+            real durante el propio despliegue: monta el escenario completo (alta, cambio de rol, baja
+            con motivo y reactivacion), comprueba sobre esos datos todas las invariantes del
+            historico y DESHACE sus propios datos con un ROLLBACK final, de modo que no deja ni una
+            fila en la base de datos.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false"), asi que el
+            ROLLBACK de PL/SQL revierte todo lo insertado ANTES de que Liquibase o el driver
+            confirmen nada. Por eso no contiene ni una sola sentencia DDL: un DDL provocaria un
+            commit implicito y los datos del oraculo quedarian grabados.
+
+            Siembra por MERGE los dos catalogos que necesita (cat_rol y cat_motivo_desactivacion)
+            porque los changelogs dml se aplican DESPUES de los ddl y aqui todavia estan vacios. El
+            ROLLBACK tambien revierte esas semillas, de modo que las semillas reales de dml siguen
+            encontrando las tablas vacias y no chocan con nada.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_user      NUMBER;
+    v_t0        TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t1        TIMESTAMP;
+    v_t2        TIMESTAMP;
+    v_t3        TIMESTAMP;
+    v_total     NUMBER;
+    v_sin_traza NUMBER;
+    v_desorden  NUMBER;
+    v_solape    NUMBER;
+    v_alias     NUMBER;
+    v_primero   VARCHAR2(32);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    v_t1 := v_t0 + INTERVAL '1' HOUR;
+    v_t2 := v_t0 + INTERVAL '2' HOUR;
+    v_t3 := v_t0 + INTERVAL '3' HOUR;
+
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 902);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    MERGE INTO cat_motivo_desactivacion d
+    USING (SELECT 'BAJA_EMPRESA' AS reason_code FROM dual) s
+       ON (d.reason_code = s.reason_code)
+    WHEN NOT MATCHED THEN
+        INSERT (reason_code, reason_name, is_active)
+        VALUES ('BAJA_EMPRESA', 'Baja en la empresa', 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Administrador', 'oraculo.tsk050.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES ('Oraculo Empleado', 'oraculo.tsk050.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_user;
+
+    -- 1) Alta como EMPLEADO: abre la primera asignacion de rol y no cierra ninguna anterior.
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', NULL, 'EMPLEADO', v_t0, NULL, v_admin, v_t0);
+
+    -- 2) Cambio a TECNICO_MANTENIMIENTO: cierra la asignacion anterior (valid_to) en el MISMO
+    --    instante en que abre la nueva (valid_from).
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', 'EMPLEADO', 'TECNICO_MANTENIMIENTO', v_t1, v_t1, v_admin, v_t1);
+    UPDATE usuario SET role_code = 'TECNICO_MANTENIMIENTO', role_changed_at = v_t1, role_changed_by = v_admin
+     WHERE user_id = v_user;
+
+    -- 3) Desactivacion con motivo obligatorio.
+    INSERT INTO usuario_historico (user_id, change_type, previous_status, new_status, reason_code, note, valid_from, changed_by, changed_at)
+         VALUES (v_user, 'ESTADO', 'ACTIVO', 'INACTIVO', 'BAJA_EMPRESA', 'Baja del oraculo de TSK-050', v_t2, v_admin, v_t2);
+    UPDATE usuario SET status = 'INACTIVO', deactivated_at = v_t2, deactivated_by = v_admin,
+                       deactivation_reason_code = 'BAJA_EMPRESA'
+     WHERE user_id = v_user;
+
+    -- 4) Reactivacion: sin motivo, el histórico de la baja permanece.
+    INSERT INTO usuario_historico (user_id, change_type, previous_status, new_status, valid_from, changed_by, changed_at)
+         VALUES (v_user, 'ESTADO', 'INACTIVO', 'ACTIVO', v_t3, v_admin, v_t3);
+    UPDATE usuario SET status = 'ACTIVO', deactivated_at = NULL, deactivated_by = NULL,
+                       deactivation_reason_code = NULL
+     WHERE user_id = v_user;
+
+    SELECT COUNT(*) INTO v_total FROM usuario_historico WHERE user_id = v_user;
+    IF v_total <> 4 THEN
+        RAISE_APPLICATION_ERROR(-20900, 'ORACULO AC-ROL-05: se esperaban 4 entradas de historico y hay ' || v_total);
+    END IF;
+
+    SELECT COUNT(*) INTO v_sin_traza FROM usuario_historico
+     WHERE user_id = v_user AND (changed_by IS NULL OR changed_at IS NULL);
+    IF v_sin_traza <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20901, 'ORACULO AC-ROL-05: hay ' || v_sin_traza || ' entradas sin actor o sin fecha');
+    END IF;
+
+    SELECT COUNT(*) INTO v_desorden FROM (
+        SELECT changed_at,
+               LAG(changed_at) OVER (ORDER BY changed_at DESC, history_id DESC) AS mas_reciente
+          FROM usuario_historico
+         WHERE user_id = v_user)
+     WHERE mas_reciente IS NOT NULL AND mas_reciente <= changed_at;
+    IF v_desorden <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20902, 'ORACULO AC-USU-04: el historico no es ordenable por changed_at descendente');
+    END IF;
+
+    SELECT new_value INTO v_primero FROM (
+        SELECT new_value FROM usuario_historico
+         WHERE user_id = v_user
+         ORDER BY changed_at DESC, history_id DESC)
+     WHERE ROWNUM = 1;
+    IF v_primero <> 'ACTIVO' THEN
+        RAISE_APPLICATION_ERROR(-20903, 'ORACULO AC-USU-04: la entrada mas reciente deberia ser la reactivacion y es ' || v_primero);
+    END IF;
+
+    SELECT COUNT(*) INTO v_alias FROM usuario_historico
+     WHERE user_id = v_user
+       AND (event_type <> change_type
+         OR NVL(new_value, '~') <> NVL(COALESCE(new_role_code, new_status), '~')
+         OR NVL(previous_value, '~') <> NVL(COALESCE(previous_role_code, previous_status), '~'));
+    IF v_alias <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20904, 'ORACULO T.5 ARC-116: las columnas virtuales no reflejan las fisicas en ' || v_alias || ' entradas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_solape
+      FROM (SELECT user_id,
+                   valid_from AS vigente_desde,
+                   LEAD(valid_to) OVER (PARTITION BY user_id ORDER BY valid_from, history_id) AS vigente_hasta
+              FROM usuario_historico
+             WHERE change_type = 'ROL') a
+      JOIN (SELECT user_id,
+                   valid_from AS vigente_desde,
+                   LEAD(valid_to) OVER (PARTITION BY user_id ORDER BY valid_from, history_id) AS vigente_hasta
+              FROM usuario_historico
+             WHERE change_type = 'ROL') b
+        ON b.user_id = a.user_id
+       AND b.vigente_desde > a.vigente_desde
+       AND (a.vigente_hasta IS NULL OR a.vigente_hasta > b.vigente_desde);
+    IF v_solape <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20905, 'ORACULO REQ-005 RN-02: hay ' || v_solape || ' solapamientos de asignacion de rol');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-08" author="MIND">
+        <comment>Oraculo REQ-015 / REQ-077: UPDATE y DELETE sobre una entrada devuelven ORA-20001 y la dejan identica</comment>
+        <!--
+            Comprueba contra el motor real las dos mitades de la inmutabilidad que exige el DoD: que
+            el UPDATE y el DELETE son rechazados con ORA-20001, y que tras ambos intentos la fila
+            sigue siendo identica byte a byte.
+
+            La identidad se verifica sobre una instantanea textual de TODAS las columnas de la
+            entrada y sobre su huella SHA-256, antes y despues de los intentos.
+
+            Oracle hace rollback a nivel de sentencia cuando el trigger lanza el error, por lo que
+            los intentos fallidos no tumban los datos ya insertados por el propio oraculo.
+
+            El bloque deshace sus datos con un ROLLBACK final y no deja ninguna fila.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin          NUMBER;
+    v_user           NUMBER;
+    v_hist           NUMBER;
+    v_t0             TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_antes          VARCHAR2(4000);
+    v_despues        VARCHAR2(4000);
+    v_sqlcode        NUMBER;
+    v_filas          NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    FUNCTION instantanea(p_history_id NUMBER) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT history_id || '|' || user_id || '|' || change_type || '|' ||
+               NVL(previous_role_code, '~') || '|' || NVL(new_role_code, '~') || '|' ||
+               NVL(previous_status, '~') || '|' || NVL(new_status, '~') || '|' ||
+               NVL(reason_code, '~') || '|' || NVL(note, '~') || '|' ||
+               TO_CHAR(valid_from, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(TO_CHAR(valid_to, 'YYYY-MM-DD HH24:MI:SS.FF6'), '~') || '|' ||
+               changed_by || '|' ||
+               TO_CHAR(changed_at, 'YYYY-MM-DD HH24:MI:SS.FF6')
+          INTO v_txt
+          FROM usuario_historico
+         WHERE history_id = p_history_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Inmutable Admin', 'oraculo.tsk050.inmutable.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES ('Oraculo Inmutable', 'oraculo.tsk050.inmutable@example.invalid', 'EMPLEADO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, note, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', NULL, 'EMPLEADO', 'Entrada de alta del oraculo', v_t0, NULL, v_admin, v_t0)
+      RETURNING history_id INTO v_hist;
+
+    v_antes := instantanea(v_hist);
+
+    BEGIN
+        UPDATE usuario_historico SET note = 'manipulado' WHERE history_id = v_hist;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20001 THEN
+        RAISE_APPLICATION_ERROR(-20910, 'ORACULO REQ-015: el UPDATE sobre usuario_historico devolvio ' || v_sqlcode || ' en lugar de ORA-20001');
+    END IF;
+
+    BEGIN
+        DELETE FROM usuario_historico WHERE history_id = v_hist;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20001 THEN
+        RAISE_APPLICATION_ERROR(-20911, 'ORACULO REQ-015: el DELETE sobre usuario_historico devolvio ' || v_sqlcode || ' en lugar de ORA-20001');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas FROM usuario_historico WHERE history_id = v_hist;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20912, 'ORACULO REQ-015: la entrada ha desaparecido tras el intento de borrado');
+    END IF;
+
+    v_despues := instantanea(v_hist);
+    IF v_antes <> v_despues
+       OR RAWTOHEX(STANDARD_HASH(v_antes, 'SHA256')) <> RAWTOHEX(STANDARD_HASH(v_despues, 'SHA256')) THEN
+        RAISE_APPLICATION_ERROR(-20913, 'ORACULO REQ-015: la entrada no es identica byte a byte tras el UPDATE y el DELETE rechazados');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-09" author="MIND">
+        <comment>Oraculo REQ-015 / REQ-065 / AC-G-07: las entradas de hace 23 meses siguen disponibles y consultables</comment>
+        <!--
+            Demuestra la retencion de 2 anios que exige el DoD: inserta una entrada fechada 23 meses
+            atras y comprueba que la consulta del historico la sigue devolviendo dentro de la ventana
+            de 24 meses, con su contenido integro.
+
+            No hay ningun proceso de purga sobre usuario_historico y el trigger de inmutabilidad
+            impide el borrado, de modo que la disponibilidad durante la ventana esta garantizada por
+            construccion; este oraculo lo verifica de forma observable.
+
+            [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+            implementa purga alguna al cumplirse los 2 anios]
+
+            El bloque deshace sus datos con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_user        NUMBER;
+    v_t23         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '23' MONTH;
+    v_en_ventana  NUMBER;
+    v_recuperada  VARCHAR2(32);
+    v_actor       NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Retencion Admin', 'oraculo.tsk050.retencion.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES ('Oraculo Retencion', 'oraculo.tsk050.retencion@example.invalid', 'EMPLEADO', 'ACTIVO', v_t23, v_admin)
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', NULL, 'EMPLEADO', v_t23, NULL, v_admin, v_t23);
+
+    SELECT COUNT(*) INTO v_en_ventana
+      FROM usuario_historico
+     WHERE user_id = v_user
+       AND changed_at >= SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_en_ventana <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20920, 'ORACULO REQ-015: la entrada de hace 23 meses no esta disponible dentro de la ventana de retencion de 2 anios');
+    END IF;
+
+    SELECT new_value, changed_by INTO v_recuperada, v_actor
+      FROM (SELECT new_value, changed_by
+              FROM usuario_historico
+             WHERE user_id = v_user
+             ORDER BY changed_at DESC, history_id DESC)
+     WHERE ROWNUM = 1;
+    IF v_recuperada <> 'EMPLEADO' OR v_actor <> v_admin THEN
+        RAISE_APPLICATION_ERROR(-20921, 'ORACULO REQ-015: la entrada de hace 23 meses no conserva integro su valor y su actor');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
