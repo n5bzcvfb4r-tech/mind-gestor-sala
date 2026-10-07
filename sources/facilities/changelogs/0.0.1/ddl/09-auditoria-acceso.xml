@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-09-01" author="MIND">
+        <comment>Registro inmutable de eventos de acceso (ARC-117): auditoria de login, bloqueo, logout y denegacion</comment>
+        <!--
+            La tabla NO declara NINGUNA columna de contrasenia ni de credencial de sesion (REQ-061
+            RN-06): session_id guarda el IDENTIFICADOR de la sesion, nunca su credencial, y
+            username_attempted registra el literal tecleado sin ir jamas acompaniado de la
+            contrasenia introducida. El oraculo del changeset 09-06 lo verifica por inspeccion de
+            USER_TAB_COLUMNS.
+
+            ck_auditoria_user_nulo materializa "user_id solo puede ser nulo cuando
+            event_type='login_failed'" (REQ-061 validacion 3): un intento fallido sobre un usuario
+            inexistente no tiene a quien atribuirse; el resto de eventos exige user_id.
+
+            occurred_at lleva DEFAULT ON NULL con la marca naive en UTC SYS_EXTRACT_UTC(SYSTIMESTAMP),
+            misma convencion que usuario.created_at y usuario_historico.changed_at. El DEFAULT solo
+            cubre el caso en que el cliente NO envia valor; que un valor enviado por el cliente se
+            IGNORE lo impone el trigger del changeset 09-04.
+
+            retention_until es columna VIRTUAL de solo lectura derivada de occurred_at mas 24 meses
+            (T.5 ARC-117, REQ-065): Oracle responde ORA-54013 si el cliente intenta escribirla, misma
+            tecnica que usuario.retention_until.
+
+            session_id se declara SIN clave ajena a proposito: la tabla sesion_usuario (T.5 ARC-112)
+            todavia no la crea ningun changelog de este repo, y una FK contra una tabla inexistente
+            haria fallar el despliegue. Queda como identificador opaco hasta que la tarea que cree
+            sesion_usuario anada la FK.
+        -->
+        <sql>CREATE TABLE auditoria_acceso (
+    audit_id           VARCHAR2(36 CHAR) DEFAULT ON NULL LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5')),
+    user_id            NUMBER,
+    username_attempted VARCHAR2(150 CHAR),
+    event_type         VARCHAR2(30 CHAR) NOT NULL,
+    operation          VARCHAR2(100 CHAR),
+    outcome            VARCHAR2(20 CHAR) NOT NULL,
+    occurred_at        TIMESTAMP(6) DEFAULT ON NULL SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    ip_address         VARCHAR2(45 CHAR),
+    user_agent         VARCHAR2(255 CHAR),
+    session_id         VARCHAR2(36 CHAR),
+    retention_until    DATE GENERATED ALWAYS AS (CAST(occurred_at + INTERVAL '24' MONTH AS DATE)) VIRTUAL,
+    CONSTRAINT pk_auditoria_acceso PRIMARY KEY (audit_id),
+    CONSTRAINT ck_auditoria_event_type CHECK (event_type IN ('login_ok','login_failed','account_locked','logout','permission_denied')),
+    CONSTRAINT ck_auditoria_outcome CHECK (outcome IN ('OK','DENIED_401','DENIED_403')),
+    CONSTRAINT ck_auditoria_user_nulo CHECK (user_id IS NOT NULL OR event_type = 'login_failed'),
+    CONSTRAINT fk_auditoria_acceso_user FOREIGN KEY (user_id) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="auditoria_acceso"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-09-02" author="MIND">
+        <comment>Indices de la consulta de auditoria (REQ-061, AC-TRZ-03): filtrado por usuario y por rango de fechas</comment>
+        <!--
+            Ambos indices cubren a la vez el filtro y el orden cronologico descendente del listado de
+            auditoria que consulta el ADMINISTRADOR (AC-TRZ-03), de modo que la paginacion por rango
+            de fechas no necesita ordenacion adicional.
+        -->
+        <sql>CREATE INDEX ix_auditoria_user_occurred ON auditoria_acceso (user_id, occurred_at DESC)</sql>
+        <sql>CREATE INDEX ix_auditoria_event_occurred ON auditoria_acceso (event_type, occurred_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_auditoria_event_occurred</sql>
+            <sql>DROP INDEX ix_auditoria_user_occurred</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
