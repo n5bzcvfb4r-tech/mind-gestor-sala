@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="dml-0.0.1-03-01" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_categoria_incidencia</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de categorias de incidencia (cat_categoria_incidencia)</comment>
+        <!--
+            La columna category_id es GENERATED ALWAYS AS IDENTITY: no se informa en los insert.
+            Las columnas updated_at y updated_by quedan sin informar en la carga semilla:
+            solo se rellenan cuando el catalogo se modifica desde la aplicacion.
+        -->
+        <insert tableName="cat_categoria_incidencia">
+            <column name="category_code" value="MOBILIARIO"/>
+            <column name="category_name" value="Mobiliario"/>
+            <column name="display_order" valueNumeric="1"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_categoria_incidencia">
+            <column name="category_code" value="CLIMATIZACION"/>
+            <column name="category_name" value="Climatizacion"/>
+            <column name="display_order" valueNumeric="2"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_categoria_incidencia">
+            <column name="category_code" value="AUDIOVISUAL"/>
+            <column name="category_name" value="Audiovisual"/>
+            <column name="display_order" valueNumeric="3"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_categoria_incidencia">
+            <column name="category_code" value="LIMPIEZA"/>
+            <column name="category_name" value="Limpieza"/>
+            <column name="display_order" valueNumeric="4"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_categoria_incidencia">
+            <column name="category_code" value="OTROS"/>
+            <column name="category_name" value="Otros"/>
+            <column name="display_order" valueNumeric="5"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_categoria_incidencia">
+                <where>category_code IN ('MOBILIARIO','CLIMATIZACION','AUDIOVISUAL','LIMPIEZA','OTROS')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-03-02" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_estado_incidencia</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de estados de incidencia (cat_estado_incidencia): sort_order sigue el CICLO DE VIDA de la incidencia (ABIERTA, EN_CURSO, RESUELTA, CERRADA), NO el orden alfabetico</comment>
+        <!--
+            sort_order es el orden de progresion del ciclo de vida y es el que debe usarse
+            para ordenar el estado en listados y selectores; ordenar por status_code daria
+            una secuencia alfabetica (ABIERTA, CERRADA, EN_CURSO, RESUELTA) que no
+            representa el flujo real. CERRADA es el unico estado terminal (is_terminal = 'Y').
+        -->
+        <insert tableName="cat_estado_incidencia">
+            <column name="status_code" value="ABIERTA"/>
+            <column name="status_name" value="Abierta"/>
+            <column name="sort_order" valueNumeric="1"/>
+            <column name="is_terminal" value="N"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_estado_incidencia">
+            <column name="status_code" value="EN_CURSO"/>
+            <column name="status_name" value="En curso"/>
+            <column name="sort_order" valueNumeric="2"/>
+            <column name="is_terminal" value="N"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_estado_incidencia">
+            <column name="status_code" value="RESUELTA"/>
+            <column name="status_name" value="Resuelta"/>
+            <column name="sort_order" valueNumeric="3"/>
+            <column name="is_terminal" value="N"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_estado_incidencia">
+            <column name="status_code" value="CERRADA"/>
+            <column name="status_name" value="Cerrada"/>
+            <column name="sort_order" valueNumeric="4"/>
+            <column name="is_terminal" value="Y"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_estado_incidencia">
+                <where>status_code IN ('ABIERTA','EN_CURSO','RESUELTA','CERRADA')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-03-03" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_transicion_incidencia</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla de la matriz de transiciones de estado de incidencia (cat_transicion_incidencia): deny by default, solo se declaran las TRES transiciones permitidas</comment>
+        <!--
+            Deny by default: solo existe fila para los pares (from_status, to_status)
+            PERMITIDOS. La AUSENCIA de fila significa transicion DENEGADA; no se insertan
+            filas de denegacion explicita. Por eso NO hay:
+              - transiciones de retroceso: EN_CURSO -> ABIERTA, RESUELTA -> EN_CURSO
+              - transiciones de salto: ABIERTA -> RESUELTA, ABIERTA -> CERRADA
+              - ninguna transicion que parta de CERRADA, que es estado terminal
+                (is_terminal = 'Y' en cat_estado_incidencia)
+            El allowed_role de RESUELTA -> CERRADA es TECNICO_MANTENIMIENTO por coherencia
+            con la matriz permiso_rol_operacion sembrada en 01-seed-cat-seguridad.xml, que
+            concede la operacion INCIDENT_CLOSE_WITH_COMMENT a ese rol.
+            La columna transition_id es GENERATED ALWAYS AS IDENTITY: no se informa en los insert.
+        -->
+        <insert tableName="cat_transicion_incidencia">
+            <column name="from_status" value="ABIERTA"/>
+            <column name="to_status" value="EN_CURSO"/>
+            <column name="allowed_role" value="TECNICO_MANTENIMIENTO"/>
+            <column name="requires_assignee" value="Y"/>
+            <column name="requires_comment" value="N"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_transicion_incidencia">
+            <column name="from_status" value="EN_CURSO"/>
+            <column name="to_status" value="RESUELTA"/>
+            <column name="allowed_role" value="TECNICO_MANTENIMIENTO"/>
+            <column name="requires_assignee" value="Y"/>
+            <column name="requires_comment" value="N"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_transicion_incidencia">
+            <column name="from_status" value="RESUELTA"/>
+            <column name="to_status" value="CERRADA"/>
+            <column name="allowed_role" value="TECNICO_MANTENIMIENTO"/>
+            <column name="requires_assignee" value="N"/>
+            <column name="requires_comment" value="Y"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_transicion_incidencia">
+                <where>(from_status, to_status) IN (('ABIERTA','EN_CURSO'),('EN_CURSO','RESUELTA'),('RESUELTA','CERRADA'))</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-03-04" author="MIND">
+        <preConditions onFail="HALT">
+            <and>
+                <sqlCheck expectedResult="5">SELECT COUNT(*) FROM cat_categoria_incidencia WHERE is_active = 'Y'</sqlCheck>
+                <sqlCheck expectedResult="4">SELECT COUNT(*) FROM cat_estado_incidencia</sqlCheck>
+                <sqlCheck expectedResult="1">SELECT COUNT(*) FROM cat_estado_incidencia WHERE is_terminal = 'Y' AND status_code = 'CERRADA'</sqlCheck>
+                <sqlCheck expectedResult="3">SELECT COUNT(*) FROM cat_transicion_incidencia</sqlCheck>
+                <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_transicion_incidencia WHERE from_status = 'ABIERTA' AND to_status = 'CERRADA'</sqlCheck>
+                <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_transicion_incidencia WHERE from_status = 'CERRADA'</sqlCheck>
+            </and>
+        </preConditions>
+        <comment>Verificacion de los oraculos del DoD de TSK-046: no inserta datos, solo materializa como precondiciones las condiciones de aceptacion del catalogo de incidencias, de forma que un update con el catalogo mal sembrado quede en rojo (onFail HALT)</comment>
+        <sql>SELECT 1 FROM dual</sql>
+        <rollback>
+            <sql>SELECT 1 FROM dual</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
