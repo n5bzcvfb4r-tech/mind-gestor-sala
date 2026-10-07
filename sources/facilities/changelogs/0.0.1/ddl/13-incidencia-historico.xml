@@ -220,4 +220,437 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-13-05" author="MIND">
+        <comment>Oraculo AC-HIST-01 / AC-HIST-REG-04: el ciclo ABIERTA -> EN_CURSO -> RESUELTA -> CERRADA deja una cadena sin huecos, alineada con el estado persistido y verificable por huella</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO del DoD de TSK-056, y se ejecuta contra el motor
+            Oracle real durante el propio despliegue: monta el escenario completo (alta de la
+            incidencia, asignacion a tecnico y las tres transiciones de estado), comprueba sobre esos
+            datos las tres invariantes del historico y DESHACE sus propios datos con un ROLLBACK
+            final, de modo que no deja ni una fila en la base de datos.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false"), asi que el
+            ROLLBACK de PL/SQL revierte todo lo insertado ANTES de que Liquibase o el driver confirmen
+            nada. Por eso no contiene ni una sola sentencia DDL: un DDL provocaria un commit implicito
+            y los datos del oraculo quedarian grabados.
+
+            Siembra por MERGE los catalogos de clave fija que necesita (cat_rol y
+            cat_estado_incidencia) y resuelve con "buscar o insertar" los de clave IDENTITY
+            (cat_oficina, cat_sala y cat_categoria_incidencia), porque los changelogs dml se aplican
+            DESPUES de los ddl y aqui todavia estan vacios. El ROLLBACK revierte tambien esas
+            semillas, de modo que las semillas reales de dml siguen encontrando las tablas vacias y no
+            chocan con nada.
+
+            TODAS las marcas temporales del escenario son PASADAS (de hace cuatro horas hasta el
+            instante actual) porque trg_incidencia_ciclo_vida rechaza con ORA-20053 cualquier marca
+            futura, y ademas avanzan en el orden alta -> asignacion -> inicio -> resolucion -> cierre
+            que exige ck_incidencia_cronologia.
+
+            QUE DEMUESTRA, punto por punto
+            ==============================
+            (1) AC-HIST-REG-04, cadena sin huecos: el from_status de cada asiento coincide con el
+            to_status del asiento inmediatamente anterior de la misma incidencia (LAG sobre el orden
+            changed_at, history_id), y el primero es el asiento CREACION con from_status nulo y
+            to_status ABIERTA. El asiento de ASIGNACION cumple from_status = to_status (lo impone
+            ck_inc_hist_asignacion), de modo que enriquece la traza sin romper la cadena. El contador
+            de discontinuidades debe ser 0.
+
+            (2) AC-HIST-01, invariante de estado: el status persistido de la incidencia coincide con
+            el to_status de la ULTIMA entrada de su historial. La comprobacion se hace sobre el 100 %
+            de las filas de incidencia, no solo sobre la del escenario, para que el oraculo detecte
+            tambien una desalineacion introducida por cualquier otra carga. El JOIN con la ultima
+            entrada EXCLUYE por construccion las incidencias que todavia no tienen ningun asiento de
+            historial: una incidencia sin traza no tiene to_status contra el que comparar y
+            penalizarla seria exigir aqui una regla que corresponde a la capa que escribe la traza.
+
+            (3) Encadenamiento de huella: el previous_entry_hash de cada asiento es igual al
+            entry_hash del asiento anterior de la misma incidencia (0 eslabones rotos) y, ademas, el
+            entry_hash de CADA asiento se RECALCULA desde el contenido ya persistido y debe reproducir
+            exactamente el valor almacenado. Las dos mitades son necesarias: la primera demuestra que
+            los eslabones encajan, la segunda que cada eslabon resume de verdad su contenido, que es
+            lo que hace DETECTABLE cualquier manipulacion. El hash se calcula con
+            RAWTOHEX(STANDARD_HASH(cadena, 'SHA256')), que devuelve hexadecimal en MAYUSCULAS, que es
+            justamente lo que admite ck_inc_hist_entry_hash ('^[0-9A-F]{64}$').
+
+            La funcion cadena() fija la forma CANONICA del contenido encadenado (campos del asiento
+            mas la huella anterior) y es la MISMA en la escritura y en la verificacion: por eso la
+            comparacion es una comprobacion real y no una tautologia, porque en la verificacion sus
+            argumentos se leen de la tabla, no de las variables del escenario.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue con un
+            codigo del rango -20930..-20939 y un mensaje que cita el AC incumplido.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_tecnico      NUMBER;
+    v_oficina      NUMBER;
+    v_sala         NUMBER;
+    v_categoria    NUMBER;
+    v_inc          NUMBER;
+    v_now          TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0           TIMESTAMP;
+    v_t1           TIMESTAMP;
+    v_t2           TIMESTAMP;
+    v_t3           TIMESTAMP;
+    v_t4           TIMESTAMP;
+    v_h0           VARCHAR2(64 CHAR);
+    v_h1           VARCHAR2(64 CHAR);
+    v_h2           VARCHAR2(64 CHAR);
+    v_h3           VARCHAR2(64 CHAR);
+    v_h4           VARCHAR2(64 CHAR);
+    v_recalculada  VARCHAR2(64 CHAR);
+    v_total        NUMBER;
+    v_huecos       NUMBER;
+    v_eslabones    NUMBER;
+    v_desalineadas NUMBER;
+    v_primer_tipo  VARCHAR2(30 CHAR);
+    v_primer_from  VARCHAR2(20 CHAR);
+    v_primer_to    VARCHAR2(20 CHAR);
+    v_estado       VARCHAR2(20 CHAR);
+
+    c_admin_nom    CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-056 Administrador';
+    c_empleado_nom CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-056 Empleado';
+    c_tecnico_nom  CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-056 Tecnico';
+    c_referencia   CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA56-000001';
+    c_resolucion   CONSTANT VARCHAR2(500 CHAR) := 'Comentario de resolucion del oraculo TSK-056: se sustituyo el termostato averiado';
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven
+    -- con el equivalente "buscar o insertar": si la semilla real ya existe se reutiliza, y si no
+    -- se crea una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA56';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA56', 'Oficina del oraculo TSK-056', 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA56-SALA-01';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA56-SALA-01', 'Sala del oraculo TSK-056', p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', 'Climatizacion oraculo TSK-056', 956, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    -- Forma CANONICA del contenido encadenado de un asiento: sus campos de negocio mas la huella
+    -- del asiento anterior. history_id queda FUERA a proposito, porque lo genera el motor en el
+    -- propio INSERT y la huella hay que calcularla antes de disponer de el.
+    FUNCTION cadena(p_incident_id NUMBER, p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                    p_prev_tech NUMBER, p_tech NUMBER, p_tech_name VARCHAR2,
+                    p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                    p_comment VARCHAR2, p_res_ref NUMBER, p_prev_hash VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN p_incident_id || '|' || p_entry_type || '|' ||
+               NVL(p_from, '~') || '|' || p_to || '|' ||
+               NVL(TO_CHAR(p_prev_tech), '~') || '|' ||
+               NVL(TO_CHAR(p_tech), '~') || '|' || NVL(p_tech_name, '~') || '|' ||
+               p_actor || '|' || p_actor_name || '|' ||
+               TO_CHAR(p_changed_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(p_comment, '~') || '|' || NVL(TO_CHAR(p_res_ref), '~') || '|' ||
+               NVL(p_prev_hash, '~');
+    END cadena;
+
+    FUNCTION huella(p_incident_id NUMBER, p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                    p_prev_tech NUMBER, p_tech NUMBER, p_tech_name VARCHAR2,
+                    p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                    p_comment VARCHAR2, p_res_ref NUMBER, p_prev_hash VARCHAR2) RETURN VARCHAR2 IS
+        l_cadena VARCHAR2(4000 CHAR);
+        l_hash   VARCHAR2(64 CHAR);
+    BEGIN
+        -- La cadena canonica se compone ANTES, en PL/SQL: una funcion local de un bloque anonimo no
+        -- puede invocarse desde dentro de una sentencia SQL (PLS-00231).
+        l_cadena := cadena(p_incident_id, p_entry_type, p_from, p_to, p_prev_tech, p_tech, p_tech_name,
+                           p_actor, p_actor_name, p_changed_at, p_comment, p_res_ref, p_prev_hash);
+
+        -- STANDARD_HASH es una funcion de SQL, no de PL/SQL, y se invoca con un SELECT ... FROM dual.
+        -- Devuelve hexadecimal en MAYUSCULAS, que es lo que admite ck_inc_hist_entry_hash.
+        SELECT RAWTOHEX(STANDARD_HASH(l_cadena, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+
+    PROCEDURE asentar(p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                      p_prev_tech NUMBER, p_tech NUMBER, p_tech_name VARCHAR2,
+                      p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                      p_comment VARCHAR2, p_res_ref NUMBER,
+                      p_prev_hash VARCHAR2, p_hash OUT VARCHAR2) IS
+    BEGIN
+        p_hash := huella(v_inc, p_entry_type, p_from, p_to, p_prev_tech, p_tech, p_tech_name,
+                         p_actor, p_actor_name, p_changed_at, p_comment, p_res_ref, p_prev_hash);
+
+        INSERT INTO incidencia_historico (
+            incident_id, entry_type, from_status, to_status,
+            previous_technician_id, assigned_technician_id, assigned_technician_name,
+            actor_user_id, actor_display_name, changed_at,
+            entry_comment, resolution_comment_ref, previous_entry_hash, entry_hash)
+        VALUES (
+            v_inc, p_entry_type, p_from, p_to,
+            p_prev_tech, p_tech, p_tech_name,
+            p_actor, p_actor_name, p_changed_at,
+            p_comment, p_res_ref, p_prev_hash, p_hash);
+    END asentar;
+BEGIN
+    v_t0 := v_now - INTERVAL '4' HOUR;
+    v_t1 := v_now - INTERVAL '3' HOUR;
+    v_t2 := v_now - INTERVAL '2' HOUR;
+    v_t3 := v_now - INTERVAL '1' HOUR;
+    v_t4 := v_now;
+
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 902);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES (c_admin_nom, 'oraculo.tsk056.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES (c_empleado_nom, 'oraculo.tsk056.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES (c_tecnico_nom, 'oraculo.tsk056.tecnico@example.invalid', 'TECNICO_MANTENIMIENTO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    -- (0) Alta de la incidencia: nace ABIERTA (REQ-125).
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 'Sala del oraculo TSK-056', 'Oficina del oraculo TSK-056', 'Climatizacion oraculo TSK-056',
+                 'El aire acondicionado de la sala no enfria y la temperatura no baja de 30 grados',
+                 'ABIERTA', v_empleado, v_t0, v_t0, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    asentar('CREACION', NULL, 'ABIERTA',
+            NULL, NULL, NULL,
+            v_empleado, c_empleado_nom, v_t0,
+            'Alta de la incidencia desde el oraculo TSK-056', NULL,
+            NULL, v_h0);
+
+    -- (1) Asignacion a tecnico: NO es una transicion de estado, la incidencia sigue ABIERTA y por
+    --     eso el asiento lleva from_status = to_status (ck_inc_hist_asignacion). Enriquece la traza
+    --     sin introducir ninguna discontinuidad en la cadena de estados.
+    UPDATE incidencia
+       SET assigned_technician_id = v_tecnico,
+           assigned_at            = v_t1,
+           updated_at             = v_t1
+     WHERE incident_id = v_inc;
+
+    asentar('ASIGNACION', 'ABIERTA', 'ABIERTA',
+            NULL, v_tecnico, c_tecnico_nom,
+            v_admin, c_admin_nom, v_t1,
+            'Asignacion al tecnico de mantenimiento', NULL,
+            v_h0, v_h1);
+
+    -- (2) ABIERTA -> EN_CURSO.
+    UPDATE incidencia
+       SET status            = 'EN_CURSO',
+           in_progress_at    = v_t2,
+           status_changed_at = v_t2,
+           status_changed_by = v_tecnico,
+           updated_at        = v_t2
+     WHERE incident_id = v_inc;
+
+    asentar('CAMBIO_ESTADO', 'ABIERTA', 'EN_CURSO',
+            NULL, NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t2,
+            'El tecnico comienza la atencion', NULL,
+            v_h1, v_h2);
+
+    -- (3) EN_CURSO -> RESUELTA.
+    UPDATE incidencia
+       SET status            = 'RESUELTA',
+           resolved_at       = v_t3,
+           status_changed_at = v_t3,
+           status_changed_by = v_tecnico,
+           updated_at        = v_t3
+     WHERE incident_id = v_inc;
+
+    asentar('CAMBIO_ESTADO', 'EN_CURSO', 'RESUELTA',
+            NULL, NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t3,
+            'El tecnico da por resuelta la averia', NULL,
+            v_h2, v_h3);
+
+    -- (4) RESUELTA -> CERRADA. resolution_comment es obligatorio en este estado y esta PROHIBIDO
+    --     fuera de el (trg_incidencia_ciclo_vida), y el asiento de cierre es el unico que informa
+    --     resolution_comment_ref, que apunta a la PROPIA incidencia (ck_inc_hist_resolucion_ref).
+    UPDATE incidencia
+       SET status             = 'CERRADA',
+           closed_at          = v_t4,
+           closed_by          = v_admin,
+           resolution_comment = c_resolucion,
+           status_changed_at  = v_t4,
+           status_changed_by  = v_admin,
+           updated_at         = v_t4
+     WHERE incident_id = v_inc;
+
+    asentar('CAMBIO_ESTADO', 'RESUELTA', 'CERRADA',
+            NULL, NULL, NULL,
+            v_admin, c_admin_nom, v_t4,
+            c_resolucion, v_inc,
+            v_h3, v_h4);
+
+    -- ------------------------------------------------------------------
+    -- Comprobacion 0: el escenario ha dejado los cinco asientos esperados
+    -- ------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_total FROM incidencia_historico WHERE incident_id = v_inc;
+    IF v_total <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20930, 'ORACULO AC-HIST-REG-04: se esperaban 5 asientos de historico y hay ' || v_total);
+    END IF;
+
+    -- -------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-HIST-REG-04): la traza abre con CREACION y no tiene huecos
+    -- -------------------------------------------------------------------------------
+    SELECT entry_type, from_status, to_status
+      INTO v_primer_tipo, v_primer_from, v_primer_to
+      FROM (SELECT entry_type, from_status, to_status
+              FROM incidencia_historico
+             WHERE incident_id = v_inc
+             ORDER BY changed_at, history_id)
+     WHERE ROWNUM = 1;
+    IF v_primer_tipo <> 'CREACION' OR v_primer_from IS NOT NULL OR v_primer_to <> 'ABIERTA' THEN
+        RAISE_APPLICATION_ERROR(-20931, 'ORACULO AC-HIST-REG-04: el primer asiento deberia ser CREACION con from_status nulo y to_status ABIERTA, y es ' ||
+            v_primer_tipo || ' ' || NVL(v_primer_from, '(nulo)') || ' -> ' || v_primer_to);
+    END IF;
+
+    -- El from_status de cada asiento tiene que ser el to_status del anterior. En el primer asiento
+    -- no hay anterior (LAG nulo) y from_status tambien es nulo: el centinela '@' hace que ese caso
+    -- cuente como continuidad y que, en cambio, un from_status nulo con asiento anterior, o un
+    -- from_status distinto del to_status anterior, cuenten como discontinuidad.
+    SELECT COUNT(*) INTO v_huecos
+      FROM (SELECT from_status,
+                   LAG(to_status) OVER (PARTITION BY incident_id ORDER BY changed_at, history_id) AS estado_anterior
+              FROM incidencia_historico
+             WHERE incident_id = v_inc)
+     WHERE NVL(from_status, '@') <> NVL(estado_anterior, '@');
+    IF v_huecos <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20932, 'ORACULO AC-HIST-REG-04: la cadena de estados tiene ' || v_huecos || ' discontinuidades');
+    END IF;
+
+    -- --------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-HIST-01): el estado persistido coincide con el ultimo asiento, en el
+    -- 100 % de las incidencias que tienen historial
+    -- --------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_desalineadas
+      FROM incidencia i
+      JOIN (SELECT incident_id, to_status
+              FROM (SELECT incident_id, to_status,
+                           ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY changed_at DESC, history_id DESC) AS rn
+                      FROM incidencia_historico)
+             WHERE rn = 1) ultimo
+        ON ultimo.incident_id = i.incident_id
+     WHERE i.status <> ultimo.to_status;
+    IF v_desalineadas <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO AC-HIST-01: hay ' || v_desalineadas || ' incidencias cuyo status no coincide con el to_status de su ultimo asiento');
+    END IF;
+
+    SELECT status INTO v_estado FROM incidencia WHERE incident_id = v_inc;
+    IF v_estado <> 'CERRADA' THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO AC-HIST-01: la incidencia del escenario deberia haber terminado CERRADA y esta ' || v_estado);
+    END IF;
+
+    -- ------------------------------------------------------------------------
+    -- Comprobacion 3: la cadena de huellas encaja y cada huella es verificable
+    -- ------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_eslabones
+      FROM (SELECT previous_entry_hash,
+                   LAG(entry_hash) OVER (PARTITION BY incident_id ORDER BY changed_at, history_id) AS huella_anterior
+              FROM incidencia_historico
+             WHERE incident_id = v_inc)
+     WHERE NVL(previous_entry_hash, '@') <> NVL(huella_anterior, '@');
+    IF v_eslabones <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20934, 'ORACULO TSK-056: hay ' || v_eslabones || ' eslabones rotos en la cadena de huellas del historico');
+    END IF;
+
+    -- Recalculo desde el contenido YA PERSISTIDO: los argumentos salen de la tabla, no de las
+    -- variables del escenario, de modo que la igualdad demuestra que la cadena es verificable y que
+    -- cualquier manipulacion del contenido seria detectable.
+    FOR r IN (SELECT incident_id, entry_type, from_status, to_status,
+                     previous_technician_id, assigned_technician_id, assigned_technician_name,
+                     actor_user_id, actor_display_name, changed_at,
+                     entry_comment, resolution_comment_ref, previous_entry_hash, entry_hash
+                FROM incidencia_historico
+               WHERE incident_id = v_inc
+               ORDER BY changed_at, history_id) LOOP
+        v_recalculada := huella(r.incident_id, r.entry_type, r.from_status, r.to_status,
+                                r.previous_technician_id, r.assigned_technician_id, r.assigned_technician_name,
+                                r.actor_user_id, r.actor_display_name, r.changed_at,
+                                r.entry_comment, r.resolution_comment_ref, r.previous_entry_hash);
+        IF v_recalculada <> r.entry_hash THEN
+            RAISE_APPLICATION_ERROR(-20935, 'ORACULO TSK-056: el entry_hash del asiento ' || r.entry_type ||
+                ' no reproduce el SHA-256 de su contenido encadenado');
+        END IF;
+        IF NOT REGEXP_LIKE(r.entry_hash, '^[0-9A-F]{64}$') THEN
+            RAISE_APPLICATION_ERROR(-20936, 'ORACULO TSK-056: el entry_hash del asiento ' || r.entry_type ||
+                ' no es hexadecimal de 64 caracteres en mayusculas');
+        END IF;
+    END LOOP;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
