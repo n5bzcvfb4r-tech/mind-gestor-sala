@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-12-01" author="MIND">
+        <comment>Metadatos de la foto adjunta de la incidencia (ARC-114, REQ-091): como maximo un adjunto por incidencia, clave opaca y checksum SHA-256</comment>
+        <!--
+            uk_incidencia_adjunto_incident, la UNIQUE sobre incident_id, materializa REQ-091 RN-01
+            ("una incidencia tiene como maximo una foto"): un segundo adjunto para la misma
+            incidencia es rechazado por la BASE DE DATOS con ORA-00001, no por la aplicacion.
+
+            fk_incidencia_adjunto_incident se declara SIN ON DELETE (ni CASCADE ni SET NULL): el
+            adjunto vive y muere con su incidencia y no hay borrado fisico (REQ-047, REQ-149 RN-02);
+            un changeset posterior de este mismo fichero bloquea ademas el DELETE con un trigger.
+
+            En Oracle NO se persiste el binario (ADR-005): solo metadatos, storage_key hacia el
+            volumen de ARC-015 y el file_checksum SHA-256 que se verifica en cada descarga (REQ-149,
+            AC-RET-07 / AC-RET-08). Por eso no hay ninguna columna BLOB.
+
+            uploaded_by es la columna FISICA de escritura con el nombre del DoD de esta tarea;
+            uploaded_by_user_id es una columna VIRTUAL de solo lectura que publica sobre ella el
+            nombre del inventario T.5 ARC-114 (misma tecnica que reported_by / reported_by_user_id en
+            incidencia). Oracle responde ORA-54013 si alguien intenta escribirla.
+
+            uploaded_at y stored_at usan DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la marca naive en UTC
+            convencion del proyecto para toda marca de auditoria.
+        -->
+        <sql>CREATE TABLE incidencia_adjunto (
+    attachment_id       NUMBER GENERATED ALWAYS AS IDENTITY,
+    incident_id         NUMBER NOT NULL,
+    file_name           VARCHAR2(255 CHAR) NOT NULL,
+    mime_type           VARCHAR2(50 CHAR) NOT NULL,
+    file_size_bytes     NUMBER NOT NULL,
+    file_checksum       CHAR(64) NOT NULL,
+    storage_key         VARCHAR2(255 CHAR) NOT NULL,
+    uploaded_by         NUMBER NOT NULL,
+    uploaded_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    stored_at           TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP),
+    uploaded_by_user_id GENERATED ALWAYS AS (uploaded_by) VIRTUAL,
+    CONSTRAINT pk_incidencia_adjunto PRIMARY KEY (attachment_id),
+    CONSTRAINT uk_incidencia_adjunto_incident UNIQUE (incident_id),
+    CONSTRAINT uk_incidencia_adjunto_storage_key UNIQUE (storage_key),
+    CONSTRAINT fk_incidencia_adjunto_incident FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id),
+    CONSTRAINT fk_incidencia_adjunto_uploaded_by FOREIGN KEY (uploaded_by) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="incidencia_adjunto"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-12-02" author="MIND">
+        <comment>Reglas del adjunto (AC-INC-06, AC-RET-07): whitelist de mime, limite de 5 MB, checksum SHA-256 hexadecimal y clave de almacen opaca</comment>
+        <!--
+            ck_inc_adj_mime_type materializa la whitelist de REQ-091 RN-03: cualquier otro tipo (por
+            ejemplo application/pdf) es rechazado por la base de datos.
+
+            ck_inc_adj_file_size_max materializa el limite de 5 MB de AC-INC-06 (5 MB = 5242880
+            bytes); ck_inc_adj_file_size_min impide registrar un adjunto de 0 bytes.
+
+            ck_inc_adj_checksum_hex exige que file_checksum sea un SHA-256 de 64 caracteres
+            hexadecimales (REQ-149 validacion 3), de modo que la comparacion entre el checksum
+            almacenado y el recalculado en la descarga (AC-RET-07) y la deteccion por consulta de una
+            discrepancia (AC-RET-08) se hacen sobre un valor siempre bien formado.
+
+            ck_inc_adj_storage_key_len y ck_inc_adj_storage_key_opaca materializan "clave opaca, no
+            adivinable" (REQ-091 RN-06): la clave no puede ser un numero (es decir, no puede ser
+            incident_id ni un correlativo secuencial) y debe tener al menos 32 caracteres, longitud
+            propia de un identificador generado aleatoriamente. La opacidad plena la garantiza el
+            backend al generarla; la base de datos cierra el modo de fallo evidente, que es almacenar
+            una clave derivable del identificador de la incidencia.
+
+            ck_inc_adj_file_name_ext materializa la coherencia entre extension y mime real (REQ-091
+            validacion 3) y ck_inc_adj_file_name_sane el saneado del nombre (validacion 6): sin
+            separadores de ruta ni recorrido de directorios, de modo que file_name nunca puede usarse
+            como ruta.
+        -->
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_mime_type CHECK (mime_type IN ('image/jpeg','image/png'))</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_file_size_max CHECK (file_size_bytes &lt;= 5242880)</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_file_size_min CHECK (file_size_bytes &gt; 0)</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_checksum_hex CHECK (REGEXP_LIKE(file_checksum, '^[0-9a-fA-F]{64}$'))</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_storage_key_len CHECK (LENGTH(storage_key) &gt;= 32)</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_storage_key_opaca CHECK (NOT REGEXP_LIKE(storage_key, '^[0-9]+$'))</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_file_name_blank CHECK (TRIM(file_name) IS NOT NULL)</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_file_name_sane CHECK (INSTR(file_name, '/') = 0 AND INSTR(file_name, '\') = 0 AND INSTR(file_name, '..') = 0)</sql>
+        <sql>ALTER TABLE incidencia_adjunto ADD CONSTRAINT ck_inc_adj_file_name_ext CHECK ((mime_type = 'image/jpeg' AND (LOWER(file_name) LIKE '%.jpg' OR LOWER(file_name) LIKE '%.jpeg')) OR (mime_type = 'image/png' AND LOWER(file_name) LIKE '%.png'))</sql>
+        <rollback>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_file_name_ext</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_file_name_sane</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_file_name_blank</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_storage_key_opaca</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_storage_key_len</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_checksum_hex</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_file_size_min</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_file_size_max</sql>
+            <sql>ALTER TABLE incidencia_adjunto DROP CONSTRAINT ck_inc_adj_mime_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-12-03" author="MIND">
+        <comment>Indice de la columna hija de la FK a usuario; incident_id y storage_key ya los indexan sus restricciones UNIQUE</comment>
+        <!--
+            uk_incidencia_adjunto_incident y uk_incidencia_adjunto_storage_key ya crean cada una su
+            propio indice unico, de modo que la recuperacion del adjunto por incidencia (AC-RET-07,
+            descarga 18 meses despues del cierre) y la busqueda por clave de almacen quedan servidas
+            por esos indices y NO necesitan ninguno adicional.
+
+            Solo falta indexar uploaded_by, la columna hija de la FK a usuario: sin indice propio,
+            Oracle bloquea la tabla padre en los DELETE sobre usuario. Misma razon por la que se
+            indexan las columnas hijas de las FK de incidencia.
+        -->
+        <sql>CREATE INDEX ix_incidencia_adjunto_uploaded_by ON incidencia_adjunto (uploaded_by)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_adjunto_uploaded_by</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-12-04" author="MIND" runOnChange="true">
+        <comment>REQ-091 RN-08 / REQ-047: el adjunto no admite borrado fisico; el DELETE se rechaza con ORA-20980</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW): se dispara una vez por sentencia y rechaza
+            el DELETE incluso cuando la sentencia no afecta a ninguna fila.
+
+            Junto con fk_incidencia_adjunto_incident, declarada SIN ON DELETE, cierra la unica via de
+            desaparicion del adjunto: el metadato se conserva mientras se conserva su incidencia,
+            hasta retention_expires_at (REQ-149 RN-02).
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_adjunto_no_delete
+BEFORE DELETE ON incidencia_adjunto
+BEGIN
+    RAISE_APPLICATION_ERROR(-20980, 'El adjunto de una incidencia no admite borrado fisico');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_adjunto_no_delete</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-12-05" author="MIND" runOnChange="true">
+        <comment>REQ-149 RN-05 / validacion 5: el adjunto no admite desvinculacion ni sustitucion; incident_id, storage_key y file_checksum son inmutables</comment>
+        <!--
+            El trigger se declara BEFORE UPDATE OF incident_id, storage_key, file_checksum, por lo que
+            se dispara en cuanto una de esas tres columnas aparece en la lista SET de la sentencia,
+            aunque el valor no llegue a cambiar.
+
+            Materializa que el adjunto no puede desvincularse de su incidencia ni reemplazarse por
+            otro binario, y que el file_checksum almacenado no puede reescribirse para encubrir una
+            discrepancia de integridad: AC-RET-08 exige que la discrepancia entre el checksum
+            almacenado y el recalculado sea DETECTABLE POR CONSULTA, lo que solo se sostiene si el
+            valor almacenado es inmutable.
+
+            El resto de columnas (por ejemplo stored_at) si admiten actualizacion.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_adjunto_vinculo
+BEFORE UPDATE OF incident_id, storage_key, file_checksum ON incidencia_adjunto
+BEGIN
+    RAISE_APPLICATION_ERROR(-20981, 'El adjunto no admite desvinculacion ni sustitucion: incident_id, storage_key y file_checksum son inmutables');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_adjunto_vinculo</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
