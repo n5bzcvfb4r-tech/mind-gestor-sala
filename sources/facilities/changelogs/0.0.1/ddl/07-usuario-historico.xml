@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-07-01" author="MIND">
+        <comment>Historico inmutable de rol y de estado de cuenta (ARC-116): traza append-only con actor y fecha</comment>
+        <!--
+            Las columnas FISICAS de escritura son las del DoD de TSK-050 (change_type,
+            previous_role_code, new_role_code, previous_status, new_status): desdoblan el valor
+            anterior y el nuevo para poder declarar FK reales contra cat_rol, cosa imposible con una
+            unica columna de texto.
+
+            event_type, previous_value y new_value son columnas VIRTUALES de solo lectura que
+            publican los nombres del inventario T.5 ARC-116 sobre esas mismas columnas fisicas;
+            misma tecnica que usuario.is_active. Oracle responde ORA-54013 si alguien intenta
+            escribirlas.
+
+            Semantica temporal (T.5: valid_to es el "cierre de la asignacion de rol ANTERIOR"): en
+            una fila de cambio de rol, valid_to marca el instante en que se cierra la asignacion de
+            previous_role_code y valid_from el instante en que se abre la de new_role_code; ambos
+            coinciden, porque ocurren en el mismo instante. La fila de alta no cierra ninguna
+            asignacion previa: valid_to va nulo.
+
+            changed_at usa DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la misma marca naive en UTC que
+            usuario.created_at, convencion del proyecto para toda marca de auditoria.
+        -->
+        <sql>CREATE TABLE usuario_historico (
+    history_id         NUMBER GENERATED ALWAYS AS IDENTITY,
+    user_id            NUMBER NOT NULL,
+    change_type        VARCHAR2(20 CHAR) NOT NULL,
+    previous_role_code VARCHAR2(32 CHAR),
+    new_role_code      VARCHAR2(32 CHAR),
+    previous_status    VARCHAR2(10 CHAR),
+    new_status         VARCHAR2(10 CHAR),
+    reason_code        VARCHAR2(30 CHAR),
+    note               VARCHAR2(500 CHAR),
+    valid_from         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    valid_to           TIMESTAMP(6),
+    changed_by         NUMBER NOT NULL,
+    changed_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    event_type         GENERATED ALWAYS AS (change_type) VIRTUAL,
+    previous_value     GENERATED ALWAYS AS (COALESCE(previous_role_code, previous_status)) VIRTUAL,
+    new_value          GENERATED ALWAYS AS (COALESCE(new_role_code, new_status)) VIRTUAL,
+    CONSTRAINT pk_usuario_historico PRIMARY KEY (history_id),
+    CONSTRAINT fk_usuario_hist_user FOREIGN KEY (user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_hist_changed_by FOREIGN KEY (changed_by) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_hist_prev_role FOREIGN KEY (previous_role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_usuario_hist_new_role FOREIGN KEY (new_role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_usuario_hist_reason FOREIGN KEY (reason_code) REFERENCES cat_motivo_desactivacion (reason_code)
+)</sql>
+        <rollback>
+            <dropTable tableName="usuario_historico"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-02" author="MIND">
+        <comment>Reglas de coherencia del historico: enumerados, valor anterior distinto del nuevo y motivo de baja</comment>
+        <!--
+            ck_usuario_hist_coherencia es la que materializa "previous_* solo nulo en la entrada de
+            alta" en su vertiente de FORMA: una fila sin valor anterior no cierra nada y por eso
+            lleva valid_to nulo. La UNICIDAD de esa entrada de alta no se puede expresar con una
+            CHECK y la impone el indice ux_usuario_hist_alta del changeset 07-03.
+
+            ck_usuario_hist_motivo: reason_code es obligatorio al desactivar y vacio tanto en la
+            reactivacion como en los cambios de rol, segun T.5 ARC-116.
+        -->
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_change_type CHECK (change_type IN ('ROL','ESTADO'))</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_status_enum CHECK (
+    (previous_status IS NULL OR previous_status IN ('ACTIVO','INACTIVO'))
+AND (new_status IS NULL OR new_status IN ('ACTIVO','INACTIVO'))
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_coherencia CHECK (
+    (change_type = 'ROL'
+        AND new_role_code IS NOT NULL
+        AND previous_status IS NULL
+        AND new_status IS NULL
+        AND reason_code IS NULL
+        AND ((previous_role_code IS NULL AND valid_to IS NULL)
+          OR (previous_role_code IS NOT NULL AND valid_to = valid_from)))
+ OR (change_type = 'ESTADO'
+        AND new_status IS NOT NULL
+        AND previous_role_code IS NULL
+        AND new_role_code IS NULL)
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_valor_distinto CHECK (
+    (previous_role_code IS NULL OR previous_role_code &lt;&gt; new_role_code)
+AND (previous_status IS NULL OR previous_status &lt;&gt; new_status)
+)</sql>
+        <sql>ALTER TABLE usuario_historico ADD CONSTRAINT ck_usuario_hist_motivo CHECK (
+    (new_status = 'INACTIVO' AND reason_code IS NOT NULL)
+ OR (new_status = 'ACTIVO' AND reason_code IS NULL)
+ OR (change_type = 'ROL' AND reason_code IS NULL)
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_motivo</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_valor_distinto</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_coherencia</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_status_enum</sql>
+            <sql>ALTER TABLE usuario_historico DROP CONSTRAINT ck_usuario_hist_change_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-03" author="MIND">
+        <comment>Invariantes de unicidad: una sola entrada de alta por usuario y una sola asignacion de rol vigente</comment>
+        <!--
+            Son indices unicos FUNCIONALES sobre expresiones CASE, misma tecnica que
+            ux_configuracion_smtp_una_activa: la expresion vale NULL en las filas que no interesan y
+            Oracle no las indexa, de modo que la unicidad solo aplica al subconjunto relevante.
+
+            ux_usuario_hist_alta deja pasar una unica fila por usuario sin valor anterior, que es por
+            definicion la entrada de alta.
+
+            ux_usuario_hist_rol_sin_cierre deja pasar una unica fila de rol por usuario que NO
+            cierra una asignacion anterior (valid_to nulo), que es de nuevo la de alta. Como el resto
+            de filas de rol cierran la anterior en el mismo instante en que abren la nueva
+            (valid_to = valid_from, impuesto por ck_usuario_hist_coherencia), la cadena de
+            asignaciones queda contigua y sin huecos: es IMPOSIBLE que dos asignaciones de rol esten
+            vigentes a la vez (T.5 ARC-116, REQ-005 RN-02). La consulta de solapamiento del changeset
+            ddl-0.0.1-07-06 lo demuestra devolviendo 0 filas.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_usuario_hist_alta ON usuario_historico (CASE WHEN previous_role_code IS NULL AND previous_status IS NULL THEN user_id END)</sql>
+        <sql>CREATE UNIQUE INDEX ux_usuario_hist_rol_sin_cierre ON usuario_historico (CASE WHEN change_type = 'ROL' AND valid_to IS NULL THEN user_id END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_usuario_hist_rol_sin_cierre</sql>
+            <sql>DROP INDEX ux_usuario_hist_alta</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-04" author="MIND">
+        <comment>Indice de la consulta del historico: por usuario y orden cronologico descendente</comment>
+        <!--
+            Sirve a REQ-008 y REQ-085, que leen el historico de un usuario ordenado por changed_at
+            descendente y paginado: el indice cubre a la vez el filtro por user_id y el orden, por lo
+            que la paginacion no necesita ordenacion adicional.
+        -->
+        <sql>CREATE INDEX ix_usuario_hist_user_changed_at ON usuario_historico (user_id, changed_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_usuario_hist_user_changed_at</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
