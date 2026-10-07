@@ -38,7 +38,7 @@
     valid_to           TIMESTAMP(6),
     changed_by         NUMBER NOT NULL,
     changed_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
-    event_type         GENERATED ALWAYS AS (change_type) VIRTUAL,
+    event_type         GENERATED ALWAYS AS (CAST(change_type AS VARCHAR2(20 CHAR))) VIRTUAL,
     previous_value     GENERATED ALWAYS AS (COALESCE(previous_role_code, previous_status)) VIRTUAL,
     new_value          GENERATED ALWAYS AS (COALESCE(new_role_code, new_status)) VIRTUAL,
     CONSTRAINT pk_usuario_historico PRIMARY KEY (history_id),
@@ -349,6 +349,194 @@ BEGIN
        AND (a.vigente_hasta IS NULL OR a.vigente_hasta > b.vigente_desde);
     IF v_solape <> 0 THEN
         RAISE_APPLICATION_ERROR(-20905, 'ORACULO REQ-005 RN-02: hay ' || v_solape || ' solapamientos de asignacion de rol');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-08" author="MIND">
+        <comment>Oraculo REQ-015 / REQ-077: UPDATE y DELETE sobre una entrada devuelven ORA-20001 y la dejan identica</comment>
+        <!--
+            Comprueba contra el motor real las dos mitades de la inmutabilidad que exige el DoD: que
+            el UPDATE y el DELETE son rechazados con ORA-20001, y que tras ambos intentos la fila
+            sigue siendo identica byte a byte.
+
+            La identidad se verifica sobre una instantanea textual de TODAS las columnas de la
+            entrada y sobre su huella SHA-256, antes y despues de los intentos.
+
+            Oracle hace rollback a nivel de sentencia cuando el trigger lanza el error, por lo que
+            los intentos fallidos no tumban los datos ya insertados por el propio oraculo.
+
+            El bloque deshace sus datos con un ROLLBACK final y no deja ninguna fila.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin          NUMBER;
+    v_user           NUMBER;
+    v_hist           NUMBER;
+    v_t0             TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_antes          VARCHAR2(4000);
+    v_despues        VARCHAR2(4000);
+    v_sqlcode        NUMBER;
+    v_filas          NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    FUNCTION instantanea(p_history_id NUMBER) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT history_id || '|' || user_id || '|' || change_type || '|' ||
+               NVL(previous_role_code, '~') || '|' || NVL(new_role_code, '~') || '|' ||
+               NVL(previous_status, '~') || '|' || NVL(new_status, '~') || '|' ||
+               NVL(reason_code, '~') || '|' || NVL(note, '~') || '|' ||
+               TO_CHAR(valid_from, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(TO_CHAR(valid_to, 'YYYY-MM-DD HH24:MI:SS.FF6'), '~') || '|' ||
+               changed_by || '|' ||
+               TO_CHAR(changed_at, 'YYYY-MM-DD HH24:MI:SS.FF6')
+          INTO v_txt
+          FROM usuario_historico
+         WHERE history_id = p_history_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Inmutable Admin', 'oraculo.tsk050.inmutable.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES ('Oraculo Inmutable', 'oraculo.tsk050.inmutable@example.invalid', 'EMPLEADO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, note, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', NULL, 'EMPLEADO', 'Entrada de alta del oraculo', v_t0, NULL, v_admin, v_t0)
+      RETURNING history_id INTO v_hist;
+
+    v_antes := instantanea(v_hist);
+
+    BEGIN
+        UPDATE usuario_historico SET note = 'manipulado' WHERE history_id = v_hist;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20001 THEN
+        RAISE_APPLICATION_ERROR(-20910, 'ORACULO REQ-015: el UPDATE sobre usuario_historico devolvio ' || v_sqlcode || ' en lugar de ORA-20001');
+    END IF;
+
+    BEGIN
+        DELETE FROM usuario_historico WHERE history_id = v_hist;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20001 THEN
+        RAISE_APPLICATION_ERROR(-20911, 'ORACULO REQ-015: el DELETE sobre usuario_historico devolvio ' || v_sqlcode || ' en lugar de ORA-20001');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas FROM usuario_historico WHERE history_id = v_hist;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20912, 'ORACULO REQ-015: la entrada ha desaparecido tras el intento de borrado');
+    END IF;
+
+    v_despues := instantanea(v_hist);
+    IF v_antes <> v_despues
+       OR RAWTOHEX(STANDARD_HASH(v_antes, 'SHA256')) <> RAWTOHEX(STANDARD_HASH(v_despues, 'SHA256')) THEN
+        RAISE_APPLICATION_ERROR(-20913, 'ORACULO REQ-015: la entrada no es identica byte a byte tras el UPDATE y el DELETE rechazados');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-07-09" author="MIND">
+        <comment>Oraculo REQ-015 / REQ-065 / AC-G-07: las entradas de hace 23 meses siguen disponibles y consultables</comment>
+        <!--
+            Demuestra la retencion de 2 anios que exige el DoD: inserta una entrada fechada 23 meses
+            atras y comprueba que la consulta del historico la sigue devolviendo dentro de la ventana
+            de 24 meses, con su contenido integro.
+
+            No hay ningun proceso de purga sobre usuario_historico y el trigger de inmutabilidad
+            impide el borrado, de modo que la disponibilidad durante la ventana esta garantizada por
+            construccion; este oraculo lo verifica de forma observable.
+
+            [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+            implementa purga alguna al cumplirse los 2 anios]
+
+            El bloque deshace sus datos con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_user        NUMBER;
+    v_t23         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '23' MONTH;
+    v_en_ventana  NUMBER;
+    v_recuperada  VARCHAR2(32);
+    v_actor       NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Retencion Admin', 'oraculo.tsk050.retencion.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES ('Oraculo Retencion', 'oraculo.tsk050.retencion@example.invalid', 'EMPLEADO', 'ACTIVO', v_t23, v_admin)
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO usuario_historico (user_id, change_type, previous_role_code, new_role_code, valid_from, valid_to, changed_by, changed_at)
+         VALUES (v_user, 'ROL', NULL, 'EMPLEADO', v_t23, NULL, v_admin, v_t23);
+
+    SELECT COUNT(*) INTO v_en_ventana
+      FROM usuario_historico
+     WHERE user_id = v_user
+       AND changed_at >= SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_en_ventana <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20920, 'ORACULO REQ-015: la entrada de hace 23 meses no esta disponible dentro de la ventana de retencion de 2 anios');
+    END IF;
+
+    SELECT new_value, changed_by INTO v_recuperada, v_actor
+      FROM (SELECT new_value, changed_by
+              FROM usuario_historico
+             WHERE user_id = v_user
+             ORDER BY changed_at DESC, history_id DESC)
+     WHERE ROWNUM = 1;
+    IF v_recuperada <> 'EMPLEADO' OR v_actor <> v_admin THEN
+        RAISE_APPLICATION_ERROR(-20921, 'ORACULO REQ-015: la entrada de hace 23 meses no conserva integro su valor y su actor');
     END IF;
 
     ROLLBACK;
