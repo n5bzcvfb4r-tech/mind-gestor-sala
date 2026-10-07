@@ -313,4 +313,289 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-14-05" author="MIND">
+        <comment>Oraculo REQ-137 / AC-AVI-02: el segundo INSERT con la misma notification_key es rechazado con ORA-00001, de modo que el reintento de la API y el doble submit son idempotentes</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO del DoD, y se ejecuta contra el motor Oracle real
+            durante el propio despliegue: monta su escenario (un rol, un usuario y un aviso de
+            credencial encolado), comprueba la invariante sobre esos datos reales y DESHACE sus
+            propios datos con un ROLLBACK final, de modo que no deja ni una fila en la base.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL: un DDL provocaria un commit implicito y los datos del oraculo
+            quedarian grabados. Siembra por MERGE el rol que necesita (sembrar_rol, idempotente)
+            porque los changelogs dml se aplican DESPUES de los ddl y cat_rol todavia esta vacio; el
+            ROLLBACK revierte tambien esa semilla, de modo que las semillas reales siguen encontrando
+            la tabla vacia y no chocan con nada.
+
+            El aviso del escenario es de tipo CREDENTIAL_ISSUED, que segun ck_aviso_correo_vinculo no
+            lleva incidencia ni entrada de historico y si exige destinatario individual: por eso el
+            escenario se sostiene con un rol y un usuario, sin incidencia ni catalogos de sala.
+
+            QUE DEMUESTRA
+            =============
+            notification_key es la clave de negocio de la idempotencia (REQ-137: unica por
+            combinacion de incidencia y entrada de historial) y su restriccion UNIQUE
+            uk_aviso_correo_notif_key convierte el reintento de la API y el doble submit en una
+            operacion idempotente a nivel de MOTOR, no de capa de servicio: el segundo INSERT no crea
+            una segunda solicitud, recibe ORA-00001 y el despachador sigue teniendo exactamente un
+            aviso que entregar (AC-AVI-02 de REQ-137: 3 cambios de estado con un doble submit
+            producen 3 avisos y 0 duplicados).
+
+            Se verifica tambien el DEFAULT 'PENDIENTE' porque AC-AVI-01 exige literalmente que la
+            solicitud nazca en ese estado sin que la capa de aplicacion tenga que informarlo.
+
+            DUP_VAL_ON_INDEX es el nombre PL/SQL de ORA-00001 y SQLCODE devuelve -1: se comprueba el
+            codigo numerico para que el oraculo no se conforme con "fallo algo".
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_usuario  NUMBER;
+    v_aviso_1  VARCHAR2(36 CHAR);
+    v_aviso_2  VARCHAR2(36 CHAR);
+    v_status   VARCHAR2(20 CHAR);
+    v_intentos NUMBER;
+    v_tope     NUMBER;
+    v_filas    NUMBER;
+    v_sqlcode  NUMBER := 0;
+
+    c_clave  CONSTANT VARCHAR2(120 CHAR) := 'ORACULO-TSK057|STATUS_CHANGE_ALERT|42|7';
+    c_nombre CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-057 Reportante';
+    c_correo CONSTANT VARCHAR2(254 CHAR) := 'oraculo.tsk057.idem@example.invalid';
+    c_asunto CONSTANT VARCHAR2(255 CHAR) := 'Credencial emitida (oraculo TSK-057)';
+    c_cuerpo CONSTANT VARCHAR2(200 CHAR) := 'Cuerpo congelado del oraculo TSK-057.';
+
+    -- Semilla idempotente del catalogo de clave fija que necesita el escenario. El display_order
+    -- queda fuera del rango de las semillas reales para que no se confunda con ellas.
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 971);
+
+    -- username, password_hash y password_algorithm son NOT NULL sin default desde
+    -- 06-usuario-credenciales.xml, y ux_usuario_username_ci exige un username distinto por cuenta.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_nombre, c_correo, 'oraculo.tsk057.idem', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk057-idem', 'argon2id')
+      RETURNING user_id INTO v_usuario;
+
+    -- El identificador del aviso lo genera el emisor (VARCHAR2(36)): SYS_GUID en hexadecimal
+    -- minuscula ocupa 32 caracteres y cabe de sobra. SYS_GUID es funcion de SQL y se invoca
+    -- con un SELECT ... FROM dual, igual que STANDARD_HASH en el oraculo de TSK-056.
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_1 FROM dual;
+
+    -- Primer encolado. status se deja SIN INFORMAR a proposito: lo que se verifica despues es
+    -- precisamente el DEFAULT de la columna, no un valor escrito por el cliente.
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, body_text)
+         VALUES (v_aviso_1, c_clave, 'CREDENTIAL_ISSUED',
+                 v_usuario, c_correo, c_asunto, c_cuerpo);
+
+    -- ---------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-AVI-01): la solicitud nace PENDIENTE, con 0 intentos y tope 3,
+    -- y se lee DE LA TABLA, no de las variables del escenario
+    -- ---------------------------------------------------------------------------------
+    SELECT status, attempt_count, max_attempts
+      INTO v_status, v_intentos, v_tope
+      FROM aviso_correo
+     WHERE notification_id = v_aviso_1;
+
+    IF v_status <> 'PENDIENTE' THEN
+        RAISE_APPLICATION_ERROR(-20990, 'ORACULO TSK-057 / AC-AVI-01: el aviso recien encolado deberia nacer en estado PENDIENTE sin que la aplicacion lo informe, y ha nacido en ' || v_status);
+    END IF;
+
+    IF v_intentos <> 0 OR v_tope <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'ORACULO TSK-057 / AC-AVI-01: el aviso recien encolado deberia nacer con attempt_count 0 y max_attempts 3, y tiene attempt_count ' || v_intentos || ' y max_attempts ' || v_tope);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-AVI-02): el reintento con la MISMA notification_key es rechazado.
+    -- El notification_id es nuevo y distinto, de modo que lo unico que colisiona es la clave
+    -- de negocio. El bloque anidado captura la violacion para poder examinar su SQLCODE.
+    -- -------------------------------------------------------------------------------------
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_2 FROM dual;
+
+    BEGIN
+        INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                                  recipient_user_id, recipient_email, subject, body_text)
+             VALUES (v_aviso_2, c_clave, 'CREDENTIAL_ISSUED',
+                     v_usuario, c_correo, c_asunto, c_cuerpo);
+    EXCEPTION
+        WHEN DUP_VAL_ON_INDEX THEN
+            v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode <> -1 THEN
+        RAISE_APPLICATION_ERROR(-20991, 'ORACULO TSK-057: el segundo INSERT con la misma notification_key NO fue rechazado con ORA-00001 (SQLCODE=' || v_sqlcode || '): la idempotencia del reintento no esta garantizada');
+    END IF;
+
+    -- El despachador tiene que seguir teniendo EXACTAMENTE un aviso que entregar.
+    SELECT COUNT(*) INTO v_filas FROM aviso_correo WHERE notification_key = c_clave;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20991, 'ORACULO TSK-057 / AC-AVI-02: tras el reintento deberia quedar exactamente 1 aviso con esa notification_key y hay ' || v_filas);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-14-06" author="MIND">
+        <comment>Oraculo REQ-142 / AC-SMTP-02: ENVIADO es terminal, el UPDATE a FALLIDO se rechaza con ORA-20060 y la fila queda intacta</comment>
+        <!--
+            Como el del changeset 14-05, este oraculo se ejecuta contra el motor Oracle real durante
+            el propio despliegue: monta su escenario (un rol, un usuario y un aviso YA ENTREGADO),
+            comprueba las invariantes sobre datos reales y DESHACE sus propios datos con un ROLLBACK
+            final, sin dejar ni una fila. El bloque entero es una UNICA sentencia JDBC
+            (splitStatements="false") y no contiene ni una sola sentencia DDL, que provocaria un
+            commit implicito. Usa identificadores propios (sufijo "terminal") para no chocar con los
+            del oraculo anterior.
+
+            QUE DEMUESTRA
+            =============
+            (1) REQ-142 regla 2 y su validacion 5, "ENVIADO es final: un aviso enviado no pasa a
+            FALLIDO ni a DESCARTADO", verificado contra el motor y no contra la intencion de la capa
+            de servicio.
+
+            (2) La prohibicion cubre tambien la vuelta a PENDIENTE, que es el camino por el que un
+            reproceso del worker atascado (AC-AVI-06) o un reenvio manual del administrador
+            (AC-SMTP-09) generarian un SEGUNDO correo de un aviso ya entregado.
+
+            (3) El rechazo es ATOMICO: la fila queda identica campo a campo, sin el last_error_code
+            que acompanaba al UPDATE rechazado.
+
+            (4) El trigger NO es un candado global sobre la tabla: el UPDATE que no cambia de estado
+            pasa, que es lo que permite al despachador registrar el reenvio y las marcas de traza
+            sobre una fila ya entregada. Sin esa ultima comprobacion, un trigger demasiado
+            restrictivo pasaria las tres primeras y dejaria la tabla inoperante.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_usuario  NUMBER;
+    v_aviso    VARCHAR2(36 CHAR);
+    v_status   VARCHAR2(20 CHAR);
+    v_error    VARCHAR2(50 CHAR);
+    v_message  VARCHAR2(255 CHAR);
+    v_filas    NUMBER := 0;
+    v_sqlcode  NUMBER := 0;
+
+    c_clave   CONSTANT VARCHAR2(120 CHAR) := 'ORACULO-TSK057|TERMINAL|1';
+    c_nombre  CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-057 Entregado';
+    c_correo  CONSTANT VARCHAR2(254 CHAR) := 'oraculo.tsk057.terminal@example.invalid';
+    c_asunto  CONSTANT VARCHAR2(255 CHAR) := 'Credencial emitida (oraculo TSK-057)';
+    c_cuerpo  CONSTANT VARCHAR2(200 CHAR) := 'Cuerpo congelado del oraculo TSK-057.';
+    c_message CONSTANT VARCHAR2(255 CHAR) := '<oraculo-tsk057@mapfre.invalid>';
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    -- Mismo patron para las tres salidas prohibidas: bloque anidado que intenta la transicion,
+    -- captura el SQLCODE y exige que sea exactamente -20060. Se comprueba el codigo numerico para
+    -- que el oraculo no se conforme con "fallo algo". El UPDATE arrastra ademas un last_error_code,
+    -- que es lo que despues permite comprobar que el rechazo no dejo rastro en la fila.
+    PROCEDURE exigir_rechazo(p_destino VARCHAR2) IS
+    BEGIN
+        v_sqlcode := 0;
+        BEGIN
+            UPDATE aviso_correo
+               SET status          = p_destino,
+                   last_error_code = 'TRANSIENT_ERROR'
+             WHERE notification_id = v_aviso;
+        EXCEPTION
+            WHEN OTHERS THEN
+                v_sqlcode := SQLCODE;
+        END;
+
+        IF v_sqlcode <> -20060 THEN
+            RAISE_APPLICATION_ERROR(-20992, 'ORACULO TSK-057: el UPDATE de ENVIADO a ' || p_destino || ' NO fue rechazado con ORA-20060 (SQLCODE=' || v_sqlcode || '): el estado ENVIADO no es terminal');
+        END IF;
+    END exigir_rechazo;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 972);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_nombre, c_correo, 'oraculo.tsk057.terminal', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk057-terminal', 'argon2id')
+      RETURNING user_id INTO v_usuario;
+
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso FROM dual;
+
+    -- Aviso YA ENTREGADO. ck_aviso_correo_enviado exige message_id y sent_at en ENVIADO, de modo
+    -- que el escenario no puede montarse sin ellos.
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, body_text,
+                              status, attempt_count, message_id, sent_at)
+         VALUES (v_aviso, c_clave, 'CREDENTIAL_ISSUED',
+                 v_usuario, c_correo, c_asunto, c_cuerpo,
+                 'ENVIADO', 1, c_message, SYS_EXTRACT_UTC(SYSTIMESTAMP));
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (REQ-142 regla 2 / AC-SMTP-02): ninguna salida de ENVIADO esta permitida,
+    -- ni a los estados de fallo ni de vuelta a la cola (AC-AVI-06 / AC-SMTP-09)
+    -- -------------------------------------------------------------------------------------
+    exigir_rechazo('FALLIDO');
+    exigir_rechazo('DESCARTADO');
+    exigir_rechazo('PENDIENTE');
+
+    -- -------------------------------------------------------------------------------
+    -- Comprobacion 2: el rechazo es atomico y la fila entregada quedo intacta
+    -- -------------------------------------------------------------------------------
+    SELECT status, last_error_code, message_id
+      INTO v_status, v_error, v_message
+      FROM aviso_correo
+     WHERE notification_id = v_aviso;
+
+    IF v_status <> 'ENVIADO' OR v_error IS NOT NULL OR v_message <> c_message THEN
+        RAISE_APPLICATION_ERROR(-20993, 'ORACULO TSK-057: el aviso ENVIADO quedo alterado tras el UPDATE rechazado');
+    END IF;
+
+    -- ------------------------------------------------------------------------------------
+    -- Comprobacion 3: el trigger no es un candado global. El UPDATE que NO cambia de estado
+    -- (el que registra el reenvio sobre una fila ya entregada) tiene que pasar.
+    -- ------------------------------------------------------------------------------------
+    BEGIN
+        UPDATE aviso_correo
+           SET resent_at = SYS_EXTRACT_UTC(SYSTIMESTAMP)
+         WHERE notification_id = v_aviso;
+        v_filas := SQL%ROWCOUNT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_filas := -1;
+    END;
+
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20993, 'ORACULO TSK-057: el trigger de estado terminal bloquea un UPDATE que no cambia de estado');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
