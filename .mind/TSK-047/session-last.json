@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-047",
+  "attempt": 1,
+  "at": "2026-10-07T11:10:34.417450+00:00",
+  "construction_id": "0dd29ccc-5e93-4a69-a357-8a2b88f8993f",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-047 — Catálogos de soporte `cat_motivo_desactivacion` y `configuracion_smtp` (arquetipo `database-relational`, Liquibase 4.31 / Oracle 23ai).\n\nENTREGADO (2 ficheros nuevos, exactamente los `zone_paths` de la tarea):\n\n1) `sources/facilities/changelogs/0.0.1/ddl/04-cat-soporte.xml` — 5 changesets (`ddl-0.0.1-04-01..05`, `author=\"MIND\"`, todos con `<rollback>`):\n   - `cat_motivo_desactivacion` (ARC-108): `reason_code VARCHAR2(30 CHAR)` PK, `reason_name VARCHAR2(120 CHAR)` NOT NULL, `is_active C",
+  "model": "claude-opus-5",
+  "input_tokens": 930026,
+  "output_tokens": 25670,
+  "llm_calls": 64,
+  "cost_usd": 2.37294625,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "97bd918232ad1fd393426f44178916f6477b1523",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
