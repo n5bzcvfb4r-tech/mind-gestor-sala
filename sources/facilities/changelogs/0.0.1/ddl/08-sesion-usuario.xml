@@ -479,4 +479,155 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-08-08" author="MIND">
+        <comment>Oraculo AC-PWD-05 / REQ-070: tras un cambio de contrasenia sobrevive solo la sesion ejecutora y el nuevo login emite otro session_id</comment>
+        <!--
+            Oraculo de COMPORTAMIENTO del DoD, ejecutado contra el Oracle real durante el despliegue:
+            un usuario con DOS sesiones abiertas en dos navegadores cambia su contrasenia desde una de
+            ellas y, tras la revocacion, sobrevive UNICAMENTE la sesion ejecutora mientras la otra
+            queda revocada con motivo password_change (AC-PWD-05, REQ-070 RN-03).
+
+            Comprueba REQ-070 RN-01: ninguna sesion emitida ANTES de password_updated_at sigue viva,
+            salvo la propia sesion ejecutora que REQ-070 RN-03 permite mantener. La verificacion se
+            hace cruzando sesion_usuario con usuario, no sobre una lista fija de sesiones.
+
+            Comprueba REQ-070 RN-04: el alcance de la revocacion se limita al user_id afectado,
+            verificando que la sesion de un SEGUNDO usuario ajeno sigue intacta tras el cambio.
+
+            Comprueba AC-SES-03 / REQ-057 RN-01: un nuevo inicio de sesion emite un session_id
+            DISTINTO de todos los anteriores; la clave primaria de sesion_usuario impide ademas
+            reutilizar el identificador de una sesion ya emitida.
+
+            El bloque entero es una UNICA sentencia JDBC y no contiene ninguna sentencia DDL: un DDL
+            provocaria un commit implicito y los datos del oraculo quedarian grabados en la base.
+            Siembra por MERGE el rol que necesita porque los changelogs dml se aplican DESPUES de los
+            ddl y cat_rol todavia esta vacio en este punto, y deshace todos sus datos, semilla
+            incluida, con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_user       NUMBER;
+    v_otro       NUMBER;
+    v_ejecutora  VARCHAR2(36);
+    v_otra       VARCHAR2(36);
+    v_ajena      VARCHAR2(36);
+    v_nueva      VARCHAR2(36);
+    v_t0         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_cambio     TIMESTAMP;
+    v_vivas      NUMBER;
+    v_superviv   VARCHAR2(36);
+    v_motivo     VARCHAR2(30);
+    v_ajenas     NUMBER;
+    v_previas    NUMBER;
+    v_repetido   NUMBER;
+
+    FUNCTION nuevo_uuid RETURN VARCHAR2 IS
+    BEGIN
+        RETURN LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5'));
+    END nuevo_uuid;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    v_cambio := v_t0 + INTERVAL '2' HOUR;
+
+    sembrar_rol('EMPLEADO', 'Empleado', 951);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm)
+         VALUES ('Oraculo Cambio Password', 'oraculo.tsk051.pwd@example.invalid',
+                 'oraculo.tsk051.pwd@example.invalid', 'EMPLEADO', 'hash-oraculo-anterior', 'argon2id')
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm)
+         VALUES ('Oraculo Cambio Password Ajeno', 'oraculo.tsk051.pwd.ajeno@example.invalid',
+                 'oraculo.tsk051.pwd.ajeno@example.invalid', 'EMPLEADO', 'hash-oraculo-ajeno', 'argon2id')
+      RETURNING user_id INTO v_otro;
+
+    v_ejecutora := nuevo_uuid;
+    v_otra      := nuevo_uuid;
+    v_ajena     := nuevo_uuid;
+
+    -- Dos navegadores del mismo usuario y una sesion de un usuario ajeno.
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_ejecutora, v_user, 'EMPLEADO', v_t0, v_t0 + INTERVAL '8' HOUR, v_t0);
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_otra, v_user, 'EMPLEADO', v_t0 + INTERVAL '1' HOUR, v_t0 + INTERVAL '9' HOUR, v_t0 + INTERVAL '1' HOUR);
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_ajena, v_otro, 'EMPLEADO', v_t0, v_t0 + INTERVAL '8' HOUR, v_t0);
+
+    -- Cambio de contrasenia ejecutado por el titular desde v_ejecutora (REQ-070).
+    UPDATE usuario
+       SET password_hash = 'hash-oraculo-nuevo', password_updated_at = v_cambio,
+           must_change_password = 'N'
+     WHERE user_id = v_user;
+
+    UPDATE sesion_usuario
+       SET revoked_at = v_cambio, revocation_reason = 'password_change'
+     WHERE user_id = v_user
+       AND revoked_at IS NULL
+       AND session_id <> v_ejecutora;
+
+    SELECT COUNT(*) INTO v_vivas FROM sesion_usuario WHERE user_id = v_user AND revoked_at IS NULL;
+    IF v_vivas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20970, 'ORACULO AC-PWD-05: tras el cambio de contrasenia quedan ' || v_vivas || ' sesiones vivas en lugar de 1');
+    END IF;
+
+    SELECT session_id INTO v_superviv FROM sesion_usuario WHERE user_id = v_user AND revoked_at IS NULL;
+    IF v_superviv <> v_ejecutora THEN
+        RAISE_APPLICATION_ERROR(-20971, 'ORACULO AC-PWD-05: la sesion superviviente no es la ejecutora del cambio');
+    END IF;
+
+    SELECT revocation_reason INTO v_motivo FROM sesion_usuario WHERE session_id = v_otra;
+    IF v_motivo <> 'password_change' THEN
+        RAISE_APPLICATION_ERROR(-20972, 'ORACULO REQ-070: la sesion del otro navegador se revoco con motivo ' || v_motivo);
+    END IF;
+
+    SELECT COUNT(*) INTO v_previas
+      FROM sesion_usuario s
+      JOIN usuario u ON u.user_id = s.user_id
+     WHERE s.user_id = v_user
+       AND s.revoked_at IS NULL
+       AND u.password_updated_at IS NOT NULL
+       AND s.issued_at < u.password_updated_at
+       AND s.session_id <> v_ejecutora;
+    IF v_previas <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20973, 'ORACULO REQ-070 RN-01: hay ' || v_previas || ' sesiones anteriores a password_updated_at todavia vigentes');
+    END IF;
+
+    SELECT COUNT(*) INTO v_ajenas FROM sesion_usuario WHERE user_id = v_otro AND revoked_at IS NULL;
+    IF v_ajenas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20974, 'ORACULO REQ-070 RN-04: la revocacion ha alcanzado las sesiones de otro usuario');
+    END IF;
+
+    -- AC-SES-03: el nuevo inicio de sesion emite un session_id distinto del de las sesiones previas.
+    v_nueva := nuevo_uuid;
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_nueva, v_user, 'EMPLEADO', v_cambio, v_cambio + INTERVAL '8' HOUR, v_cambio);
+
+    IF v_nueva = v_ejecutora OR v_nueva = v_otra THEN
+        RAISE_APPLICATION_ERROR(-20975, 'ORACULO AC-SES-03: el nuevo inicio de sesion ha reutilizado un session_id anterior');
+    END IF;
+
+    SELECT COUNT(DISTINCT session_id) INTO v_repetido FROM sesion_usuario WHERE user_id = v_user;
+    IF v_repetido <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20976, 'ORACULO AC-SES-03: se esperaban 3 session_id distintos para el usuario y hay ' || v_repetido);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
