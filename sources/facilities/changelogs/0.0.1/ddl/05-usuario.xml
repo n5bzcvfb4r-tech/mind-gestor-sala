@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-05-01" author="MIND">
+        <comment>Censo de usuarios (ARC-110): identidad, rol vigente, estado de cuenta, auditoria y retencion</comment>
+        <!--
+            is_active y retention_until son columnas VIRTUALES (REQ-088 / AC-TRZ-03): se derivan de
+            status y de deactivated_at, son de solo lectura y no ocupan almacenamiento; si el cliente
+            envia un valor para ellas en un INSERT o UPDATE, Oracle responde ORA-54013.
+
+            created_at usa el mismo DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) que cat_sala: marca naive
+            en UTC, convencion del proyecto para todas las marcas de auditoria.
+
+            created_by es NULLABLE a proposito: la cuenta administradora semilla no tiene autor
+            previo (T.5 ARC-110, "nulo solo en la cuenta semilla") y, ademas, la CHECK
+            ck_usuario_created_by_self (created_by distinto de user_id) impediria cualquier alta si
+            la columna fuese NOT NULL.
+        -->
+        <sql>CREATE TABLE usuario (
+    user_id                  NUMBER GENERATED ALWAYS AS IDENTITY,
+    full_name                VARCHAR2(120 CHAR) NOT NULL,
+    corporate_email          VARCHAR2(150 CHAR) NOT NULL,
+    role_code                VARCHAR2(32 CHAR) NOT NULL,
+    status                   VARCHAR2(10 CHAR) DEFAULT 'ACTIVO' NOT NULL,
+    is_active                GENERATED ALWAYS AS (CASE WHEN status = 'ACTIVO' THEN 'Y' ELSE 'N' END) VIRTUAL,
+    role_changed_at          TIMESTAMP(6),
+    role_changed_by          NUMBER,
+    last_login_at            TIMESTAMP(6),
+    deactivated_at           TIMESTAMP(6),
+    deactivated_by           NUMBER,
+    deactivation_reason_code VARCHAR2(30 CHAR),
+    deactivation_note        VARCHAR2(500 CHAR),
+    retention_until          DATE GENERATED ALWAYS AS (CAST(deactivated_at + INTERVAL '24' MONTH AS DATE)) VIRTUAL,
+    created_at               TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    created_by               NUMBER,
+    updated_at               TIMESTAMP(6),
+    updated_by               NUMBER,
+    CONSTRAINT pk_usuario PRIMARY KEY (user_id),
+    CONSTRAINT ck_usuario_full_name_len CHECK (LENGTH(TRIM(full_name)) BETWEEN 2 AND 120),
+    CONSTRAINT ck_usuario_status CHECK (status IN ('ACTIVO','INACTIVO')),
+    CONSTRAINT ck_usuario_created_by_self CHECK (created_by &lt;&gt; user_id),
+    CONSTRAINT ck_usuario_deactivated_by_self CHECK (deactivated_by &lt;&gt; user_id),
+    CONSTRAINT ck_usuario_coherencia_baja CHECK (
+        (status = 'INACTIVO' AND deactivated_at IS NOT NULL AND deactivated_by IS NOT NULL AND deactivation_reason_code IS NOT NULL)
+     OR (status = 'ACTIVO' AND deactivated_at IS NULL AND deactivated_by IS NULL AND deactivation_reason_code IS NULL)
+    ),
+    CONSTRAINT fk_usuario_role_code FOREIGN KEY (role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_usuario_deactivation_reason FOREIGN KEY (deactivation_reason_code) REFERENCES cat_motivo_desactivacion (reason_code),
+    CONSTRAINT fk_usuario_created_by FOREIGN KEY (created_by) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_updated_by FOREIGN KEY (updated_by) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_role_changed_by FOREIGN KEY (role_changed_by) REFERENCES usuario (user_id),
+    CONSTRAINT fk_usuario_deactivated_by FOREIGN KEY (deactivated_by) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="usuario"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
