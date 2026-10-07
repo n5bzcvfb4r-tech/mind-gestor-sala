@@ -190,4 +190,373 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-10-05" author="MIND">
+        <comment>Oraculo REQ-100 / AC-CLAS-01: el alta con categoria inexistente o inactiva falla y no escribe ninguna fila</comment>
+        <!--
+            Este es un ORACULO DE COMPORTAMIENTO: no describe la regla, la EJECUTA contra el motor
+            Oracle real durante el propio despliegue. Monta el escenario completo (oficina, sala,
+            categoria activa, categoria inactiva, administrador y empleado), intenta las tres altas
+            que REQ-100 obliga a rechazar, comprueba el alta valida y DESHACE sus propios datos con
+            un ROLLBACK final, de modo que no deja ni una fila en la base de datos.
+
+            Demuestra AC-CLAS-01 en su mitad mas exigente, la de "CERO FILAS ESCRITAS": no basta con
+            que el alta devuelva error, hay que comprobar ademas que el recuento de incidencia es
+            exactamente el mismo antes y despues de los tres intentos rechazados. Oracle hace
+            rollback a nivel de SENTENCIA cuando el trigger lanza el error, asi que la fila
+            rechazada no llega a existir en ningun momento visible.
+
+            El intento con categoria INACTIVA es el que justifica la existencia del trigger: la FK
+            fk_incidencia_category por si sola NO distingue un catalogo inactivo de uno inexistente,
+            porque una categoria desactivada sigue siendo una fila valida del padre y la FK la
+            acepta. Por eso ese intento debe devolver exactamente ORA-20012 (el codigo del trigger)
+            y no un ORA-02291 de integridad referencial: es la prueba de que la regla de negocio de
+            REQ-100 esta viva y no delegada en la FK.
+
+            El alta valida comprueba REQ-150: se inserta SIN informar los tres *_snapshot y es el
+            motor quien sella la denominacion VIGENTE de sala, oficina y categoria, junto al estado
+            inicial ABIERTA y version 0.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL: un DDL provocaria un commit implicito y los datos del oraculo
+            quedarian grabados. Siembra por MERGE los catalogos que necesita porque los changelogs
+            dml se aplican DESPUES de los ddl y aqui todavia estan vacios; el ROLLBACK revierte
+            tambien esas semillas, de modo que las semillas reales de dml siguen encontrando las
+            tablas vacias y no chocan con nada. Los display_order / sort_order 9xx y los correos
+            @example.invalid evitan cualquier colision con el catalogo real.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_empleado    NUMBER;
+    v_office      NUMBER;
+    v_room        NUMBER;
+    v_cat_ok      NUMBER;
+    v_cat_ko      NUMBER;
+    v_inc         NUMBER;
+    v_filas_antes NUMBER;
+    v_filas_ahora NUMBER;
+    v_sqlcode     NUMBER;
+    v_room_snap   incidencia.room_name_snapshot%TYPE;
+    v_office_snap incidencia.office_name_snapshot%TYPE;
+    v_cat_snap    incidencia.category_name_snapshot%TYPE;
+    v_status      incidencia.status%TYPE;
+    v_version     NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('MOBILIARIO', 'Mobiliario oraculo', 901, 'Y');
+    sembrar_categoria('LIMPIEZA', 'Limpieza oraculo inactiva', 902, 'N');
+
+    SELECT category_id INTO v_cat_ok FROM cat_categoria_incidencia WHERE category_code = 'MOBILIARIO';
+    SELECT category_id INTO v_cat_ko FROM cat_categoria_incidencia WHERE category_code = 'LIMPIEZA';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA53' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA53', 'Oficina Oraculo TSK-053', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA53';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Clasificacion Admin', 'oraculo.tsk053.clas.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Clasificacion Empleado', 'oraculo.tsk053.clas.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA53' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA53', 'Sala Oraculo', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA53';
+
+    SELECT COUNT(*) INTO v_filas_antes FROM incidencia;
+
+    -- Intento A: categoria INEXISTENTE. Debe fallar (ORA-20012 del trigger, u ORA-02291 de la FK).
+    BEGIN
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9053-000001', v_room, v_cat_ok + 100000,
+                     'El proyector de la sala no enciende desde esta manana', v_empleado);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20930, 'ORACULO AC-CLAS-01: el alta con category_id inexistente deberia fallar y no fallo');
+    END IF;
+
+    -- Intento B: categoria EXISTENTE pero INACTIVA. La FK la aceptaria; el trigger la rechaza.
+    BEGIN
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9053-000001', v_room, v_cat_ko,
+                     'El proyector de la sala no enciende desde esta manana', v_empleado);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20012 THEN
+        RAISE_APPLICATION_ERROR(-20931, 'ORACULO REQ-100: el alta con category_id inactivo devolvio ' || v_sqlcode || ' en lugar de ORA-20012');
+    END IF;
+
+    -- Intento C: sala INEXISTENTE con categoria valida.
+    BEGIN
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9053-000001', v_room + 100000, v_cat_ok,
+                     'El proyector de la sala no enciende desde esta manana', v_empleado);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20932, 'ORACULO AC-CLAS-01: el alta con room_id inexistente deberia fallar y no fallo');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas_ahora FROM incidencia;
+    IF v_filas_ahora <> v_filas_antes THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO AC-CLAS-01: un alta rechazada ha dejado filas escritas en incidencia');
+    END IF;
+
+    -- Alta VALIDA sin informar los *_snapshot: los sella el motor desde el catalogo (REQ-150).
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9053-000002', v_room, v_cat_ok,
+                 'El proyector de la sala no enciende desde esta manana', v_empleado)
+      RETURNING incident_id INTO v_inc;
+
+    SELECT room_name_snapshot, office_name_snapshot, category_name_snapshot, status, version
+      INTO v_room_snap, v_office_snap, v_cat_snap, v_status, v_version
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_room_snap <> 'Sala Oraculo'
+       OR v_office_snap <> 'Oficina Oraculo TSK-053'
+       OR v_cat_snap <> 'Mobiliario oraculo'
+       OR v_status <> 'ABIERTA'
+       OR v_version <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20934, 'ORACULO REQ-150: el alta valida no ha sellado la denominacion vigente ni el estado inicial');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10-06" author="MIND">
+        <comment>Oraculo REQ-102 / REQ-047: no se puede borrar una sala referenciada por una incidencia (FK sin ON DELETE)</comment>
+        <!--
+            Segundo ORACULO DE COMPORTAMIENTO, tambien contra el Oracle real del despliegue: registra
+            una incidencia sobre una sala, una categoria y un usuario, intenta BORRARLOS fisicamente
+            y comprueba que el motor rechaza los tres intentos con ORA-02292 (restriccion de
+            integridad: registro hijo encontrado).
+
+            Esa es la demostracion observable de que NINGUNA de las FK de incidencia declara ON
+            DELETE, ni CASCADE ni SET NULL (REQ-087 / AC-TRZ-02). Si alguna declarase CASCADE el
+            borrado habria tenido exito y se habria llevado por delante la incidencia; si alguna
+            declarase SET NULL el borrado habria tenido exito dejando la clasificacion o la
+            atribucion a NULL. Como no hay ninguna, el unico desenlace posible es el rechazo, y la
+            comprobacion final verifica ademas que la incidencia conserva intactos su room_id, su
+            category_id y su reported_by.
+
+            De ahi que el ciclo de vida de los catalogos y de las cuentas sea de DESACTIVACION y
+            nunca de borrado (REQ-102, REQ-047): una sala, una categoria o un usuario desactivados
+            siguen existiendo, de modo que la incidencia historica nunca pierde su clasificacion ni
+            la traza de quien la reporto.
+
+            Como en el oraculo anterior, el bloque no contiene DDL alguno (evita el commit
+            implicito), siembra por MERGE los catalogos que los changelogs dml aun no han poblado y
+            deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin    NUMBER;
+    v_empleado NUMBER;
+    v_office   NUMBER;
+    v_room     NUMBER;
+    v_cat      NUMBER;
+    v_inc      NUMBER;
+    v_sqlcode  NUMBER;
+    v_salas    NUMBER;
+    v_cats     NUMBER;
+    v_users    NUMBER;
+    v_incs     NUMBER;
+    v_room_ref NUMBER;
+    v_cat_ref  NUMBER;
+    v_rep_ref  NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('MOBILIARIO', 'Mobiliario oraculo', 901, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'MOBILIARIO';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA53' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA53', 'Oficina Oraculo TSK-053', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA53';
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Borrado Admin', 'oraculo.tsk053.fk.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Borrado Empleado', 'oraculo.tsk053.fk.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA53' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA53', 'Sala Oraculo', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA53';
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9053-000010', v_room, v_cat,
+                 'La silla de la sala esta rota y no se puede utilizar', v_empleado)
+      RETURNING incident_id INTO v_inc;
+
+    -- 1) La sala referenciada no se puede borrar: fk_incidencia_room no declara ON DELETE.
+    BEGIN
+        DELETE FROM cat_sala WHERE room_id = v_room;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2292 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO REQ-102: el borrado de una sala referenciada devolvio ' || v_sqlcode || ' en lugar de ORA-02292');
+    END IF;
+
+    -- 2) Lo mismo con la categoria: fk_incidencia_category tampoco declara ON DELETE.
+    BEGIN
+        DELETE FROM cat_categoria_incidencia WHERE category_id = v_cat;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2292 THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO REQ-102: el borrado de una categoria referenciada devolvio ' || v_sqlcode || ' en lugar de ORA-02292');
+    END IF;
+
+    -- 3) Y con el reportante: fk_incidencia_reported_by no declara ON DELETE (REQ-087 / AC-TRZ-02).
+    BEGIN
+        DELETE FROM usuario WHERE user_id = v_empleado;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2292 THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO AC-TRZ-02: el borrado fisico del reportante devolvio ' || v_sqlcode || ' en lugar de ORA-02292');
+    END IF;
+
+    SELECT COUNT(*) INTO v_salas FROM cat_sala WHERE room_id = v_room;
+    SELECT COUNT(*) INTO v_cats  FROM cat_categoria_incidencia WHERE category_id = v_cat;
+    SELECT COUNT(*) INTO v_users FROM usuario WHERE user_id = v_empleado;
+    SELECT COUNT(*) INTO v_incs  FROM incidencia WHERE incident_id = v_inc;
+
+    IF v_salas <> 1 OR v_cats <> 1 OR v_users <> 1 OR v_incs <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-TRZ-02: la incidencia ha perdido su clasificacion o su atribucion tras los borrados rechazados');
+    END IF;
+
+    SELECT room_id, category_id, reported_by
+      INTO v_room_ref, v_cat_ref, v_rep_ref
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_room_ref IS NULL OR v_room_ref <> v_room
+       OR v_cat_ref IS NULL OR v_cat_ref <> v_cat
+       OR v_rep_ref IS NULL OR v_rep_ref <> v_empleado THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-TRZ-02: la incidencia ha perdido su clasificacion o su atribucion tras los borrados rechazados');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
