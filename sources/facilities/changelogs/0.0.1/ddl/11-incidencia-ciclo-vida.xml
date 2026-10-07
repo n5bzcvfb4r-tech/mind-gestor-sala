@@ -747,4 +747,721 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-11-08" author="MIND">
+        <comment>Oraculo AC-CIE-01 / AC-CIE-02: cerrar sin comentario de resolucion se rechaza y la incidencia sigue RESUELTA sin ningun dato de cierre</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO, con la misma mecanica que el de ddl-0.0.1-11-07 y que los de
+            10-incidencia.xml: no describe la regla del cierre, la EJECUTA contra el Oracle real
+            durante el propio despliegue. No mira metadatos (ni USER_CONSTRAINTS, ni USER_TRIGGERS):
+            siembra su escenario completo, intenta los cierres que el DoD obliga a rechazar,
+            comprueba el cierre valido y DESHACE sus propios datos con un ROLLBACK final, de modo que
+            no deja ni una fila en la base de datos.
+
+            QUE DEMUESTRA
+            =============
+            AC-CIE-01 exige comentario de resolucion OBLIGATORIO para cerrar, y AC-CIE-02 anade dos
+            matices que son justamente por donde se escapan las implementaciones descuidadas:
+            el comentario tiene que ser NO VACIO TRAS TRIM (un texto de espacios no es un comentario)
+            y los CUATRO datos de cierre (status, closed_at, closed_by y resolution_comment) son un
+            bloque que existe entero o no existe (REQ-111 RN-04).
+
+            El oraculo recorre esos tres frentes en este orden:
+
+            (A) Cierre SIN comentario: el UPDATE completo de cierre, con closed_at y closed_by
+                informados, dejando resolution_comment a NULL. Tiene que fallar. Se admite el codigo
+                del trigger (-20054, bloque (4) de trg_incidencia_ciclo_vida) o el de la restriccion
+                declarativa (-2290, ORA-02290), porque lo que el DoD garantiza es que el MOTOR lo
+                rechaza, no POR CUAL de sus dos mecanismos lo hace. Lo unico inadmisible es 0, es
+                decir, que la sentencia pase.
+
+            (B) Cierre con comentario de SOLO ESPACIOS (espacios y tabuladores). Es la mitad "no
+                vacio tras TRIM" de AC-CIE-02 y la razon de que el trigger use
+                REGEXP_INSTR(resolution_comment, '[^[:space:]]') sobre el CLOB completo y no una
+                simple comprobacion de NULL: un comentario en blanco tiene longitud mayor que cero y
+                colaria con cualquier chequeo ingenuo.
+
+            (C) Cierre INCOMPLETO sobre otra incidencia: status CERRADA y comentario informados pero
+                sin closed_at ni closed_by. Aqui el comentario ya no salva la escritura: la rechaza
+                ck_incidencia_cierre_coexiste (ORA-02290), que es la otra mitad del bloque atomico de
+                cierre de REQ-111 RN-04.
+
+            Entre (B) y el cierre valido se relee la fila y se exige que este EXACTAMENTE como
+            estaba: RESUELTA, sin closed_at, sin closed_by, sin closed_by_user_id y sin comentario.
+            Esa comprobacion es la que convierte "la sentencia dio error" en "la sentencia no dejo
+            rastro": un rechazo que hubiese escrito la mitad de los datos de cierre seria una fila
+            corrupta aunque la API devolviese 400.
+
+            El cierre VALIDO cierra el oraculo por el lado positivo: con comentario real la misma
+            sentencia pasa, closed_by_user_id (la columna virtual del inventario T.5 ARC-113, ver
+            ddl-0.0.1-11-02) publica el mismo valor que closed_by sin posibilidad de divergir, y
+            closed_at queda por detras de resolved_at segun exige ck_incidencia_cronologia. Sin esta
+            mitad, un esquema que rechazase TODOS los cierres pasaria las comprobaciones anteriores.
+
+            POR QUE EL ALTA LLEVA created_at EN EL PASADO
+            =============================================
+            El escenario necesita una incidencia RESUELTA con marcas coherentes, e in_progress_at y
+            resolved_at se fijan una y dos horas antes del instante actual para que el cierre
+            posterior tenga algo por delante en la linea temporal. ck_incidencia_cronologia exige que
+            TODAS las marcas sean posteriores a created_at, de modo que el alta tiene que sellarse
+            antes que ellas: por eso el INSERT informa created_at tres horas atras en lugar de dejar
+            el DEFAULT. Es una marca pasada, asi que el bloque (3) del trigger (ninguna marca futura)
+            la acepta sin problema.
+
+            La version se comprueba de paso: el alta nace con version 0 y el UPDATE que lleva la
+            incidencia a RESUELTA tiene que dejarla por encima, porque el contador lo lleva el motor
+            en el bloque (5) del trigger y no la sentencia (REQ-118 RN-03).
+
+            DATOS Y LIMPIEZA
+            ================
+            Siembra por MERGE los catalogos que necesita porque los changelogs dml se aplican DESPUES
+            de los ddl y aqui todavia estan vacios. Usa SUS PROPIOS codigos (sufijo ORA54B) y sus
+            propios display_order / sort_order 90x para no chocar ni con el catalogo real ni con los
+            demas oraculos del fichero. sembrar_estado admite aqui el flag is_terminal porque este
+            escenario necesita CERRADA, que es el unico estado terminal del catalogo. Los usuarios
+            informan username, password_hash y password_algorithm porque 06-usuario-credenciales.xml
+            los declara NOT NULL. El bloque entero es una UNICA sentencia JDBC
+            (splitStatements="false"), no contiene ni una sola sentencia DDL (provocaria un commit
+            implicito) y no hace ningun commit: termina en ROLLBACK, igual en la salida normal que en
+            el manejador de excepciones, de modo que no deja ni una fila en la base de datos.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_tecnico      NUMBER;
+    v_office       NUMBER;
+    v_room         NUMBER;
+    v_cat          NUMBER;
+    v_inc          NUMBER;
+    v_inc_c        NUMBER;
+    v_version_alta NUMBER;
+    v_version_res  NUMBER;
+    v_codigo       NUMBER;
+    v_status       incidencia.status%TYPE;
+    v_closed_at    incidencia.closed_at%TYPE;
+    v_resolved_at  incidencia.resolved_at%TYPE;
+    v_closed_by    incidencia.closed_by%TYPE;
+    v_closed_virt  NUMBER;
+    v_comentario   CLOB;
+    v_util         NUMBER;
+    v_ahora        TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    -- Variante del sembrador de estados con el flag is_terminal: este escenario necesita CERRADA,
+    -- que es el unico estado terminal del catalogo (los demas se siembran con 'N').
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER,
+                             p_terminal VARCHAR2 DEFAULT 'N') IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+
+        -- La categoria tiene que estar ACTIVA aunque la fila ya existiese: el trigger
+        -- trg_incidencia_clasificacion rechaza el alta sobre catalogo inactivo (REQ-100).
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_code = p_code;
+    END sembrar_categoria;
+
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 905);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 906);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 907);
+    sembrar_estado('ABIERTA', 'Abierta', 905, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 906, 'N');
+    sembrar_estado('CERRADA', 'Cerrada', 907, 'Y');
+    sembrar_categoria('MOBILIARIO', 'Mobiliario oraculo cierre', 905);
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'MOBILIARIO';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA54B' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA54B', 'Oficina Oraculo Cierre', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA54B';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    -- username, password_hash y password_algorithm son NOT NULL desde 06-usuario-credenciales.xml.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES ('Oraculo Cierre Admin', 'oraculo.tsk054.cie.admin@example.invalid',
+                 'oraculo.tsk054.cie.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk054-cie-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Cierre Empleado', 'oraculo.tsk054.cie.empleado@example.invalid',
+                 'oraculo.tsk054.cie.empleado', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk054-cie-empleado', 'argon2id', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Cierre Tecnico', 'oraculo.tsk054.cie.tecnico@example.invalid',
+                 'oraculo.tsk054.cie.tecnico', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk054-cie-tecnico', 'argon2id', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA54B' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA54B', 'Sala Oraculo Cierre', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA54B';
+
+    -- (1) Incidencia llevada a RESUELTA con marcas coherentes. created_at va tres horas atras
+    --     porque ck_incidencia_cronologia exige que toda marca posterior sea mayor o igual que el
+    --     alta, y el inicio de atencion y la resolucion se sellan dos y una hora atras.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054B-000001', v_room, v_cat,
+                 'Incidencia del oraculo de cierre que se llevara hasta el estado RESUELTA',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR)
+      RETURNING incident_id INTO v_inc;
+
+    SELECT version INTO v_version_alta FROM incidencia WHERE incident_id = v_inc;
+
+    UPDATE incidencia
+       SET status                 = 'RESUELTA',
+           in_progress_at         = v_ahora - INTERVAL '2' HOUR,
+           resolved_at            = v_ahora - INTERVAL '1' HOUR,
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '2' HOUR,
+           status_changed_at      = v_ahora - INTERVAL '1' HOUR,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc;
+
+    SELECT version INTO v_version_res FROM incidencia WHERE incident_id = v_inc;
+
+    IF v_version_res <= v_version_alta THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO REQ-118 RN-03: la version era ' || v_version_alta ||
+            ' en el alta y es ' || v_version_res || ' tras llevar la incidencia a RESUELTA;' ||
+            ' el motor tiene que incrementarla en cada UPDATE');
+    END IF;
+
+    -- (2) INTENTO A: cierre SIN comentario de resolucion. Debe fallar.
+    BEGIN
+        UPDATE incidencia
+           SET status            = 'CERRADA',
+               closed_at         = v_ahora - INTERVAL '30' MINUTE,
+               closed_by         = v_tecnico,
+               status_changed_at = v_ahora - INTERVAL '30' MINUTE,
+               status_changed_by = v_tecnico
+         WHERE incident_id = v_inc;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    IF v_codigo NOT IN (-20054, -2290) THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-CIE-01: el cierre sin comentario de resolucion' ||
+            ' devolvio ' || v_codigo || '; cerrar una incidencia sin comentario de resolucion tiene' ||
+            ' que ser IMPOSIBLE en la base de datos, con ORA-20054 (trigger) u ORA-02290 (CHECK)');
+    END IF;
+
+    -- (3) INTENTO B: cierre con un comentario que solo contiene espacios y tabuladores.
+    --     Es la mitad "no vacio tras TRIM" de AC-CIE-02: un texto en blanco no es un comentario.
+    BEGIN
+        UPDATE incidencia
+           SET status             = 'CERRADA',
+               closed_at          = v_ahora - INTERVAL '30' MINUTE,
+               closed_by          = v_tecnico,
+               resolution_comment = '   ' || CHR(9) || '  ' || CHR(9) || ' ',
+               status_changed_at  = v_ahora - INTERVAL '30' MINUTE,
+               status_changed_by  = v_tecnico
+         WHERE incident_id = v_inc;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    IF v_codigo NOT IN (-20054, -2290) THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-CIE-02: el cierre con un comentario de solo' ||
+            ' espacios y tabuladores devolvio ' || v_codigo || '; un comentario vacio tras TRIM no' ||
+            ' es un comentario de resolucion y el motor tiene que rechazarlo con ORA-20054 u ORA-02290');
+    END IF;
+
+    -- (4) Tras los dos rechazos la fila tiene que seguir EXACTAMENTE como estaba: ni medio cierre,
+    --     ni una marca suelta, ni el nombre virtual del cerrador informado.
+    SELECT status, closed_at, closed_by, closed_by_user_id, resolution_comment
+      INTO v_status, v_closed_at, v_closed_by, v_closed_virt, v_comentario
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_status <> 'RESUELTA'
+       OR v_closed_at IS NOT NULL
+       OR v_closed_by IS NOT NULL
+       OR v_closed_virt IS NOT NULL
+       OR v_comentario IS NOT NULL THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-CIE-02: un cierre rechazado no deja ningun dato' ||
+            ' de cierre informado, y la incidencia quedo en estado ' || v_status ||
+            ' con closed_at=' || NVL(TO_CHAR(v_closed_at), 'NULL') ||
+            ', closed_by=' || NVL(TO_CHAR(v_closed_by), 'NULL') ||
+            ', closed_by_user_id=' || NVL(TO_CHAR(v_closed_virt), 'NULL') ||
+            ', resolution_comment=' || CASE WHEN v_comentario IS NULL THEN 'NULL' ELSE 'INFORMADO' END);
+    END IF;
+
+    -- (5) Cierre VALIDO: la misma sentencia con un comentario de resolucion real tiene que pasar.
+    UPDATE incidencia
+       SET status             = 'CERRADA',
+           closed_at          = v_ahora - INTERVAL '30' MINUTE,
+           closed_by          = v_tecnico,
+           resolution_comment = 'Se ha sustituido el mecanismo averiado de la mesa y se ha' ||
+                                ' verificado su funcionamiento con la persona que reporto la incidencia.',
+           status_changed_at  = v_ahora - INTERVAL '30' MINUTE,
+           status_changed_by  = v_tecnico
+     WHERE incident_id = v_inc;
+
+    SELECT status, closed_at, closed_by, closed_by_user_id, resolution_comment, resolved_at,
+           NVL(REGEXP_INSTR(resolution_comment, '[^[:space:]]'), 0)
+      INTO v_status, v_closed_at, v_closed_by, v_closed_virt, v_comentario, v_resolved_at, v_util
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_status <> 'CERRADA'
+       OR v_closed_at IS NULL
+       OR v_closed_by IS NULL
+       OR v_closed_by <> v_tecnico
+       OR v_closed_virt IS NULL
+       OR v_closed_virt <> v_closed_by
+       OR v_comentario IS NULL
+       OR v_util = 0
+       OR v_closed_at < v_resolved_at THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO AC-CIE-01: el cierre valido no dejo la fila' ||
+            ' completa: status=' || v_status ||
+            ', closed_at=' || NVL(TO_CHAR(v_closed_at), 'NULL') ||
+            ', closed_by=' || NVL(TO_CHAR(v_closed_by), 'NULL') ||
+            ' (tecnico esperado ' || v_tecnico || ')' ||
+            ', closed_by_user_id=' || NVL(TO_CHAR(v_closed_virt), 'NULL') ||
+            ', caracteres utiles del comentario=' || v_util ||
+            ', resolved_at=' || NVL(TO_CHAR(v_resolved_at), 'NULL'));
+    END IF;
+
+    -- (6) INTENTO C sobre OTRA incidencia: cierre incompleto. El comentario esta, pero faltan
+    --     closed_at y closed_by, y los cuatro datos de cierre son un bloque atomico (REQ-111 RN-04).
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054B-000002', v_room, v_cat,
+                 'Segunda incidencia del oraculo de cierre para el intento de cierre incompleto',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR)
+      RETURNING incident_id INTO v_inc_c;
+
+    UPDATE incidencia
+       SET status                 = 'RESUELTA',
+           in_progress_at         = v_ahora - INTERVAL '2' HOUR,
+           resolved_at            = v_ahora - INTERVAL '1' HOUR,
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '2' HOUR,
+           status_changed_at      = v_ahora - INTERVAL '1' HOUR,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc_c;
+
+    BEGIN
+        UPDATE incidencia
+           SET status             = 'CERRADA',
+               resolution_comment = 'Se da por cerrada la incidencia sin informar ni la fecha ni el autor del cierre.',
+               status_changed_at  = v_ahora - INTERVAL '30' MINUTE,
+               status_changed_by  = v_tecnico
+         WHERE incident_id = v_inc_c;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    IF v_codigo NOT IN (-2290, -20054, -20055) THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO AC-CIE-02 / REQ-111 RN-04: un cierre sin closed_at' ||
+            ' ni closed_by devolvio ' || v_codigo || '; los cuatro datos de cierre (estado, fecha,' ||
+            ' autor y comentario de resolucion) coexisten obligatoriamente, y ck_incidencia_cierre_coexiste' ||
+            ' tiene que rechazar la escritura con ORA-02290');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-09" author="MIND">
+        <comment>Oraculo AC-RET-01 / AC-TRZ-03 / REQ-148: una incidencia cerrada hace 30 dias sigue en la tabla operativa y retention_expires_at no lo fija el cliente</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO con la misma mecanica que los dos anteriores: siembra su
+            escenario (sufijo ORA54C), recorre el ciclo de vida completo de una incidencia hasta
+            CERRADA, comprueba contra el motor lo que exigen REQ-148 y AC-RET-01 / AC-RET-02 /
+            AC-RET-06 / AC-TRZ-03 y termina en ROLLBACK sin dejar ni una fila.
+
+            QUE DEMUESTRA Y POR QUE IMPORTA
+            ===============================
+            (1) EL CIERRE NO ARCHIVA (AC-RET-01). El error clasico es tratar el cierre como una
+                "baja": mover la fila a una tabla historica, marcarla como borrada o excluirla por
+                defecto de las consultas. La incidencia cerrada hace 30 dias se busca aqui con el
+                MISMO filtro que usa la bandeja (status, sala y categoria, que es exactamente el que
+                sirve ix_incidencia_cierres_sala_categoria de ddl-0.0.1-11-05) y tiene que aparecer
+                con su sala, su categoria, su fecha de cierre y su tecnico intactos. Si alguien
+                introdujese un archivado, este oraculo lo detectaria en el despliegue.
+
+            (2) NINGUN FILTRO POR DEFECTO EXCLUYE LOS ESTADOS TERMINALES (AC-RET-02). Una consulta
+                que solo filtra por sala devuelve la cerrada JUNTO A la vigente: dos filas. Es la
+                comprobacion complementaria de la anterior, porque un "borrado logico" implementado
+                como vista o como predicado implicito dejaria pasar (1) y fallaria aqui.
+
+            (3) LA RETENCION SE CUENTA DESDE EL ALTA, NO DESDE EL CIERRE (REQ-148 / AC-RET-01).
+                retention_expires_at es la columna virtual de ddl-0.0.1-11-02, definida como
+                CAST(created_at + INTERVAL '24' MONTH AS DATE). La incidencia de este escenario nace
+                hace 395 dias y se cierra hace 30, de modo que las dos lecturas posibles (24 meses
+                desde el alta y 24 meses desde el cierre) dan fechas MUY distintas y la comprobacion
+                es concluyente: se exige la primera y se rechaza explicitamente la segunda.
+
+            (4) EL VALOR ENVIADO POR EL CLIENTE SE IGNORA (AC-TRZ-03 / AC-RET-06). Un cliente de la
+                API puede mandar retention_expires_at en el cuerpo de la peticion; la garantia de que
+                no manda no puede depender de que el backend se acuerde de descartar el campo. Al ser
+                una columna VIRTUAL, Oracle responde ORA-54013 en cuanto se la menciona en la lista de
+                columnas de un INSERT y ORA-54017 en cuanto aparece en el SET de un UPDATE (ambos son
+                la misma familia "operacion no permitida sobre columna virtual"; se admiten los dos
+                codigos porque lo que el DoD garantiza es el rechazo del motor, no su numero exacto).
+                Despues de los dos intentos se relee el valor derivado y se comprueba que sigue siendo
+                el calculado, y que el recuento de filas de incidencia no ha cambiado: un rechazo que
+                hubiese escrito algo seria peor que no rechazar.
+
+            POR QUE ESOS DOS INTENTOS VAN EN SQL DINAMICO
+            =============================================
+            Es una decision tecnica OBLIGADA, no una preferencia de estilo. El SQL estatico de un
+            bloque PL/SQL se analiza al COMPILAR el bloque, asi que un INSERT que mencione una columna
+            virtual haria fallar la compilacion del bloque entero con ORA-54013 antes de ejecutar ni
+            una linea: el despliegue abortaria con ese error en lugar de VERIFICAR que el motor lo
+            rechaza, y el manejador de excepciones no llegaria a verlo nunca. Con EXECUTE IMMEDIATE la
+            sentencia se analiza en EJECUCION, dentro de un bloque con su propio manejador, que es lo
+            que permite capturar el SQLCODE y afirmarlo. Es el unico uso de SQL dinamico del fichero y
+            esta acotado a estas dos sentencias.
+
+            DATOS Y LIMPIEZA
+            ================
+            Catalogos sembrados por MERGE con codigos propios (sufijo ORA54C) y display_order /
+            sort_order 91x, para no chocar ni con el catalogo real ni con los otros oraculos. El alta
+            informa created_at explicitamente 395 dias atras (13 meses) porque el escenario necesita
+            una incidencia antigua; es una marca pasada, de modo que el bloque (3) del trigger
+            trg_incidencia_ciclo_vida (ninguna marca futura) la acepta, y todas las marcas posteriores
+            quedan por delante segun exige ck_incidencia_cronologia. El bloque es una UNICA sentencia
+            JDBC (splitStatements="false"), no contiene ninguna sentencia DDL y no hace ningun commit:
+            termina en ROLLBACK tanto en la salida normal como en el manejador de excepciones.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_tecnico      NUMBER;
+    v_office       NUMBER;
+    v_room         NUMBER;
+    v_cat          NUMBER;
+    v_inc          NUMBER;
+    v_inc_vigente  NUMBER;
+    v_codigo       NUMBER;
+    v_filas        NUMBER;
+    v_cerradas     NUMBER;
+    v_antes        NUMBER;
+    v_despues      NUMBER;
+    v_status       incidencia.status%TYPE;
+    v_room_leida   incidencia.room_id%TYPE;
+    v_cat_leida    incidencia.category_id%TYPE;
+    v_tec_leido    incidencia.assigned_technician_id%TYPE;
+    v_creada       incidencia.created_at%TYPE;
+    v_cerrada_en   incidencia.closed_at%TYPE;
+    v_retencion    DATE;
+    v_esperada     DATE;
+    v_desde_cierre DATE;
+    v_ahora        TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    -- Variante del sembrador de estados con el flag is_terminal: el escenario recorre el ciclo
+    -- completo y necesita CERRADA, que es el unico estado terminal del catalogo.
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER,
+                             p_terminal VARCHAR2 DEFAULT 'N') IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+
+        -- La categoria tiene que estar ACTIVA aunque la fila ya existiese: el trigger
+        -- trg_incidencia_clasificacion rechaza el alta sobre catalogo inactivo (REQ-100).
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_code = p_code;
+    END sembrar_categoria;
+
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 911);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 912);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 913);
+    sembrar_estado('ABIERTA', 'Abierta', 911, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 912, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 913, 'N');
+    sembrar_estado('CERRADA', 'Cerrada', 914, 'Y');
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion oraculo retencion', 911);
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA54C' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA54C', 'Oficina Oraculo Retencion', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA54C';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    -- username, password_hash y password_algorithm son NOT NULL desde 06-usuario-credenciales.xml.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES ('Oraculo Retencion Admin', 'oraculo.tsk054.ret.admin@example.invalid',
+                 'oraculo.tsk054.ret.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk054-ret-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Retencion Empleado', 'oraculo.tsk054.ret.empleado@example.invalid',
+                 'oraculo.tsk054.ret.empleado', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk054-ret-empleado', 'argon2id', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Retencion Tecnico', 'oraculo.tsk054.ret.tecnico@example.invalid',
+                 'oraculo.tsk054.ret.tecnico', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk054-ret-tecnico', 'argon2id', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA54C' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA54C', 'Sala Oraculo Retencion', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA54C';
+
+    -- (1) Alta hace 13 meses y ciclo de vida completo hasta CERRADA hace 30 dias.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054C-000001', v_room, v_cat,
+                 'Incidencia antigua del oraculo de retencion, cerrada hace treinta dias',
+                 v_empleado, v_ahora - INTERVAL '395' DAY)
+      RETURNING incident_id INTO v_inc;
+
+    UPDATE incidencia
+       SET status                 = 'EN_CURSO',
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '61' DAY,
+           in_progress_at         = v_ahora - INTERVAL '60' DAY,
+           status_changed_at      = v_ahora - INTERVAL '60' DAY,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc;
+
+    UPDATE incidencia
+       SET status            = 'RESUELTA',
+           resolved_at       = v_ahora - INTERVAL '31' DAY,
+           status_changed_at = v_ahora - INTERVAL '31' DAY,
+           status_changed_by = v_tecnico
+     WHERE incident_id = v_inc;
+
+    UPDATE incidencia
+       SET status             = 'CERRADA',
+           closed_at          = v_ahora - INTERVAL '30' DAY,
+           closed_by          = v_tecnico,
+           resolution_comment = 'Se reparo la unidad de climatizacion de la sala y se confirmo la' ||
+                                ' temperatura correcta antes de cerrar la incidencia.',
+           status_changed_at  = v_ahora - INTERVAL '30' DAY,
+           status_changed_by  = v_tecnico
+     WHERE incident_id = v_inc;
+
+    -- (2) AC-RET-01: la incidencia cerrada SIGUE en la tabla operativa y se encuentra con el
+    --     filtro de la bandeja (estado + sala + categoria), con todos sus datos intactos.
+    SELECT COUNT(*)
+      INTO v_filas
+      FROM incidencia
+     WHERE status = 'CERRADA'
+       AND room_id = v_room
+       AND category_id = v_cat;
+
+    SELECT status, room_id, category_id, closed_at, assigned_technician_id, created_at
+      INTO v_status, v_room_leida, v_cat_leida, v_cerrada_en, v_tec_leido, v_creada
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_filas <> 1
+       OR v_status <> 'CERRADA'
+       OR v_room_leida IS NULL
+       OR v_cat_leida IS NULL
+       OR v_cerrada_en IS NULL
+       OR v_tec_leido IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO AC-RET-01: el cierre no archiva ni mueve la' ||
+            ' incidencia, pero la consulta por estado, sala y categoria devolvio ' || v_filas ||
+            ' filas y la fila leida tiene status=' || NVL(v_status, 'NULL') ||
+            ', room_id=' || NVL(TO_CHAR(v_room_leida), 'NULL') ||
+            ', category_id=' || NVL(TO_CHAR(v_cat_leida), 'NULL') ||
+            ', closed_at=' || NVL(TO_CHAR(v_cerrada_en), 'NULL') ||
+            ', assigned_technician_id=' || NVL(TO_CHAR(v_tec_leido), 'NULL'));
+    END IF;
+
+    -- (3) AC-RET-02: una consulta que NO fija el estado devuelve la cerrada junto a la vigente.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9054C-000002', v_room, v_cat,
+                 'Incidencia vigente de la misma sala para comprobar que la cerrada sigue listandose',
+                 v_empleado)
+      RETURNING incident_id INTO v_inc_vigente;
+
+    SELECT COUNT(*) INTO v_filas FROM incidencia WHERE room_id = v_room;
+    SELECT COUNT(*) INTO v_cerradas FROM incidencia WHERE room_id = v_room AND incident_id = v_inc;
+
+    IF v_filas <> 2 OR v_cerradas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO AC-RET-02: ningun filtro por defecto excluye los' ||
+            ' estados terminales, pero la consulta por sala devolvio ' || v_filas ||
+            ' filas en lugar de 2 y la incidencia cerrada aparece ' || v_cerradas || ' veces');
+    END IF;
+
+    -- (4) REQ-148 / AC-RET-01: la retencion se cuenta desde el ALTA, no desde el cierre.
+    SELECT retention_expires_at,
+           CAST(created_at + INTERVAL '24' MONTH AS DATE),
+           CAST(closed_at + INTERVAL '24' MONTH AS DATE)
+      INTO v_retencion, v_esperada, v_desde_cierre
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_retencion IS NULL OR v_retencion <> v_esperada THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO REQ-148: retention_expires_at vale ' ||
+            NVL(TO_CHAR(v_retencion, 'YYYY-MM-DD'), 'NULL') || ' y tiene que valer ' ||
+            TO_CHAR(v_esperada, 'YYYY-MM-DD') || ', es decir 24 meses despues del alta (' ||
+            TO_CHAR(v_creada, 'YYYY-MM-DD') || ')');
+    END IF;
+
+    IF v_retencion = v_desde_cierre THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO REQ-148: retention_expires_at vale ' ||
+            TO_CHAR(v_retencion, 'YYYY-MM-DD') || ', que son 24 meses despues del CIERRE (' ||
+            TO_CHAR(v_cerrada_en, 'YYYY-MM-DD') || '); la retencion se cuenta desde el alta');
+    END IF;
+
+    SELECT COUNT(*) INTO v_antes FROM incidencia;
+
+    -- (5) AC-TRZ-03 / AC-RET-06: el valor enviado por el cliente no puede sustituir al derivado.
+    --     Las dos sentencias van en SQL DINAMICO a proposito: en SQL estatico el bloque entero no
+    --     compilaria (el error de columna virtual se da al analizar la sentencia) y el despliegue
+    --     moriria en lugar de VERIFICAR el rechazo.
+    BEGIN
+        EXECUTE IMMEDIATE
+            'INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by,' ||
+            ' retention_expires_at) VALUES (:ref, :room, :cat, :descr, :rep, DATE ''2099-12-31'')'
+            USING 'INC-9054C-000003', v_room, v_cat,
+                  'Alta que intenta fijar la fecha de retencion desde el cliente de la API',
+                  v_empleado;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    IF v_codigo <> -54013 THEN
+        RAISE_APPLICATION_ERROR(-20963, 'ORACULO AC-TRZ-03: un alta que informa retention_expires_at' ||
+            ' devolvio ' || v_codigo || ' y tiene que devolver ORA-54013 (operacion no permitida' ||
+            ' sobre columna virtual): la fecha de retencion la calcula el motor, no el cliente');
+    END IF;
+
+    BEGIN
+        EXECUTE IMMEDIATE
+            'UPDATE incidencia SET retention_expires_at = DATE ''2099-12-31'' WHERE incident_id = :id'
+            USING v_inc;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    -- ORA-54013 e ORA-54017 son la misma familia de rechazo sobre columna virtual (la primera la
+    -- devuelve el INSERT y la segunda el UPDATE segun version del motor); lo inadmisible es 0.
+    IF v_codigo NOT IN (-54013, -54017) THEN
+        RAISE_APPLICATION_ERROR(-20964, 'ORACULO AC-RET-06: un UPDATE que escribe' ||
+            ' retention_expires_at devolvio ' || v_codigo || ' y tiene que devolver ORA-54013 u' ||
+            ' ORA-54017 (operacion no permitida sobre columna virtual)');
+    END IF;
+
+    SELECT retention_expires_at
+      INTO v_retencion
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    IF v_retencion IS NULL OR v_retencion <> v_esperada THEN
+        RAISE_APPLICATION_ERROR(-20965, 'ORACULO AC-TRZ-03: el valor derivado no lo puede sustituir' ||
+            ' el cliente, pero tras los dos intentos rechazados retention_expires_at vale ' ||
+            NVL(TO_CHAR(v_retencion, 'YYYY-MM-DD'), 'NULL') || ' en lugar de ' ||
+            TO_CHAR(v_esperada, 'YYYY-MM-DD'));
+    END IF;
+
+    -- (6) Los dos intentos rechazados no han escrito NADA: mismo recuento de filas antes y despues.
+    SELECT COUNT(*) INTO v_despues FROM incidencia;
+
+    IF v_despues <> v_antes THEN
+        RAISE_APPLICATION_ERROR(-20966, 'ORACULO AC-TRZ-03: la tabla incidencia tenia ' || v_antes ||
+            ' filas antes de los intentos rechazados y tiene ' || v_despues ||
+            ' despues; una escritura rechazada no puede dejar ninguna fila');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
