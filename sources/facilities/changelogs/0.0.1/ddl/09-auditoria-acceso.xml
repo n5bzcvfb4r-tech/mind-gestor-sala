@@ -204,4 +204,180 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-09-06" author="MIND" runAlways="true">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0"><![CDATA[SELECT COUNT(*)
+  FROM user_tab_cols
+ WHERE table_name = 'AUDITORIA_ACCESO'
+   AND (column_name LIKE '%PASSWORD%'
+     OR column_name LIKE '%PASSWD%'
+     OR column_name LIKE '%PWD%'
+     OR column_name LIKE '%CONTRASE%'
+     OR column_name LIKE '%CREDENTIAL%'
+     OR column_name LIKE '%SECRET%'
+     OR column_name LIKE '%TOKEN%'
+     OR column_name LIKE '%HASH%'
+     OR column_name LIKE '%SALT%'
+     OR column_name LIKE '%COOKIE%'
+     OR column_name LIKE '%AUTHORIZATION%')]]></sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-061 RN-06 / AC-TRZ-02: la tabla no declara ninguna columna de contrasenia ni de credencial de sesion</comment>
+        <!--
+            Esta es la INSPECCION DE USER_TAB_COLUMNS que exige el DoD. No comprueba el dato de una
+            fila sino la FORMA de la tabla: ninguna columna cuyo nombre delate una contrasenia o una
+            credencial.
+
+            Se declara con runAlways="true" y precondicion onFail="HALT" para que sea una GUARDIA
+            PERMANENTE: la comprobacion se reevalua en CADA despliegue, de modo que si una tarea
+            futura anadiese por descuido una columna de credencial a la auditoria el despliegue se
+            detiene (REQ-061 RN-06, REQ-076).
+
+            session_id pasa la guardia porque guarda el IDENTIFICADOR de la sesion, nunca su
+            credencial.
+        -->
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-09-07" author="MIND">
+        <comment>Oraculo AC-TRZ-02: los cinco tipos de evento generan una fila cada uno con occurred_at sellado por el servidor</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO que exige el DoD, y se ejecuta contra el motor Oracle
+            real durante el propio despliegue: genera los cinco eventos del catalogo cerrado
+            (login_ok, login_failed, account_locked, logout, permission_denied) y comprueba que cada
+            uno deja exactamente una fila.
+
+            Las cinco inserciones envian A PROPOSITO una marca de cliente evidentemente falsa
+            (1999-01-01) en occurred_at; el oraculo verifica que NINGUNA fila la conserva y que las
+            cinco llevan la hora del servidor, que es como se demuestra que el trigger
+            trg_auditoria_acceso_servidor IGNORA el valor del cliente (REQ-061 validacion 2).
+
+            El evento login_failed es el unico que va sin user_id, por ser un intento sobre un usuario
+            inexistente; el oraculo comprueba que ningun otro tipo de evento admite user_id nulo
+            (REQ-061 validacion 3).
+
+            El bloque entero es una UNICA sentencia JDBC y termina en ROLLBACK, de modo que no deja ni
+            una fila; no contiene ninguna sentencia DDL porque un DDL provocaria un commit implicito.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_user      NUMBER;
+    v_falsa     TIMESTAMP := TIMESTAMP '1999-01-01 00:00:00';
+    v_marca     CONSTANT VARCHAR2(150) := 'oraculo.tsk052.eventos';
+    v_filas     NUMBER;
+    v_tipos     NUMBER;
+    v_cliente   NUMBER;
+    v_servidor  NUMBER;
+    v_sin_user  NUMBER;
+    v_sin_id    NUMBER;
+    v_falta     VARCHAR2(400);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status, password_hash, password_algorithm)
+         VALUES ('Oraculo Eventos Auditoria Admin', 'oraculo.tsk052.eventos.admin@example.invalid',
+                 'oraculo.tsk052.eventos.admin', 'ADMINISTRADOR', 'ACTIVO', '$argon2id$oraculo', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status, password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Eventos Auditoria', 'oraculo.tsk052.eventos@example.invalid',
+                 'oraculo.tsk052.eventos', 'EMPLEADO', 'ACTIVO', '$argon2id$oraculo', 'argon2id', v_admin)
+      RETURNING user_id INTO v_user;
+
+    -- Los cinco eventos del catalogo. Todos envian la marca de cliente falsa en occurred_at.
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, occurred_at, ip_address, user_agent, session_id)
+         VALUES (v_user, v_marca, 'login_ok', 'POST /auth/login', 'OK', v_falsa, '10.0.0.7', 'oraculo-tsk052', 'd3f1c0de-0000-4000-8000-000000000001');
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, occurred_at, ip_address, user_agent)
+         VALUES (NULL, v_marca, 'login_failed', 'POST /auth/login', 'DENIED_401', v_falsa, '10.0.0.7', 'oraculo-tsk052');
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, occurred_at, ip_address, user_agent)
+         VALUES (v_user, v_marca, 'account_locked', 'POST /auth/login', 'DENIED_401', v_falsa, '10.0.0.7', 'oraculo-tsk052');
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, occurred_at, ip_address, user_agent, session_id)
+         VALUES (v_user, v_marca, 'logout', 'POST /auth/logout', 'OK', v_falsa, '10.0.0.7', 'oraculo-tsk052', 'd3f1c0de-0000-4000-8000-000000000001');
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, occurred_at, ip_address, user_agent)
+         VALUES (v_user, v_marca, 'permission_denied', 'GET /api/audit-log', 'DENIED_403', v_falsa, '10.0.0.7', 'oraculo-tsk052');
+
+    -- 1) una fila por evento y los cinco tipos del catalogo presentes
+    SELECT COUNT(*), COUNT(DISTINCT event_type) INTO v_filas, v_tipos
+      FROM auditoria_acceso
+     WHERE username_attempted = v_marca;
+    IF v_filas <> 5 OR v_tipos <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-TRZ-02: se esperaban 5 entradas de 5 tipos distintos y hay ' || v_filas || ' entradas de ' || v_tipos || ' tipos');
+    END IF;
+
+    -- 2) estan exactamente los cinco tipos esperados
+    SELECT LISTAGG(t.tipo, ',') WITHIN GROUP (ORDER BY t.tipo) INTO v_falta
+      FROM (SELECT 'login_ok' AS tipo FROM dual
+            UNION ALL SELECT 'login_failed' FROM dual
+            UNION ALL SELECT 'account_locked' FROM dual
+            UNION ALL SELECT 'logout' FROM dual
+            UNION ALL SELECT 'permission_denied' FROM dual) t
+     WHERE NOT EXISTS (SELECT 1
+                         FROM auditoria_acceso a
+                        WHERE a.username_attempted = v_marca
+                          AND a.event_type = t.tipo);
+    IF v_falta IS NOT NULL THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO AC-TRZ-02: faltan entradas de auditoria para los eventos ' || v_falta);
+    END IF;
+
+    -- 3) occurred_at lo sella el SERVIDOR: la marca del cliente se ha ignorado
+    SELECT COUNT(*) INTO v_cliente
+      FROM auditoria_acceso
+     WHERE username_attempted = v_marca
+       AND occurred_at = v_falsa;
+    IF v_cliente <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO REQ-061: ' || v_cliente || ' entradas conservan la marca temporal enviada por el cliente en lugar de la del servidor');
+    END IF;
+
+    SELECT COUNT(*) INTO v_servidor
+      FROM auditoria_acceso
+     WHERE username_attempted = v_marca
+       AND occurred_at BETWEEN SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '1' HOUR
+                           AND SYS_EXTRACT_UTC(SYSTIMESTAMP) + INTERVAL '1' MINUTE;
+    IF v_servidor <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO REQ-061: solo ' || v_servidor || ' de 5 entradas llevan occurred_at fijado por el servidor');
+    END IF;
+
+    -- 4) user_id solo es nulo en login_failed
+    SELECT COUNT(*) INTO v_sin_user
+      FROM auditoria_acceso
+     WHERE username_attempted = v_marca
+       AND user_id IS NULL
+       AND event_type <> 'login_failed';
+    IF v_sin_user <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20944, 'ORACULO REQ-061: hay ' || v_sin_user || ' entradas sin atribucion de usuario fuera de login_failed');
+    END IF;
+
+    -- 5) toda entrada recibe su identificador uuid por defecto
+    SELECT COUNT(*) INTO v_sin_id
+      FROM auditoria_acceso
+     WHERE username_attempted = v_marca
+       AND (audit_id IS NULL OR LENGTH(audit_id) <> 36);
+    IF v_sin_id <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20945, 'ORACULO T.5 ARC-117: hay ' || v_sin_id || ' entradas sin audit_id uuid');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
