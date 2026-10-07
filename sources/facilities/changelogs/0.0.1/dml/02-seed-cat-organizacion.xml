@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="dml-0.0.1-04" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_oficina</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de oficinas (cat_oficina): las tres sedes de Espana</comment>
+        <!--
+            Valores PROVISIONALES: el RFP no aporta los nombres ni las ciudades reales de las
+            tres oficinas, por eso cada fila lleva encima el marcador SQL literal
+            "PENDIENTE VALIDACION CLIENTE" (comentario de linea SQL).
+            Se usan bloques <sql> en lugar de <insert> precisamente para poder dejar ese
+            comentario literal junto a cada sentencia; por eso tampoco se desactiva
+            stripComments.
+            La columna office_id es GENERATED ALWAYS AS IDENTITY: no se informa en los insert.
+        -->
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+            VALUES ('MAD', 'Oficina Madrid', 'Madrid', 'Y')
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+            VALUES ('BCN', 'Oficina Barcelona', 'Barcelona', 'Y')
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+            VALUES ('VLC', 'Oficina Valencia', 'Valencia', 'Y')
+        </sql>
+        <rollback>
+            <delete tableName="cat_oficina">
+                <where>office_code IN ('MAD','BCN','VLC')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-05" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_sala</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del inventario inicial de salas (cat_sala): 3 salas por oficina</comment>
+        <!--
+            Valores PROVISIONALES: el inventario real de salas lo tiene que confirmar el
+            cliente, por eso cada fila lleva encima el marcador SQL literal
+            "PENDIENTE VALIDACION CLIENTE" (comentario de linea SQL).
+            room_id es GENERATED ALWAYS AS IDENTITY: no se informa en los insert.
+            office_id tambien es IDENTITY en cat_oficina, asi que NO puede referenciarse con un
+            literal numerico; se resuelve con subconsulta por el office_code natural (INSERT ... SELECT).
+            created_at lo rellena el DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) de la tabla.
+            created_by = 1 es la cuenta administradora semilla del sistema.
+            Nota: 'Sala Norte' se repite a proposito en MAD y BCN, porque la unicidad de nombre
+            de sala de REQ-099 es POR oficina, no global.
+        -->
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'MAD-S01', 'Sala Norte', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'MAD'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'MAD-S02', 'Sala Sur', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'MAD'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'MAD-S03', 'Sala Consejo', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'MAD'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'BCN-S01', 'Sala Norte', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'BCN'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'BCN-S02', 'Sala Diagonal', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'BCN'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'BCN-S03', 'Sala Formacion', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'BCN'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'VLC-S01', 'Sala Turia', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'VLC'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'VLC-S02', 'Sala Marina', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'VLC'
+        </sql>
+        <sql stripComments="false" splitStatements="false">
+            -- PENDIENTE VALIDACION CLIENTE
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+            SELECT 'VLC-S03', 'Sala Reuniones 1', o.office_id, 'Y', 1 FROM cat_oficina o WHERE o.office_code = 'VLC'
+        </sql>
+        <rollback>
+            <delete tableName="cat_sala">
+                <where>room_code IN ('MAD-S01','MAD-S02','MAD-S03','BCN-S01','BCN-S02','BCN-S03','VLC-S01','VLC-S02','VLC-S03')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
