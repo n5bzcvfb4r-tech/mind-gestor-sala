@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-06-01" author="MIND">
+        <comment>Credenciales y bloqueo de cuenta sobre usuario (ARC-110; REQ-038, REQ-053, REQ-054, REQ-069, REQ-072)</comment>
+        <!--
+            password_hash y password_salt son la UNICA representacion persistida de la credencial
+            (REQ-063 / REQ-076): en este modelo NO existe ninguna columna de contrasenia en claro,
+            ni aqui ni en ninguna tabla derivada; la verificacion se hace siempre recalculando el
+            hash con password_algorithm sobre el salt almacenado.
+
+            failed_password_attempts es el contador POR CUENTA (no por sesion ni por navegador):
+            vive en la fila de usuario, de modo que los intentos fallidos se acumulan aunque el
+            atacante cambie de navegador o de dispositivo. Esta unica columna materializa a la vez
+            REQ-055 y REQ-072, y su nombre fisico es exactamente el que fija el DoD de esta tarea.
+
+            locked_until es un bloqueo TEMPORAL: expresa hasta que instante se rechaza el acceso,
+            pero NO altera status ni la columna virtual is_active (AC-AUT-04). Una cuenta bloqueada
+            sigue siendo una cuenta ACTIVA del censo; el desbloqueo es el simple paso del tiempo o
+            la puesta a NULL de esta columna, nunca un cambio de estado de la cuenta.
+        -->
+        <addColumn tableName="usuario">
+            <column name="username" type="VARCHAR2(100 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="password_hash" type="VARCHAR2(255 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="password_salt" type="VARCHAR2(64 CHAR)"/>
+            <column name="password_algorithm" type="VARCHAR2(30 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="password_updated_at" type="TIMESTAMP(6)"/>
+            <column name="must_change_password" type="CHAR(1)" defaultValue="Y">
+                <constraints nullable="false"/>
+            </column>
+            <column name="credential_issued_at" type="TIMESTAMP(6)"/>
+            <column name="password_expires_at" type="TIMESTAMP(6)"/>
+            <column name="failed_password_attempts" type="NUMBER" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+            <column name="last_failed_attempt_at" type="TIMESTAMP(6)"/>
+            <column name="locked_until" type="TIMESTAMP(6)"/>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="usuario">
+                <column name="locked_until"/>
+                <column name="last_failed_attempt_at"/>
+                <column name="failed_password_attempts"/>
+                <column name="password_expires_at"/>
+                <column name="credential_issued_at"/>
+                <column name="must_change_password"/>
+                <column name="password_updated_at"/>
+                <column name="password_algorithm"/>
+                <column name="password_salt"/>
+                <column name="password_hash"/>
+                <column name="username"/>
+            </dropColumn>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-02" author="MIND">
+        <comment>Reglas de integridad de la credencial y del contador de fallos (REQ-053, REQ-072; T.5 ARC-110)</comment>
+        <!--
+            ck_usuario_pwd_algorithm acota el algoritmo a los adaptativos aceptados por T.5 de
+            ARC-110: al guardarse el algoritmo con cada credencial, una cuenta antigua puede
+            rehashearse a argon2id sin migrar el resto del censo.
+        -->
+        <sql>ALTER TABLE usuario ADD CONSTRAINT ck_usuario_username_len CHECK (LENGTH(username) BETWEEN 3 AND 100)</sql>
+        <sql>ALTER TABLE usuario ADD CONSTRAINT ck_usuario_must_change_pwd CHECK (must_change_password IN ('Y','N'))</sql>
+        <sql>ALTER TABLE usuario ADD CONSTRAINT ck_usuario_failed_attempts CHECK (failed_password_attempts &gt;= 0)</sql>
+        <sql>ALTER TABLE usuario ADD CONSTRAINT ck_usuario_pwd_algorithm CHECK (password_algorithm IN ('argon2id','bcrypt'))</sql>
+        <rollback>
+            <sql>ALTER TABLE usuario DROP CONSTRAINT ck_usuario_pwd_algorithm</sql>
+            <sql>ALTER TABLE usuario DROP CONSTRAINT ck_usuario_failed_attempts</sql>
+            <sql>ALTER TABLE usuario DROP CONSTRAINT ck_usuario_must_change_pwd</sql>
+            <sql>ALTER TABLE usuario DROP CONSTRAINT ck_usuario_username_len</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-03" author="MIND">
+        <comment>REQ-053: unicidad de username insensible a mayusculas</comment>
+        <!--
+            La unicidad se impone sobre la EXPRESION LOWER(username), no sobre la columna: este
+            indice funcional es lo que hace que 'A@mapfre.com' y 'a@mapfre.com' se normalicen al
+            mismo valor y colisionen con ORA-00001 en el segundo INSERT, igual que ya hace
+            ux_usuario_email_ci con el correo corporativo.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_usuario_username_ci ON usuario (LOWER(username))</sql>
+        <rollback>
+            <sql>DROP INDEX ux_usuario_username_ci</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
