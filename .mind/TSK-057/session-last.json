@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-057",
+  "attempt": 1,
+  "at": "2026-10-07T15:23:18.769909+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-057 — `aviso_correo`: outbox transaccional de avisos con idempotencia, estados y supresión.\n\nENTREGA (única zona tocada: `sources/facilities/changelogs/0.0.1/ddl/14-aviso-correo.xml`, 8 changesets, 1.325 líneas). El fichero lo recoge automáticamente el `includeAll path=\"0.0.1/ddl\"` de `sources/facilities/changelogs/changelog-0.0.1.xml`, que cuelga del maestro `sources/facilities/master.xml` (composition root del modelo de datos): no hubo que editar ningún otro fichero y no se montó un segund",
+  "model": "claude-opus-5",
+  "input_tokens": 4623886,
+  "output_tokens": 67808,
+  "llm_calls": 168,
+  "cost_usd": 14.348142250000002,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "4be7b15a1b52ec6ec79e13845ae3943cbe4e8810",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
