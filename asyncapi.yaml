@@ -1,0 +1,131 @@
+asyncapi: 2.6.0
+info:
+  title: incidencias_project — Eventos
+  version: 0.1.0
+  description: 'Catálogo de eventos generado por MIND desde T.3 (PR #0). Los canales
+    con x-mind-audience: client son el contrato cliente↔servidor en tiempo real; los
+    payloads marcados x-mind-placeholder los completa la construcción.'
+servers:
+  webhooks:
+    url: /api/webhooks
+    protocol: https
+    description: Webhooks entrantes
+channels:
+  facilities.avisos.solicitado.v1:
+    description: 'AvisoSolicitado · productor: ARC-013 → consumidor: ARC-014'
+    x-mind-transport: internal
+    x-mind-audience: internal
+    publish:
+      message: &id001
+        $ref: '#/components/messages/AvisoSolicitado'
+      operationId: EVT-001
+    subscribe:
+      message: *id001
+  facilities.avisos.intento-registrado.v1:
+    description: 'IntentoDeEnvioRegistrado · productor: ARC-014 → consumidor: ARC-016'
+    x-mind-transport: internal
+    x-mind-audience: internal
+    publish:
+      message: &id002
+        $ref: '#/components/messages/IntentoDeEnvioRegistrado'
+      operationId: EVT-002
+    subscribe:
+      message: *id002
+  facilities.retencion.vencimiento-recalculado.v1:
+    description: 'VencimientoRetencionRecalculado · productor: ARC-014 → consumidor:
+      ARC-016'
+    x-mind-transport: internal
+    x-mind-audience: internal
+    publish:
+      message: &id003
+        $ref: '#/components/messages/VencimientoRetencionRecalculado'
+      operationId: EVT-003
+    subscribe:
+      message: *id003
+  facilities.avisos.alta-incidencia-entregado.v1:
+    description: 'AvisoAltaIncidenciaEntregado · productor: ARC-005 → consumidor:
+      ARC-003'
+    x-mind-transport: webhook
+    x-mind-audience: client
+    publish:
+      message: &id004
+        $ref: '#/components/messages/AvisoAltaIncidenciaEntregado'
+      operationId: EVT-004
+    subscribe:
+      message: *id004
+    servers:
+    - webhooks
+  facilities.avisos.cambio-estado-entregado.v1:
+    description: 'AvisoCambioEstadoEntregado · productor: ARC-005 → consumidor: ARC-002'
+    x-mind-transport: webhook
+    x-mind-audience: client
+    publish:
+      message: &id005
+        $ref: '#/components/messages/AvisoCambioEstadoEntregado'
+      operationId: EVT-005
+    subscribe:
+      message: *id005
+    servers:
+    - webhooks
+  facilities.avisos.credencial-entregada.v1:
+    description: 'CredencialInicialEntregada · productor: ARC-005 → consumidor: ARC-004'
+    x-mind-transport: webhook
+    x-mind-audience: client
+    publish:
+      message: &id006
+        $ref: '#/components/messages/CredencialInicialEntregada'
+      operationId: EVT-006
+    subscribe:
+      message: *id006
+    servers:
+    - webhooks
+components:
+  messages:
+    AvisoAltaIncidenciaEntregado:
+      name: AvisoAltaIncidenciaEntregado
+      summary: código de referencia de la incidencia, sala, oficina, categoría, descripción
+        breve, reportante y fecha de alta
+      payload:
+        type: object
+        description: Payload de AvisoAltaIncidenciaEntregado
+        x-mind-placeholder: true
+    AvisoCambioEstadoEntregado:
+      name: AvisoCambioEstadoEntregado
+      summary: código de referencia de la incidencia, sala, estado anterior, estado
+        nuevo, fecha del cambio y comentario de resolución si es el cierre
+      payload:
+        type: object
+        description: Payload de AvisoCambioEstadoEntregado
+        x-mind-placeholder: true
+    AvisoSolicitado:
+      name: AvisoSolicitado
+      summary: id de solicitud de aviso, tipo de aviso, id de incidencia, id de entrada
+        de historial, destinatario resuelto, estado de envío y fecha de creación
+      payload:
+        type: object
+        description: Payload de AvisoSolicitado
+        x-mind-placeholder: true
+    CredencialInicialEntregada:
+      name: CredencialInicialEntregada
+      summary: id de usuario destino, correo corporativo, tipo de credencial (alta
+        o restablecimiento), resultado de la entrega y fecha
+      payload:
+        type: object
+        description: Payload de CredencialInicialEntregada
+        x-mind-placeholder: true
+    IntentoDeEnvioRegistrado:
+      name: IntentoDeEnvioRegistrado
+      summary: id de solicitud de aviso, número de intento, resultado, código de respuesta
+        SMTP, identificador de mensaje, destinatarios del intento y fecha del intento
+      payload:
+        type: object
+        description: Payload de IntentoDeEnvioRegistrado
+        x-mind-placeholder: true
+    VencimientoRetencionRecalculado:
+      name: VencimientoRetencionRecalculado
+      summary: id de incidencia, fecha de alta, fecha de vencimiento de retención
+        calculada, estado de retención y fecha del recálculo
+      payload:
+        type: object
+        description: Payload de VencimientoRetencionRecalculado
+        x-mind-placeholder: true

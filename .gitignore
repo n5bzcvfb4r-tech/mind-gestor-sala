@@ -1,0 +1,42 @@
+# Dependencies & build
+node_modules/
+.pnpm-store/
+dist/
+build/
+.angular/
+.next/
+out/
+target/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# MIND session noise (no entregables)
+conversation_history/
+large_tool_results/
+.mind/*/env.sh
+.mind/*/env.json
+
+# Write-hygiene residuales
+*.new
+*_combined.py
+*_new.py
+*_2.py
+tmp/
+
+# Playwright / coverage (construction browser validation)
+/test-results/
+/playwright-report/
+/blob-report/
+/coverage/

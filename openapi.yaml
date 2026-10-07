@@ -1,0 +1,1615 @@
+openapi: 3.0.3
+info:
+  title: incidencias_project — API
+  version: 0.1.0
+  description: 'Contrato generado por MIND desde los contratos de arquitectura (T.3,
+    contract-first PR #0). Paths, verbos y campos de los schemas son LEY; los esquemas
+    marcados x-mind-placeholder aún no tienen campos y los completa la construcción
+    sin cambiar path/verb.'
+servers:
+- url: /api
+  description: Base pública de la API
+paths:
+  /auth/sessions:
+    post:
+      operationId: EP-001
+      summary: Inicia sesión con usuario y contraseña propios y devuelve la sesión
+        con el rol vigente
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /auth/sessions/current:
+    delete:
+      operationId: EP-002
+      summary: Cierra la sesión del usuario y la revoca en servidor
+      tags:
+      - ARC-012
+      responses:
+        '204':
+          description: OK
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    get:
+      operationId: EP-003
+      summary: Devuelve el contexto del usuario autenticado con su identidad y rol
+        vigente
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionContext'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /auth/permissions:
+    get:
+      operationId: EP-004
+      summary: Devuelve las operaciones permitidas y el alcance de datos del rol vigente
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectivePermissions'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /auth/password:
+    put:
+      operationId: EP-005
+      summary: Cambia la contraseña del propio usuario aportando la actual
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordChangeRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordChangeResult'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /auth/initial-password:
+    put:
+      operationId: EP-006
+      summary: Establece la contraseña definitiva en el primer acceso tras alta o
+        restablecimiento
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitialPasswordRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordChangeResult'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users:
+    post:
+      operationId: EP-007
+      summary: Da de alta un usuario con nombre, correo corporativo y rol, y emite
+        su credencial inicial
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    get:
+      operationId: EP-008
+      summary: Lista el censo de usuarios con su rol y estado, con búsqueda, filtros
+        y paginación
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}:
+    get:
+      operationId: EP-009
+      summary: Consulta la ficha de un usuario con su rol vigente y su trazabilidad
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    put:
+      operationId: EP-010
+      summary: Modifica el nombre y el correo corporativo de un usuario activo
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/role:
+    put:
+      operationId: EP-011
+      summary: Cambia el rol funcional vigente de un usuario
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleChangeRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRoleDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/role-history:
+    get:
+      operationId: EP-012
+      summary: Consulta el histórico inmutable de asignaciones y cambios de rol de
+        un usuario
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleHistoryPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/deactivation-impact:
+    get:
+      operationId: EP-013
+      summary: Devuelve el impacto de dar de baja a un usuario sobre sus incidencias
+        y avisos
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeactivationImpact'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/deactivation:
+    post:
+      operationId: EP-014
+      summary: Desactiva lógicamente un usuario con motivo, revocando sus sesiones
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserDeactivationRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/reactivation:
+    post:
+      operationId: EP-015
+      summary: Reactiva un usuario inactivo devolviéndole su rol previo
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserReactivationRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/status-history:
+    get:
+      operationId: EP-016
+      summary: Consulta el histórico de cambios de estado de cuenta y los datos de
+        baja
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountStatusHistoryPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/password-reset:
+    post:
+      operationId: EP-017
+      summary: Restablece la contraseña de un usuario activo generando una credencial
+        temporal
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordResetResult'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/{userId}/unlock:
+    post:
+      operationId: EP-018
+      summary: Desbloquea una cuenta bloqueada por intentos fallidos sin alterar su
+        contraseña
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountUnlockRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLockStatus'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /users/credential-status:
+    get:
+      operationId: EP-019
+      summary: Lista el estado de credencial de los usuarios (cambio pendiente, bloqueo,
+        último acceso)
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialStatusPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /access-audit-events:
+    get:
+      operationId: EP-020
+      summary: Consulta la auditoría inmutable de accesos y operaciones sensibles
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessAuditEventPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-recipients/{userId}:
+    get:
+      operationId: EP-021
+      summary: Resuelve el destinatario de aviso de un usuario y su notificabilidad
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-groups/maintenance-team:
+    get:
+      operationId: EP-022
+      summary: Resuelve la composición vigente del colectivo equipo de mantenimiento
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientGroupDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-recipients:
+    get:
+      operationId: EP-023
+      summary: Verifica qué usuarios reciben avisos y cuáles quedan excluidos con
+        su motivo
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientVerificationPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /recipient-resolutions:
+    get:
+      operationId: EP-024
+      summary: Consulta el registro inmutable de resoluciones de destinatarios del
+        directorio
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientResolutionPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents:
+    post:
+      operationId: EP-025
+      summary: Da de alta una incidencia de sala con categoría, descripción y foto
+        opcional
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentCreateRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    get:
+      operationId: EP-026
+      summary: Consulta la bandeja completa de incidencias con filtros, búsqueda,
+        orden y paginación
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentListPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /my-incidents:
+    get:
+      operationId: EP-027
+      summary: Consulta el listado de las incidencias reportadas por el propio empleado
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentListPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}:
+    get:
+      operationId: EP-028
+      summary: Consulta el detalle de una incidencia con su estado, responsable y
+        transiciones disponibles
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/history:
+    get:
+      operationId: EP-029
+      summary: Consulta el historial cronológico de cambios de una incidencia con
+        autor y fecha
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentHistoryPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/photo:
+    get:
+      operationId: EP-030
+      summary: Descarga la foto adjunta de una incidencia previa verificación de integridad
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentPhotoContent'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/assignment:
+    post:
+      operationId: EP-031
+      summary: Permite a un técnico autoasignarse una incidencia sin responsable
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelfAssignmentRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentAssignmentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    put:
+      operationId: EP-032
+      summary: Reasigna una incidencia no cerrada a otro técnico de mantenimiento
+        activo
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignmentChangeRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentAssignmentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    delete:
+      operationId: EP-033
+      summary: Libera la incidencia asignada indicando el motivo y la devuelve a tomable
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignmentReleaseRequest'
+      responses:
+        '204':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentAssignmentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/transitions:
+    post:
+      operationId: EP-034
+      summary: Ejecuta una transición de estado válida del ciclo de vida de la incidencia
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusTransitionRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/closure:
+    post:
+      operationId: EP-035
+      summary: Cierra una incidencia resuelta aportando el comentario de resolución
+        obligatorio
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentClosureRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/classification:
+    put:
+      operationId: EP-036
+      summary: Reclasifica la sala o la categoría de una incidencia no cerrada
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentReclassificationRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incidents/{incidentId}/similar-closures:
+    get:
+      operationId: EP-037
+      summary: Consulta los cierres anteriores de la misma sala y categoría con su
+        resolución
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimilarClosurePage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incident-activities:
+    get:
+      operationId: EP-038
+      summary: Consulta el registro de actividad reciente de todas las incidencias
+        con filtros
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentActivityPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incident-statistics:
+    get:
+      operationId: EP-039
+      summary: Devuelve el recuento agregado de incidencias por oficina, sala o categoría
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentCountSummary'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incident-categories:
+    get:
+      operationId: EP-040
+      summary: Consulta el catálogo cerrado de categorías de incidencia
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentCategoryList'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incident-categories/{categoryCode}:
+    put:
+      operationId: EP-041
+      summary: Renombra, reordena o activa/desactiva una categoría del catálogo cerrado
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentCategoryUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentCategoryDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /rooms:
+    get:
+      operationId: EP-042
+      summary: Consulta el catálogo de salas agrupadas por oficina con búsqueda
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomList'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    post:
+      operationId: EP-043
+      summary: Da de alta una sala en una oficina activa del catálogo
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomCreateRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /rooms/{roomId}:
+    put:
+      operationId: EP-044
+      summary: Edita el nombre, la oficina o el estado de activación de una sala
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoomUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /offices:
+    get:
+      operationId: EP-045
+      summary: Consulta el catálogo de oficinas con su estado y sus salas asociadas
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfficeList'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /offices/{officeId}:
+    put:
+      operationId: EP-046
+      summary: Edita el literal o el estado de activación de una oficina
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OfficeUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfficeDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-dispatches:
+    get:
+      operationId: EP-047
+      summary: Consulta los avisos por correo emitidos con su estado de entrega y
+        filtros
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationDispatchPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-dispatches/{dispatchId}:
+    get:
+      operationId: EP-048
+      summary: Consulta el detalle de un aviso con su traza inmutable de intentos
+        de entrega
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationDispatchDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /notification-dispatches/{dispatchId}/resend:
+    post:
+      operationId: EP-049
+      summary: Reenvía manualmente un aviso fallido o descartado sobre la misma solicitud
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationResendRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationDispatchDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /mail-settings:
+    get:
+      operationId: EP-050
+      summary: Consulta la configuración vigente del servidor de correo saliente
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailSettingsDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    put:
+      operationId: EP-051
+      summary: Actualiza y activa los parámetros del servidor SMTP y del remitente
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailSettingsUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailSettingsDetail'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /mail-settings/test-messages:
+    post:
+      operationId: EP-052
+      summary: Envía un correo de prueba para verificar la conexión con el servidor
+        SMTP
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MailTestRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailTestResult'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /incident-retentions:
+    get:
+      operationId: EP-053
+      summary: Consulta el vencimiento de retención de las incidencias y las próximas
+        a vencer
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetentionOverview'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /integrity-checks:
+    post:
+      operationId: EP-054
+      summary: Lanza la verificación diagnóstica de integridad del registro histórico
+      tags:
+      - ARC-012
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IntegrityCheckRequest'
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrityCheckReport'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+    get:
+      operationId: EP-055
+      summary: Lista los informes de verificación de integridad ejecutados
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrityCheckPage'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+  /integrity-checks/{checkId}:
+    get:
+      operationId: EP-056
+      summary: Consulta un informe de integridad con sus inconsistencias por incidencia
+        y regla
+      tags:
+      - ARC-012
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrityCheckReport'
+        '401':
+          description: No autenticado
+        '403':
+          description: Prohibido
+      x-required-roles: []
+      security:
+      - bearerAuth: []
+      x-mind-access: deny-all
+components:
+  schemas:
+    AccessAuditEventPage:
+      type: object
+      description: Respuesta AccessAuditEventPage
+      x-mind-placeholder: true
+    AccountLockStatus:
+      type: object
+      description: Respuesta AccountLockStatus
+      x-mind-placeholder: true
+    AccountStatusHistoryPage:
+      type: object
+      description: Respuesta AccountStatusHistoryPage
+      x-mind-placeholder: true
+    AccountUnlockRequest:
+      type: object
+      description: Cuerpo de petición AccountUnlockRequest
+      x-mind-placeholder: true
+    AssignmentChangeRequest:
+      type: object
+      description: Cuerpo de petición AssignmentChangeRequest
+      x-mind-placeholder: true
+    AssignmentReleaseRequest:
+      type: object
+      description: Cuerpo de petición AssignmentReleaseRequest
+      x-mind-placeholder: true
+    CredentialStatusPage:
+      type: object
+      description: Respuesta CredentialStatusPage
+      x-mind-placeholder: true
+    DeactivationImpact:
+      type: object
+      description: Respuesta DeactivationImpact
+      x-mind-placeholder: true
+    EffectivePermissions:
+      type: object
+      description: Respuesta EffectivePermissions
+      x-mind-placeholder: true
+    IncidentActivityPage:
+      type: object
+      description: Respuesta IncidentActivityPage
+      x-mind-placeholder: true
+    IncidentAssignmentDetail:
+      type: object
+      description: Respuesta IncidentAssignmentDetail
+      x-mind-placeholder: true
+    IncidentCategoryDetail:
+      type: object
+      description: Respuesta IncidentCategoryDetail
+      x-mind-placeholder: true
+    IncidentCategoryList:
+      type: object
+      description: Respuesta IncidentCategoryList
+      x-mind-placeholder: true
+    IncidentCategoryUpdateRequest:
+      type: object
+      description: Cuerpo de petición IncidentCategoryUpdateRequest
+      x-mind-placeholder: true
+    IncidentClosureRequest:
+      type: object
+      description: Cuerpo de petición IncidentClosureRequest
+      x-mind-placeholder: true
+    IncidentCountSummary:
+      type: object
+      description: Respuesta IncidentCountSummary
+      x-mind-placeholder: true
+    IncidentCreateRequest:
+      type: object
+      description: Cuerpo de petición IncidentCreateRequest
+      x-mind-placeholder: true
+    IncidentDetail:
+      type: object
+      description: Respuesta IncidentDetail
+      x-mind-placeholder: true
+    IncidentHistoryPage:
+      type: object
+      description: Respuesta IncidentHistoryPage
+      x-mind-placeholder: true
+    IncidentListPage:
+      type: object
+      description: Respuesta IncidentListPage
+      x-mind-placeholder: true
+    IncidentPhotoContent:
+      type: object
+      description: Respuesta IncidentPhotoContent
+      x-mind-placeholder: true
+    IncidentReclassificationRequest:
+      type: object
+      description: Cuerpo de petición IncidentReclassificationRequest
+      x-mind-placeholder: true
+    InitialPasswordRequest:
+      type: object
+      description: Cuerpo de petición InitialPasswordRequest
+      x-mind-placeholder: true
+    IntegrityCheckPage:
+      type: object
+      description: Respuesta IntegrityCheckPage
+      x-mind-placeholder: true
+    IntegrityCheckReport:
+      type: object
+      description: Respuesta IntegrityCheckReport
+      x-mind-placeholder: true
+    IntegrityCheckRequest:
+      type: object
+      description: Cuerpo de petición IntegrityCheckRequest
+      x-mind-placeholder: true
+    LoginRequest:
+      type: object
+      description: Cuerpo de petición LoginRequest
+      x-mind-placeholder: true
+    MailSettingsDetail:
+      type: object
+      description: Respuesta MailSettingsDetail
+      x-mind-placeholder: true
+    MailSettingsUpdateRequest:
+      type: object
+      description: Cuerpo de petición MailSettingsUpdateRequest
+      x-mind-placeholder: true
+    MailTestRequest:
+      type: object
+      description: Cuerpo de petición MailTestRequest
+      x-mind-placeholder: true
+    MailTestResult:
+      type: object
+      description: Respuesta MailTestResult
+      x-mind-placeholder: true
+    NotificationDispatchDetail:
+      type: object
+      description: Respuesta NotificationDispatchDetail
+      x-mind-placeholder: true
+    NotificationDispatchPage:
+      type: object
+      description: Respuesta NotificationDispatchPage
+      x-mind-placeholder: true
+    NotificationResendRequest:
+      type: object
+      description: Cuerpo de petición NotificationResendRequest
+      x-mind-placeholder: true
+    OfficeDetail:
+      type: object
+      description: Respuesta OfficeDetail
+      x-mind-placeholder: true
+    OfficeList:
+      type: object
+      description: Respuesta OfficeList
+      x-mind-placeholder: true
+    OfficeUpdateRequest:
+      type: object
+      description: Cuerpo de petición OfficeUpdateRequest
+      x-mind-placeholder: true
+    PasswordChangeRequest:
+      type: object
+      description: Cuerpo de petición PasswordChangeRequest
+      x-mind-placeholder: true
+    PasswordChangeResult:
+      type: object
+      description: Respuesta PasswordChangeResult
+      x-mind-placeholder: true
+    PasswordResetRequest:
+      type: object
+      description: Cuerpo de petición PasswordResetRequest
+      x-mind-placeholder: true
+    PasswordResetResult:
+      type: object
+      description: Respuesta PasswordResetResult
+      x-mind-placeholder: true
+    RecipientDetail:
+      type: object
+      description: Respuesta RecipientDetail
+      x-mind-placeholder: true
+    RecipientGroupDetail:
+      type: object
+      description: Respuesta RecipientGroupDetail
+      x-mind-placeholder: true
+    RecipientResolutionPage:
+      type: object
+      description: Respuesta RecipientResolutionPage
+      x-mind-placeholder: true
+    RecipientVerificationPage:
+      type: object
+      description: Respuesta RecipientVerificationPage
+      x-mind-placeholder: true
+    RetentionOverview:
+      type: object
+      description: Respuesta RetentionOverview
+      x-mind-placeholder: true
+    RoleChangeRequest:
+      type: object
+      description: Cuerpo de petición RoleChangeRequest
+      x-mind-placeholder: true
+    RoleHistoryPage:
+      type: object
+      description: Respuesta RoleHistoryPage
+      x-mind-placeholder: true
+    RoomCreateRequest:
+      type: object
+      description: Cuerpo de petición RoomCreateRequest
+      x-mind-placeholder: true
+    RoomDetail:
+      type: object
+      description: Respuesta RoomDetail
+      x-mind-placeholder: true
+    RoomList:
+      type: object
+      description: Respuesta RoomList
+      x-mind-placeholder: true
+    RoomUpdateRequest:
+      type: object
+      description: Cuerpo de petición RoomUpdateRequest
+      x-mind-placeholder: true
+    SelfAssignmentRequest:
+      type: object
+      description: Cuerpo de petición SelfAssignmentRequest
+      x-mind-placeholder: true
+    SessionContext:
+      type: object
+      description: Respuesta SessionContext
+      x-mind-placeholder: true
+    SessionDetail:
+      type: object
+      description: Respuesta SessionDetail
+      x-mind-placeholder: true
+    SimilarClosurePage:
+      type: object
+      description: Respuesta SimilarClosurePage
+      x-mind-placeholder: true
+    StatusTransitionRequest:
+      type: object
+      description: Cuerpo de petición StatusTransitionRequest
+      x-mind-placeholder: true
+    UserCreateRequest:
+      type: object
+      description: Cuerpo de petición UserCreateRequest
+      x-mind-placeholder: true
+    UserDeactivationRequest:
+      type: object
+      description: Cuerpo de petición UserDeactivationRequest
+      x-mind-placeholder: true
+    UserDetail:
+      type: object
+      description: Respuesta UserDetail
+      x-mind-placeholder: true
+    UserListPage:
+      type: object
+      description: Respuesta UserListPage
+      x-mind-placeholder: true
+    UserReactivationRequest:
+      type: object
+      description: Cuerpo de petición UserReactivationRequest
+      x-mind-placeholder: true
+    UserRoleDetail:
+      type: object
+      description: Respuesta UserRoleDetail
+      x-mind-placeholder: true
+    UserUpdateRequest:
+      type: object
+      description: Cuerpo de petición UserUpdateRequest
+      x-mind-placeholder: true
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT de acceso. Los scopes son códigos ROL-NNN del catálogo de roles.
