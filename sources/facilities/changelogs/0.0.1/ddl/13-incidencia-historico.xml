@@ -653,4 +653,368 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-13-06" author="MIND">
+        <comment>Oraculo AC-HIST-REG-02 / AC-CIE-05: si el asiento de historico falla dentro de la transaccion del alta, la unidad de trabajo se revierte entera y no queda ni la incidencia ni el asiento</comment>
+        <!--
+            Este es el SEGUNDO ORACULO DE COMPORTAMIENTO del DoD de TSK-056 y, como el del changeset
+            13-05, se ejecuta contra el motor Oracle real durante el propio despliegue, monta su
+            escenario, comprueba las invariantes sobre datos reales y DESHACE sus propios datos con un
+            ROLLBACK final, de modo que no deja ni una fila en la base de datos.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL: un DDL provocaria un commit implicito y los datos del oraculo
+            quedarian grabados, ademas de hacer imposible la propia reversion que aqui se verifica.
+
+            Siembra los catalogos exactamente igual que 13-05 (MERGE para los de clave fija, "buscar
+            o insertar" para los de clave IDENTITY), porque los changelogs dml se aplican DESPUES de
+            los ddl y aqui todavia estan vacios. Usa identificadores propios (correos y
+            reference_code 'INC-ORA56-000002') para no chocar con los del oraculo anterior.
+
+            POR QUE UN SAVEPOINT MODELA EL LIMITE TRANSACCIONAL DEL SERVICE
+            ===============================================================
+            La convencion del proyecto es que el caso de uso de ALTA de una incidencia escribe la
+            fila de incidencia y su asiento de historico de CREACION en la MISMA transaccion (el
+            "with uow(db)" del service): o se graban los dos, o no se graba ninguno. Aqui ese limite
+            transaccional se materializa con SAVEPOINT antes_del_alta: el savepoint marca el estado
+            de la base JUSTO ANTES de entrar en la unidad de trabajo, y ROLLBACK TO SAVEPOINT es la
+            reversion COMPLETA de todo lo que la unidad de trabajo haya escrito desde entonces.
+
+            Se usa un savepoint, y no un ROLLBACK a secas, precisamente porque la siembra de
+            catalogos y las cuentas del escenario son PRECONDICIONES que viven FUERA de la unidad de
+            trabajo del alta: tienen que sobrevivir a la reversion para que la segunda mitad del
+            oraculo pueda repetir el alta sobre el mismo escenario. Un ROLLBACK total borraria
+            tambien las precondiciones y no distinguiria "se revirtio el alta" de "se revirtio todo".
+
+            POR QUE EL FALLO SE FUERZA CON UNA REGLA REAL DE LA TABLA
+            =========================================================
+            El fallo del asiento NO se simula con un RAISE artificial: se provoca un fallo de
+            PERSISTENCIA GENUINO del propio asiento, violando ck_inc_hist_from_status_creacion con un
+            asiento de entry_type = 'CREACION' que lleva from_status = 'ABIERTA' en vez de nulo. Es
+            el motor quien rechaza la fila (ORA-02290, violacion de CHECK), de modo que lo que se
+            verifica es el comportamiento real de la base ante un asiento invalido y no un error
+            inventado por el oraculo. Todo lo demas de ese INSERT es valido (entry_hash con el
+            formato que exige ck_inc_hist_entry_hash, actor existente, to_status ABIERTA), asi que la
+            UNICA causa del rechazo es la regla que se quiere forzar.
+
+            El intento va dentro de un BEGIN ... EXCEPTION WHEN OTHERS THEN v_sqlcode := SQLCODE; END;
+            para capturar el codigo sin abortar el bloque; si v_sqlcode fuese 0 el fallo no se habria
+            producido y el oraculo aborta con -20940, porque entonces la prueba no estaria probando
+            nada. Oracle hace rollback a nivel de SENTENCIA cuando una sentencia falla, de modo que
+            tras el intento la incidencia del alta SIGUE presente: es el ROLLBACK TO SAVEPOINT
+            explicito, y no el motor, quien tiene que llevarsela por delante.
+
+            QUE DEMUESTRA, PUNTO POR PUNTO
+            ==============================
+            (1) Antes del fallo, la incidencia SI existe (COUNT = 1 por reference_code). Esta
+            comprobacion intermedia es imprescindible: sin ella, un COUNT = 0 al final seria
+            compatible con que el INSERT de la incidencia no se hubiese ejecutado nunca, y el oraculo
+            estaria dando por buena una reversion que jamas ocurrio.
+
+            (2) Tras ROLLBACK TO SAVEPOINT antes_del_alta no queda NADA de la unidad de trabajo: 0
+            filas de incidencia con ese reference_code (-20941) y 0 asientos de incidencia_historico
+            para ese incident_id (-20942). Es exactamente la reversion completa que exige
+            AC-HIST-REG-02 y que AC-CIE-05 da por supuesta al cerrar el ciclo.
+
+            (3) No hay asientos HUERFANOS en toda la tabla: 0 filas de incidencia_historico cuyo
+            incident_id no exista en incidencia (-20943). Es una invariante GLOBAL de la base, no
+            solo del escenario, de modo que el oraculo detectaria tambien una traza descolgada
+            introducida por cualquier otra carga.
+
+            (4) El camino feliz como CONTRASTE: se repite el alta con el mismo reference_code (libre
+            de nuevo, precisamente porque la reversion fue real) y esta vez con el asiento de CREACION
+            BIEN formado (from_status nulo, to_status ABIERTA, previous_entry_hash nulo porque el
+            alta ABRE la cadena, entry_hash calculado con la misma forma canonica que usa 13-05).
+            Ahora incidencia y asiento COEXISTEN, 1 y 1 (-20944). Esta segunda mitad demuestra que lo
+            que fallo en la primera fue el ASIENTO y no el alta en si, y que la reversion no fue una
+            consecuencia de un escenario mal montado.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue con un
+            codigo del rango -20940..-20949 y un mensaje que cita el AC incumplido.
+
+            TODAS las marcas temporales del escenario son PASADAS porque trg_incidencia_ciclo_vida
+            rechaza con ORA-20053 cualquier marca futura.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_oficina      NUMBER;
+    v_sala         NUMBER;
+    v_categoria    NUMBER;
+    v_inc          NUMBER;
+    v_inc_ok       NUMBER;
+    v_now          TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0           TIMESTAMP;
+    v_t1           TIMESTAMP;
+    v_hash         VARCHAR2(64 CHAR);
+    v_sqlcode      NUMBER;
+    v_incidencias  NUMBER;
+    v_asientos     NUMBER;
+    v_huerfanos    NUMBER;
+
+    c_admin_nom    CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-056 Rollback Administrador';
+    c_empleado_nom CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-056 Rollback Empleado';
+    c_referencia   CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA56-000002';
+    c_descripcion  CONSTANT VARCHAR2(500 CHAR) := 'La persiana motorizada de la sala no sube y la sala se queda a oscuras toda la manana';
+    c_sala_nom     CONSTANT VARCHAR2(120 CHAR) := 'Sala del oraculo TSK-056';
+    c_oficina_nom  CONSTANT VARCHAR2(120 CHAR) := 'Oficina del oraculo TSK-056';
+    c_categoria_nm CONSTANT VARCHAR2(60 CHAR)  := 'Climatizacion oraculo TSK-056';
+    c_alta_nota    CONSTANT VARCHAR2(500 CHAR) := 'Alta de la incidencia desde el oraculo de rollback TSK-056';
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven
+    -- con el equivalente "buscar o insertar": si la semilla real ya existe se reutiliza, y si no
+    -- se crea una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA56';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA56', c_oficina_nom, 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA56-SALA-01';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA56-SALA-01', c_sala_nom, p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', c_categoria_nm, 956, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    -- Forma CANONICA del contenido encadenado de un asiento, la MISMA que usa el oraculo 13-05:
+    -- sus campos de negocio mas la huella del asiento anterior. history_id queda FUERA a proposito,
+    -- porque lo genera el motor en el propio INSERT y la huella hay que calcularla antes.
+    FUNCTION cadena(p_incident_id NUMBER, p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                    p_prev_tech NUMBER, p_tech NUMBER, p_tech_name VARCHAR2,
+                    p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                    p_comment VARCHAR2, p_res_ref NUMBER, p_prev_hash VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN p_incident_id || '|' || p_entry_type || '|' ||
+               NVL(p_from, '~') || '|' || p_to || '|' ||
+               NVL(TO_CHAR(p_prev_tech), '~') || '|' ||
+               NVL(TO_CHAR(p_tech), '~') || '|' || NVL(p_tech_name, '~') || '|' ||
+               p_actor || '|' || p_actor_name || '|' ||
+               TO_CHAR(p_changed_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(p_comment, '~') || '|' || NVL(TO_CHAR(p_res_ref), '~') || '|' ||
+               NVL(p_prev_hash, '~');
+    END cadena;
+
+    FUNCTION huella(p_incident_id NUMBER, p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                    p_prev_tech NUMBER, p_tech NUMBER, p_tech_name VARCHAR2,
+                    p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                    p_comment VARCHAR2, p_res_ref NUMBER, p_prev_hash VARCHAR2) RETURN VARCHAR2 IS
+        l_cadena VARCHAR2(4000 CHAR);
+        l_hash   VARCHAR2(64 CHAR);
+    BEGIN
+        -- La cadena canonica se compone ANTES, en PL/SQL: una funcion local de un bloque anonimo no
+        -- puede invocarse desde dentro de una sentencia SQL (PLS-00231).
+        l_cadena := cadena(p_incident_id, p_entry_type, p_from, p_to, p_prev_tech, p_tech, p_tech_name,
+                           p_actor, p_actor_name, p_changed_at, p_comment, p_res_ref, p_prev_hash);
+
+        -- STANDARD_HASH es una funcion de SQL, no de PL/SQL, y se invoca con un SELECT ... FROM dual.
+        -- Devuelve hexadecimal en MAYUSCULAS, que es lo que admite ck_inc_hist_entry_hash.
+        SELECT RAWTOHEX(STANDARD_HASH(l_cadena, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+BEGIN
+    v_t0 := v_now - INTERVAL '2' HOUR;
+    v_t1 := v_now - INTERVAL '1' HOUR;
+
+    -- ==================================================================================
+    -- PRECONDICIONES: catalogos y cuentas del escenario. Viven FUERA de la unidad de
+    -- trabajo del alta y por eso se escriben ANTES del savepoint: tienen que sobrevivir
+    -- a la reversion para que la segunda mitad pueda repetir el alta sobre lo mismo.
+    -- ==================================================================================
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES (c_admin_nom, 'oraculo.tsk056.rollback.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_at, created_by)
+         VALUES (c_empleado_nom, 'oraculo.tsk056.rollback.reportante@example.invalid', 'EMPLEADO', 'ACTIVO', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    -- ==================================================================================
+    -- PRIMERA MITAD: la unidad de trabajo del alta, con el asiento de historico fallido
+    -- ==================================================================================
+
+    -- Limite transaccional del caso de uso de alta: todo lo que se escriba a partir de
+    -- aqui es la unidad de trabajo que el service abre con "with uow(db)".
+    SAVEPOINT antes_del_alta;
+
+    -- (1) Dentro de la unidad de trabajo: alta de la incidencia, que nace ABIERTA (REQ-125).
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t0, v_t0, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    -- (2) Punto intermedio: la incidencia SI esta escrita. Sin esta comprobacion, el COUNT = 0
+    --     del final seria compatible con que el INSERT nunca llego a ejecutarse y la reversion
+    --     quedaria sin demostrar.
+    SELECT COUNT(*) INTO v_incidencias FROM incidencia WHERE reference_code = c_referencia;
+    IF v_incidencias <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20945, 'ORACULO AC-HIST-REG-02: dentro de la unidad de trabajo la incidencia deberia existir (1 fila) y hay ' || v_incidencias);
+    END IF;
+
+    -- (3) Fallo FORZADO del asiento de historico, con una regla REAL de la tabla: el asiento de
+    --     CREACION llega con from_status = 'ABIERTA' en vez de nulo y viola
+    --     ck_inc_hist_from_status_creacion, de modo que el motor lo rechaza con ORA-02290. Todo lo
+    --     demas del asiento es valido (actor existente, to_status ABIERTA, entry_hash con el
+    --     formato que exige ck_inc_hist_entry_hash), asi que esa es la UNICA causa del rechazo.
+    v_hash := huella(v_inc, 'CREACION', 'ABIERTA', 'ABIERTA',
+                     NULL, NULL, NULL,
+                     v_empleado, c_empleado_nom, v_t0,
+                     c_alta_nota, NULL, NULL);
+
+    BEGIN
+        INSERT INTO incidencia_historico (
+            incident_id, entry_type, from_status, to_status,
+            previous_technician_id, assigned_technician_id, assigned_technician_name,
+            actor_user_id, actor_display_name, changed_at,
+            entry_comment, resolution_comment_ref, previous_entry_hash, entry_hash)
+        VALUES (
+            v_inc, 'CREACION', 'ABIERTA', 'ABIERTA',
+            NULL, NULL, NULL,
+            v_empleado, c_empleado_nom, v_t0,
+            c_alta_nota, NULL, NULL, v_hash);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-HIST-REG-02: el asiento de CREACION con from_status no nulo deberia haber sido rechazado por ck_inc_hist_from_status_creacion y fue aceptado, de modo que el fallo de persistencia no se ha producido');
+    END IF;
+
+    -- (4) Reversion COMPLETA de la unidad de trabajo: es lo que hace el service cuando el asiento
+    --     falla dentro del "with uow(db)".
+    ROLLBACK TO SAVEPOINT antes_del_alta;
+
+    -- (5) No queda NADA de la unidad de trabajo revertida: ni incidencia ni asiento.
+    SELECT COUNT(*) INTO v_incidencias FROM incidencia WHERE reference_code = c_referencia;
+    IF v_incidencias <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO AC-HIST-REG-02: tras el rollback de la unidad de trabajo quedan ' || v_incidencias || ' incidencias con reference_code ' || c_referencia);
+    END IF;
+
+    SELECT COUNT(*) INTO v_asientos FROM incidencia_historico WHERE incident_id = v_inc;
+    IF v_asientos <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO AC-HIST-REG-02: tras el rollback de la unidad de trabajo quedan ' || v_asientos || ' asientos de historico de la incidencia revertida');
+    END IF;
+
+    -- (6) Invariante GLOBAL de la base: ningun asiento puede sobrevivir a la incidencia que
+    --     describe. Se comprueba sobre el 100 % de la tabla, no solo sobre el escenario.
+    SELECT COUNT(*) INTO v_huerfanos
+      FROM incidencia_historico h
+     WHERE NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.incident_id = h.incident_id);
+    IF v_huerfanos <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-HIST-REG-02: hay ' || v_huerfanos || ' asientos de historico huerfanos, sin incidencia que los sostenga');
+    END IF;
+
+    -- ==================================================================================
+    -- SEGUNDA MITAD: el camino feliz como CONTRASTE. El reference_code vuelve a estar
+    -- libre precisamente porque la reversion anterior fue real.
+    -- ==================================================================================
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t1, v_t1, NULL)
+      RETURNING incident_id INTO v_inc_ok;
+
+    -- Asiento de CREACION BIEN formado: from_status nulo (antes del alta no hay estado de origen),
+    -- to_status ABIERTA y previous_entry_hash nulo, porque el alta ABRE la cadena de huellas.
+    v_hash := huella(v_inc_ok, 'CREACION', NULL, 'ABIERTA',
+                     NULL, NULL, NULL,
+                     v_empleado, c_empleado_nom, v_t1,
+                     c_alta_nota, NULL, NULL);
+
+    INSERT INTO incidencia_historico (
+        incident_id, entry_type, from_status, to_status,
+        previous_technician_id, assigned_technician_id, assigned_technician_name,
+        actor_user_id, actor_display_name, changed_at,
+        entry_comment, resolution_comment_ref, previous_entry_hash, entry_hash)
+    VALUES (
+        v_inc_ok, 'CREACION', NULL, 'ABIERTA',
+        NULL, NULL, NULL,
+        v_empleado, c_empleado_nom, v_t1,
+        c_alta_nota, NULL, NULL, v_hash);
+
+    SELECT COUNT(*) INTO v_incidencias FROM incidencia WHERE reference_code = c_referencia;
+    SELECT COUNT(*) INTO v_asientos FROM incidencia_historico WHERE incident_id = v_inc_ok;
+    IF v_incidencias <> 1 OR v_asientos <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20944, 'ORACULO AC-HIST-REG-02: con el asiento bien formado deberian coexistir incidencia y asiento (1 y 1) y hay ' ||
+            v_incidencias || ' y ' || v_asientos || ', de modo que lo que fallo antes no fue el asiento');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
