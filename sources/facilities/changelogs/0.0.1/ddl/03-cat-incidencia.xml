@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-03-01" author="MIND">
+        <comment>Catalogo cerrado de categorias de incidencia con PK identity</comment>
+        <!--
+            La FK de updated_by a usuario (user_id) queda PENDIENTE de la TSK que cree la
+            tabla usuario (ARC-110): hoy ningun changelog de este repo la crea, y declarar
+            aqui la FK haria fallar el update por tabla inexistente.
+        -->
+        <sql>CREATE TABLE cat_categoria_incidencia (
+    category_id    NUMBER GENERATED ALWAYS AS IDENTITY,
+    category_code  VARCHAR2(20 CHAR) NOT NULL,
+    category_name  VARCHAR2(60 CHAR) NOT NULL,
+    display_order  NUMBER NOT NULL,
+    is_active      CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
+    updated_at     TIMESTAMP,
+    updated_by     NUMBER,
+    CONSTRAINT pk_cat_categoria_incidencia PRIMARY KEY (category_id),
+    CONSTRAINT uk_cat_categoria_code UNIQUE (category_code),
+    CONSTRAINT uk_cat_categoria_display_order UNIQUE (display_order),
+    CONSTRAINT ck_cat_categoria_code CHECK (category_code IN ('MOBILIARIO','CLIMATIZACION','AUDIOVISUAL','LIMPIEZA','OTROS')),
+    CONSTRAINT ck_cat_categoria_name_len CHECK (LENGTH(TRIM(category_name)) BETWEEN 3 AND 60),
+    CONSTRAINT ck_cat_categoria_is_active CHECK (is_active IN ('Y','N'))
+)</sql>
+        <rollback>
+            <dropTable tableName="cat_categoria_incidencia"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03-02" author="MIND">
+        <comment>Indice unico funcional que garantiza la unicidad de category_name sin distinguir mayusculas de minusculas</comment>
+        <sql>CREATE UNIQUE INDEX uk_cat_categoria_name_ci ON cat_categoria_incidencia (UPPER(category_name))</sql>
+        <rollback>
+            <sql>DROP INDEX uk_cat_categoria_name_ci</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03-03" author="MIND">
+        <comment>Catalogo cerrado de estados del ciclo de vida de la incidencia. status_code y status_name son los nombres fisicos del inventario T.5 (ARC-106): son los que referencian incidencia.status_code e incidencia_historico.from_status / to_status</comment>
+        <createTable tableName="cat_estado_incidencia">
+            <column name="status_code" type="VARCHAR2(20 CHAR)">
+                <constraints primaryKey="true" primaryKeyName="pk_cat_estado_incidencia" nullable="false"/>
+            </column>
+            <column name="status_name" type="VARCHAR2(40 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="sort_order" type="NUMBER">
+                <constraints nullable="false" unique="true" uniqueConstraintName="uk_cat_estado_sort_order"/>
+            </column>
+            <column name="is_terminal" type="CHAR(1 CHAR)" defaultValue="N">
+                <constraints nullable="false"/>
+            </column>
+            <column name="is_active" type="CHAR(1 CHAR)" defaultValue="Y">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="cat_estado_incidencia"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03-04" author="MIND">
+        <comment>Restricciones CHECK del catalogo de estados de incidencia</comment>
+        <sql>ALTER TABLE cat_estado_incidencia ADD CONSTRAINT ck_cat_estado_code CHECK (status_code IN ('ABIERTA','EN_CURSO','RESUELTA','CERRADA'))</sql>
+        <sql>ALTER TABLE cat_estado_incidencia ADD CONSTRAINT ck_cat_estado_is_terminal CHECK (is_terminal IN ('Y','N'))</sql>
+        <sql>ALTER TABLE cat_estado_incidencia ADD CONSTRAINT ck_cat_estado_is_active CHECK (is_active IN ('Y','N'))</sql>
+        <rollback>
+            <sql>ALTER TABLE cat_estado_incidencia DROP CONSTRAINT ck_cat_estado_code</sql>
+            <sql>ALTER TABLE cat_estado_incidencia DROP CONSTRAINT ck_cat_estado_is_terminal</sql>
+            <sql>ALTER TABLE cat_estado_incidencia DROP CONSTRAINT ck_cat_estado_is_active</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03-05" author="MIND">
+        <comment>Grafo de transiciones permitidas entre estados de incidencia, con PK identity y rol autorizado</comment>
+        <sql>CREATE TABLE cat_transicion_incidencia (
+    transition_id     NUMBER GENERATED ALWAYS AS IDENTITY,
+    from_status       VARCHAR2(20 CHAR) NOT NULL,
+    to_status         VARCHAR2(20 CHAR) NOT NULL,
+    allowed_role      VARCHAR2(32 CHAR) NOT NULL,
+    requires_assignee CHAR(1 CHAR) DEFAULT 'N' NOT NULL,
+    requires_comment  CHAR(1 CHAR) DEFAULT 'N' NOT NULL,
+    is_active         CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
+    CONSTRAINT pk_cat_transicion_incidencia PRIMARY KEY (transition_id),
+    CONSTRAINT uk_cat_transicion_from_to UNIQUE (from_status, to_status),
+    CONSTRAINT ck_cat_transicion_distinct CHECK (from_status &lt;&gt; to_status),
+    CONSTRAINT ck_cat_transicion_req_assignee CHECK (requires_assignee IN ('Y','N')),
+    CONSTRAINT ck_cat_transicion_req_comment CHECK (requires_comment IN ('Y','N')),
+    CONSTRAINT ck_cat_transicion_is_active CHECK (is_active IN ('Y','N')),
+    CONSTRAINT fk_cat_transicion_from_status FOREIGN KEY (from_status) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_cat_transicion_to_status FOREIGN KEY (to_status) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_cat_transicion_allowed_role FOREIGN KEY (allowed_role) REFERENCES cat_rol (role_code)
+)</sql>
+        <rollback>
+            <dropTable tableName="cat_transicion_incidencia"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03-06" author="MIND">
+        <comment>Indice de apoyo para resolver las transiciones disponibles desde un estado origen</comment>
+        <createIndex indexName="ix_cat_transicion_from_status" tableName="cat_transicion_incidencia">
+            <column name="from_status"/>
+        </createIndex>
+        <rollback>
+            <dropIndex indexName="ix_cat_transicion_from_status" tableName="cat_transicion_incidencia"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
