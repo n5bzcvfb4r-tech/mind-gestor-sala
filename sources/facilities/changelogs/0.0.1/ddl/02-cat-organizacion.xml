@@ -109,4 +109,35 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <!--
+        El trigger consulta cat_oficina, tabla DISTINTA de cat_sala, por lo que no hay
+        problema de tabla mutante (ORA-04091) y puede ser de nivel fila.
+    -->
+    <changeSet id="ddl-0.0.1-12" author="MIND">
+        <comment>REQ-098: una sala activa solo puede colgar de una oficina activa</comment>
+        <sql splitStatements="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_cat_sala_oficina_activa
+BEFORE INSERT OR UPDATE OF office_id, is_active ON cat_sala
+FOR EACH ROW
+DECLARE
+    l_is_active CHAR(1);
+BEGIN
+    IF :NEW.is_active = 'Y' THEN
+        SELECT o.is_active
+          INTO l_is_active
+          FROM cat_oficina o
+         WHERE o.office_id = :NEW.office_id;
+
+        IF l_is_active = 'N' THEN
+            RAISE_APPLICATION_ERROR(-20033, 'La oficina seleccionada no existe o esta inactiva');
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20033, 'La oficina seleccionada no existe o esta inactiva');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_cat_sala_oficina_activa</sql>
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
