@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-056",
+  "attempt": 1,
+  "at": "2026-10-07T14:38:52.245928+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-056 — `incidencia_historico` (ARC-118): traza append-only encadenada de alta, estado, asignación y reclasificación.\n\nENTREGA (un único fichero, dentro de la zona declarada): `sources/facilities/changelogs/0.0.1/ddl/13-incidencia-historico.xml`, 7 changesets Liquibase para Oracle 23ai. Queda montado en el changelog maestro automáticamente: `changelog-0.0.1.xml` usa `<includeAll path=\"0.0.1/ddl\">`, así que no hay que editarlo (y no se ha tocado). No se ha modificado ningún otro fichero del rep",
+  "model": "claude-opus-5",
+  "input_tokens": 2822426,
+  "output_tokens": 41046,
+  "llm_calls": 153,
+  "cost_usd": 11.957408999999998,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "5355b07b1479978cf427d52da72847a301820a31",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
