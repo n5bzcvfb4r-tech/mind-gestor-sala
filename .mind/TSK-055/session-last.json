@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-055",
+  "attempt": 1,
+  "at": "2026-10-07T13:26:52.774716+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-055 — `incidencia_adjunto` (ARC-114): foto opcional con clave opaca e integridad verificable.\n\nENTREGA (un único fichero nuevo, dentro de la zona declarada):\n`sources/facilities/changelogs/0.0.1/ddl/12-incidencia-adjunto.xml`, con 5 changesets `author=\"MIND\"` que imitan exactamente la forma de los changelogs hermanos del repo (`16-resolucion-destinatario-log.xml`, `10-incidencia.xml`): `<sql>` crudo, `<comment>` + bloque explicativo en español sin tildes, y `<rollback>` en todos ellos.\n\n- `d",
+  "model": "claude-opus-5",
+  "input_tokens": 1229687,
+  "output_tokens": 28170,
+  "llm_calls": 74,
+  "cost_usd": 2.767148999999999,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "38bbc3f0450e5ed7ac119a18da0970450a00f9ee",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
