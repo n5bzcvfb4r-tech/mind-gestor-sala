@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-10-01" author="MIND">
+        <comment>Nucleo de la incidencia (ARC-113): alta con referencia unica, sala, categoria, snapshots de denominacion y autor</comment>
+        <!--
+            Las columnas FISICAS de escritura del estado y del autor son status y reported_by, que
+            son los nombres del DoD de TSK-053 y por tanto los que acepta el INSERT.
+
+            status_code y reported_by_user_id son columnas VIRTUALES de solo lectura que publican
+            sobre esas mismas columnas fisicas los nombres del inventario T.5 ARC-113; misma tecnica
+            que event_type y previous_value en usuario_historico y que usuario.is_active. No ocupan
+            almacenamiento y Oracle responde ORA-54013 si alguien intenta escribirlas.
+
+            created_at usa DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) y no SYSTIMESTAMP crudo: es la
+            misma marca naive en UTC que usuario.created_at y cat_sala.created_at, convencion del
+            proyecto para toda marca de auditoria. SYSTIMESTAMP a secas grabaria la hora local del
+            servidor, que depende de su zona horaria y rompe la comparacion entre marcas.
+
+            room_name_snapshot, office_name_snapshot y category_name_snapshot guardan la
+            denominacion VIGENTE EN EL ALTA de la sala, su oficina y la categoria (REQ-150): un
+            renombrado posterior del catalogo no reescribe la incidencia ya registrada. Son
+            INMUTABLES; el trigger que lo impone llega en un changeset posterior de este mismo
+            fichero. Se dimensionan a 120 CHAR (sala y oficina) y 60 CHAR (categoria) para no quedar
+            por debajo de la columna de origen.
+
+            NINGUNA de las cuatro FK declara ON DELETE (REQ-087 / AC-TRZ-02): ni CASCADE ni SET
+            NULL. Ademas reported_by es NOT NULL, de modo que una desactivacion de usuario nunca
+            puede dejar la atribucion de la incidencia a NULL ni borrarla en cascada: la traza del
+            autor sobrevive al ciclo de vida de la cuenta.
+
+            Las columnas restantes de T.5 ARC-113 (assigned_technician_id, in_progress_at,
+            resolved_at, closed_at, resolution_comment, status_changed_at, retention_expires_at,
+            ...) pertenecen al ciclo de vida de la incidencia y las anaden las TSK siguientes; esta
+            tarea entrega el NUCLEO del alta.
+        -->
+        <sql>CREATE TABLE incidencia (
+    incident_id            NUMBER GENERATED ALWAYS AS IDENTITY,
+    reference_code         VARCHAR2(30 CHAR) NOT NULL,
+    room_id                NUMBER NOT NULL,
+    category_id            NUMBER NOT NULL,
+    room_name_snapshot     VARCHAR2(120 CHAR) NOT NULL,
+    office_name_snapshot   VARCHAR2(120 CHAR) NOT NULL,
+    category_name_snapshot VARCHAR2(60 CHAR) NOT NULL,
+    description            VARCHAR2(500 CHAR) NOT NULL,
+    status                 VARCHAR2(20 CHAR) DEFAULT 'ABIERTA' NOT NULL,
+    reported_by            NUMBER NOT NULL,
+    created_at             TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    updated_at             TIMESTAMP(6),
+    version                NUMBER DEFAULT 0 NOT NULL,
+    status_code            GENERATED ALWAYS AS (CAST(status AS VARCHAR2(20 CHAR))) VIRTUAL,
+    reported_by_user_id    GENERATED ALWAYS AS (reported_by) VIRTUAL,
+    CONSTRAINT pk_incidencia PRIMARY KEY (incident_id),
+    CONSTRAINT uk_incidencia_reference_code UNIQUE (reference_code),
+    CONSTRAINT ck_incidencia_description_len CHECK (LENGTH(description) BETWEEN 10 AND 500),
+    CONSTRAINT ck_incidencia_description_blank CHECK (TRIM(description) IS NOT NULL),
+    CONSTRAINT ck_incidencia_version CHECK (version &gt;= 0),
+    CONSTRAINT fk_incidencia_room FOREIGN KEY (room_id) REFERENCES cat_sala (room_id),
+    CONSTRAINT fk_incidencia_category FOREIGN KEY (category_id) REFERENCES cat_categoria_incidencia (category_id),
+    CONSTRAINT fk_incidencia_status FOREIGN KEY (status) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_incidencia_reported_by FOREIGN KEY (reported_by) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="incidencia"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
