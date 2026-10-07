@@ -625,4 +625,271 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-07" author="MIND">
+        <comment>Oraculo AC-BAN-07 / REQ-110: la busqueda de 'proyector' recupera 'Proyector' y 'PROYECTOR' con tilde, y los comodines % y _ se tratan como literales</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la busqueda textual de la bandeja. Siembra seis incidencias
+            en una sala propia y pregunta por ellas tal y como lo hara la consulta real, para
+            DEMOSTRAR que 'proyector', 'Proyector' y 'PROYECTOR' acentuado encuentran las mismas
+            filas.
+
+            COMO SE OBTIENE LA COMPARACION ACENTO E INSENSIBLE A MAYUSCULAS
+            =============================================================
+            No se obtiene normalizando el texto a mano ni envolviendo la columna en UPPER o TRANSLATE:
+            se obtiene activando en la SESION el juego de ordenacion linguistico
+                ALTER SESSION SET NLS_COMP = LINGUISTIC
+                ALTER SESSION SET NLS_SORT = SPANISH_AI
+            que es EXACTAMENTE el mismo juego sobre el que se construyo el indice funcional
+            ix_incidencia_desc_ai en ddl-0.0.1-17-03. Con NLS_COMP = LINGUISTIC el operador LIKE deja
+            de comparar byte a byte y compara LINGUISTICAMENTE con el juego de NLS_SORT; y como el
+            sufijo _AI de SPANISH_AI es a la vez insensible a acentos y a mayusculas, 'proyector',
+            'Proyector' y 'PROYECTOR' con tilde son para el motor EL MISMO TEXTO. Que el oraculo y el
+            indice usen el mismo juego no es casual: solo asi la busqueda puede apoyarse en el indice
+            en lugar de calcular la clave linguistica de todas las filas.
+
+            POR QUE EL ALTER SESSION NO ROMPE EL ROLLBACK
+            ============================================
+            ALTER SESSION es una orden de sesion, NO de transaccion: no confirma lo pendiente, no
+            abre una transaccion nueva y no cierra la que esta en curso (a diferencia del DDL, que si
+            provoca COMMIT implicito). Por eso la siembra de este oraculo sigue siendo enteramente
+            reversible y el ROLLBACK final la deshace por completo.
+
+            Aun asi, el cambio de NLS SI persiste en la sesion mas alla de este bloque, y la sesion es
+            la misma con la que Liquibase ejecutara los changesets siguientes. Dejar NLS_COMP en
+            LINGUISTIC contaminaria esas ejecuciones posteriores alterando en silencio el resultado de
+            sus comparaciones. De ahi que la sesion se devuelva a NLS_COMP = BINARY (y NLS_SORT =
+            BINARY) ANTES del ROLLBACK, y tambien en la rama de excepcion dentro de un bloque interno
+            tolerante, para que una restauracion fallida no enmascare el error original.
+
+            EL ESCAPE DE COMODINES
+            ======================
+            La regla 4 de REQ-110 exige que los caracteres % y _ ESCRITOS POR EL USUARIO se busquen
+            como texto literal y no como comodines del LIKE. Sin escape, buscar '100%' devolveria
+            TODAS las filas (porque % significa "cualquier cosa") y buscar 'corriente_de' aceptaria
+            cualquier caracter en el hueco del _. En Oracle eso se resuelve declarando un caracter de
+            escape con ESCAPE '\' y anteponiendolo a cada comodin del patron; el oraculo comprueba
+            que cada una de esas dos busquedas devuelve UNA sola fila, que es la respuesta correcta
+            cuando el comodin se trata como literal.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60B / SAL-ORA60C), display_order y sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_tecnico   NUMBER;
+    v_office    NUMBER;
+    v_room      NUMBER;
+    v_cat       NUMBER;
+
+    v_n         NUMBER;
+    v_mayus     NUMBER;
+    v_acento    NUMBER;
+    v_ruido     NUMBER;
+    v_cod       NUMBER;
+    v_pct       NUMBER;
+    v_us        NUMBER;
+    v_idx       NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60B' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60B', 'Oficina Oraculo Busqueda', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60B';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Busqueda Admin', 'oraculo.tsk060.txt.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Busqueda Tecnico', 'oraculo.tsk060.txt.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60C' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60C', 'Sala Oraculo Busqueda Textual', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60C';
+
+    -- Tres descripciones CONTIENEN el termino en tres grafias distintas (minuscula, mayuscula
+    -- inicial y mayusculas con tilde) y tres NO lo contienen; dos de estas ultimas llevan ademas
+    -- un % y un _ literales para probar el escape de comodines.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00001', v_room, v_cat, 'El Proyector de la sala no enciende al conectar el portatil', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00002', v_room, v_cat, 'EL PROYECTÓR PARPADEA Y PIERDE LA SENAL DE VIDEO CADA POCOS MINUTOS', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00003', v_room, v_cat, 'Mando a distancia del proyector sin pilas desde la semana pasada', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00004', v_room, v_cat, 'La persiana de la sala esta descolgada y no baja del todo', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00005', v_room, v_cat, 'Silla de ruedas rota junto a la mesa principal de reuniones', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00006', v_room, v_cat, 'Un 100% de las tomas de corriente_de la pared no dan tension', v_tecnico);
+
+    -- Activa el MISMO juego linguistico sobre el que se construyo ix_incidencia_desc_ai.
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = LINGUISTIC';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = SPANISH_AI';
+
+    -- Coincidencia parcial, insensible a mayusculas y a acentos: las tres grafias del termino.
+    SELECT COUNT(*) INTO v_n
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%proyector%';
+
+    IF v_n <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-BAN-07: la busqueda de proyector recupera ' || v_n || ' incidencias en lugar de 3: la comparacion no es acento e insensible a mayusculas');
+    END IF;
+
+    -- Las dos variantes concretas que exige el DoD, comprobadas una a una.
+    SELECT COUNT(*) INTO v_mayus
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code = 'INC-9060-C00001'
+       AND description LIKE '%proyector%';
+
+    IF v_mayus <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-BAN-07: la variante con mayuscula inicial Proyector no la recupera la busqueda en minusculas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_acento
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code = 'INC-9060-C00002'
+       AND description LIKE '%proyector%';
+
+    IF v_acento <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-BAN-07: la variante acentuada PROYECTOR con tilde no la recupera la busqueda sin tilde');
+    END IF;
+
+    -- La busqueda no falsea positivos: las filas sin el termino no pueden aparecer.
+    SELECT COUNT(*) INTO v_ruido
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code IN ('INC-9060-C00004', 'INC-9060-C00005')
+       AND description LIKE '%proyector%';
+
+    IF v_ruido <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-BAN-07: la busqueda devuelve filas que no contienen el termino');
+    END IF;
+
+    -- Busqueda por codigo de incidencia insensible a mayusculas (ix_incidencia_reference_upper).
+    SELECT COUNT(*) INTO v_cod
+      FROM incidencia
+     WHERE UPPER(reference_code) = UPPER('inc-9060-c00003');
+
+    IF v_cod <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO AC-BAN-07: la busqueda por codigo de incidencia no es insensible a mayusculas');
+    END IF;
+
+    -- REQ-110 regla 4: el % escrito por el usuario es literal, no comodin.
+    SELECT COUNT(*) INTO v_pct
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%100\%%' ESCAPE '\';
+
+    IF v_pct <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO AC-BAN-07: el comodin % del texto buscado no se esta tratando como literal');
+    END IF;
+
+    -- REQ-110 regla 4: el _ escrito por el usuario es literal, no comodin de un caracter.
+    SELECT COUNT(*) INTO v_us
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%corriente\_de%' ESCAPE '\';
+
+    IF v_us <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20956, 'ORACULO AC-BAN-07: el comodin _ del texto buscado no se esta tratando como literal');
+    END IF;
+
+    -- Los indices funcionales que sostienen la busqueda existen y son utilizables.
+    SELECT COUNT(*) INTO v_idx
+      FROM user_indexes
+     WHERE index_name = 'IX_INCIDENCIA_DESC_AI'
+       AND status = 'VALID';
+
+    IF v_idx <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20957, 'ORACULO AC-BAN-07: el indice funcional NLSSORT sobre description no existe o no es valido');
+    END IF;
+
+    SELECT COUNT(*) INTO v_idx
+      FROM user_indexes
+     WHERE index_name = 'IX_INCIDENCIA_REFERENCE_UPPER'
+       AND status = 'VALID';
+
+    IF v_idx <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20958, 'ORACULO AC-BAN-07: el indice funcional UPPER sobre reference_code no existe o no es valido');
+    END IF;
+
+    -- Devuelve la sesion a la comparacion binaria para no contaminar los changesets posteriores.
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = BINARY';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = BINARY';
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        BEGIN
+            EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = BINARY';
+            EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = BINARY';
+        EXCEPTION
+            WHEN OTHERS THEN NULL;
+        END;
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
