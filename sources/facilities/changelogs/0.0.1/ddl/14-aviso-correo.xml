@@ -218,4 +218,99 @@
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-14-03" author="MIND">
+        <comment>Invariantes de unicidad del outbox y acceso FIFO del despachador: un unico aviso de alta por incidencia, un unico aviso por entrada de historico y consumo por estado y fecha de reintento</comment>
+        <!--
+            ux_aviso_correo_alta es la restriccion que materializa "exactamente un aviso de alta por
+            incidencia" (REQ-130, AC-AVI-01 / AC-AVI-02): el DoD la enuncia como unica sobre
+            (incident_id, notification_type) para NEW_INCIDENT_ALERT, y aqui se implementa como indice
+            unico FUNCIONAL sobre una expresion CASE, misma tecnica que ux_inc_hist_creacion. La
+            expresion vale NULL en las filas de los otros tres tipos de aviso y Oracle NO indexa las
+            claves integramente nulas, de modo que la unicidad aplica SOLO al subconjunto
+            NEW_INCIDENT_ALERT y los avisos de cambio de estado o de credencial de la misma incidencia
+            pasan sin estorbar. Incluir notification_type como segunda columna seria inutil: dentro del
+            subconjunto ya es constante.
+
+            Es ademas el mecanismo de IDEMPOTENCIA frente al reintento del alta: un segundo INSERT de
+            aviso de alta para la misma incidencia choca con ORA-00001 y el reintento no duplica el
+            correo.
+
+            ux_aviso_correo_cambio_estado impone "un aviso por entrada de historial" (REQ-137,
+            AC-AVI-02 de REQ-137): la pareja (incident_id, history_entry_id) es unica dentro del
+            subconjunto STATUS_CHANGE_ALERT. Las dos columnas del indice son expresiones CASE para que
+            ambas valgan NULL fuera del subconjunto; si solo se envolviera la primera, las filas de
+            otros tipos entrarian en el indice con clave parcialmente informada y colisionarian entre
+            si.
+
+            La CHECK ck_aviso_correo_vinculo del changeset 14-02 es la PRECONDICION de los dos
+            indices: garantiza que dentro de cada subconjunto las columnas indexadas nunca son nulas,
+            que es lo que impide esquivar la unicidad con una clave nula.
+
+            ix_aviso_correo_fifo sirve el CONSUMO del despachador (REQ-132): el worker toma las
+            solicitudes PENDIENTE cuyo next_attempt_at ya ha vencido en orden de creacion, con
+            SELECT ... FOR UPDATE SKIP LOCKED. El orden de columnas (status, next_attempt_at,
+            created_at) es el del predicado: igualdad por estado, rango por fecha de reintento y orden
+            FIFO por fecha de creacion, de modo que el indice resuelve filtro y ordenacion sin
+            ordenacion adicional.
+
+            ix_aviso_correo_incidencia sirve la consulta administrativa de avisos por incidencia
+            (REQ-145) y evita ademas el bloqueo de tabla hija que Oracle toma sobre una FK no indexada
+            al operar sobre incidencia.
+
+            NINGUN indice toca body_text ni body_html: son CLOB y Oracle rechaza un indice de arbol B
+            sobre ellos.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_aviso_correo_alta ON aviso_correo (CASE WHEN notification_type = 'NEW_INCIDENT_ALERT' THEN incident_id END)</sql>
+        <sql>CREATE UNIQUE INDEX ux_aviso_correo_cambio_estado ON aviso_correo (CASE WHEN notification_type = 'STATUS_CHANGE_ALERT' THEN incident_id END, CASE WHEN notification_type = 'STATUS_CHANGE_ALERT' THEN history_entry_id END)</sql>
+        <sql>CREATE INDEX ix_aviso_correo_fifo ON aviso_correo (status, next_attempt_at, created_at)</sql>
+        <sql>CREATE INDEX ix_aviso_correo_incidencia ON aviso_correo (incident_id, created_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_aviso_correo_incidencia</sql>
+            <sql>DROP INDEX ix_aviso_correo_fifo</sql>
+            <sql>DROP INDEX ux_aviso_correo_cambio_estado</sql>
+            <sql>DROP INDEX ux_aviso_correo_alta</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-14-04" author="MIND" runOnChange="true">
+        <comment>REQ-142: ENVIADO es estado terminal, el trigger rechaza con ORA-20060 cualquier transicion que salga de el</comment>
+        <!--
+            REQ-142 y su validacion 5 son explicitos: "ENVIADO es un estado final; un aviso enviado no
+            pasa a FALLIDO ni a DESCARTADO", y el DoD exige rechazar el paso de ENVIADO a cualquier
+            otro estado.
+
+            Es un trigger de FILA (FOR EACH ROW) con clausula WHEN, y no de sentencia: la tabla
+            aviso_correo se actualiza constantemente en su operacion normal (el despachador mueve
+            PENDIENTE -> ENVIANDO -> ENVIADO, incrementa attempt_count y programa next_attempt_at), de
+            modo que prohibir el UPDATE entero seria inservible. La clausula WHEN acota la evaluacion a
+            la unica fila infractora y deja pasar el resto sin coste. Es la diferencia con los triggers
+            de inmutabilidad append-only de incidencia_historico y auditoria_acceso, cuyas tablas no
+            admiten UPDATE alguno.
+
+            En la clausula WHEN las pseudocolumnas se escriben SIN los dos puntos (OLD.status,
+            NEW.status); dentro del bloque PL/SQL SI los llevan (:NEW.status). Es sintaxis obligatoria
+            de Oracle.
+
+            El UPDATE que deja ENVIADO en ENVIADO (por ejemplo, el que registra un message_id) NO se
+            bloquea: la condicion exige que el estado nuevo sea DISTINTO.
+
+            Junto con ck_aviso_correo_enviado (message_id y sent_at obligatorios en ENVIADO) cierra la
+            idempotencia de AC-AVI-06 y AC-SMTP-02: una solicitud ya entregada no puede volver a la
+            cola, ni por un reproceso del worker atascado ni por un reenvio manual del administrador,
+            de modo que nunca se genera un segundo correo.
+
+            El codigo ORA-20060 no esta usado por ningun otro trigger del esquema.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_aviso_correo_estado_final
+BEFORE UPDATE ON aviso_correo
+FOR EACH ROW
+WHEN (OLD.status = 'ENVIADO' AND NEW.status <> 'ENVIADO')
+BEGIN
+    RAISE_APPLICATION_ERROR(-20060, 'El aviso ya entregado es terminal: ENVIADO no admite transicion a ' || :NEW.status);
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_aviso_correo_estado_final</sql>
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
