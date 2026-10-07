@@ -1,0 +1,576 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-16-01" author="MIND">
+        <comment>Registro inmutable de resoluciones de destinatarios del directorio (ARC-120): quien se resolvio, nunca su correo</comment>
+        <!--
+            resolved_user_ids es un CLOB que guarda un documento JSON (la lista de identificadores de
+            los destinatarios resueltos) validado por la restriccion IS JSON (STRICT). El DoD de
+            TSK-059 fija CLOB + IS JSON, y esa decision prevalece sobre el VARCHAR2(4000) que figura
+            en el inventario T.5 ARC-120.
+
+            resolved_ids_cardinalidad y resolved_ids_solo_numeros son columnas VIRTUALES de solo
+            lectura (misma tecnica que usuario.is_active y usuario_historico.event_type): proyectan
+            sobre NUMBER el tamanio de la lista y si todos sus elementos son numeros, para poder
+            declarar CHECKs deterministas SIN referenciar el CLOB, porque Oracle solo admite la
+            condicion IS JSON sobre una columna LOB. Oracle responde ORA-54013 si alguien intenta
+            escribirlas.
+
+            resolved_at usa DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la misma marca naive en UTC que
+            usuario.created_at y usuario_historico.changed_at, convencion del proyecto para toda
+            marca de auditoria; el DoD pide "default SYSTIMESTAMP" y esta es su forma normalizada a
+            UTC.
+
+            NO hay indice de arbol B sobre resolved_user_ids: Oracle rechaza indexar un CLOB.
+        -->
+        <sql>CREATE TABLE resolucion_destinatario_log (
+    resolution_id           NUMBER GENERATED ALWAYS AS IDENTITY,
+    request_type            VARCHAR2(20 CHAR) NOT NULL,
+    requested_by_module     VARCHAR2(50 CHAR) NOT NULL,
+    subject_user_id         NUMBER,
+    resolved_user_ids       CLOB NOT NULL,
+    recipient_count         NUMBER NOT NULL,
+    is_fallback_used        CHAR(1) DEFAULT 'N' NOT NULL,
+    outcome                 VARCHAR2(30 CHAR) NOT NULL,
+    resolved_at             TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    resolved_by_user_id     NUMBER,
+    resolved_ids_cardinalidad NUMBER GENERATED ALWAYS AS (JSON_VALUE(resolved_user_ids, '$.size()' RETURNING NUMBER NULL ON ERROR)) VIRTUAL,
+    resolved_ids_solo_numeros NUMBER GENERATED ALWAYS AS (CASE WHEN JSON_EXISTS(resolved_user_ids, '$[*]?(@.type() &lt;&gt; "number")') THEN 0 ELSE 1 END) VIRTUAL,
+    CONSTRAINT pk_resolucion_destinatario_log PRIMARY KEY (resolution_id),
+    CONSTRAINT ck_res_dest_ids_json CHECK (resolved_user_ids IS JSON (STRICT)),
+    CONSTRAINT fk_res_dest_subject_user FOREIGN KEY (subject_user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_res_dest_resolved_by FOREIGN KEY (resolved_by_user_id) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="resolucion_destinatario_log"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-02" author="MIND">
+        <comment>Reglas de coherencia del registro de resoluciones (REQ-081): enumerados, sujeto solo en INDIVIDUAL y cardinalidad</comment>
+        <!--
+            ck_res_dest_subject_iff materializa "sujeto informado si y solo si la peticion es
+            INDIVIDUAL": en una resolucion COLECTIVO no hay usuario sujeto y la columna va nula.
+
+            ck_res_dest_cardinalidad materializa "recipient_count coincide con la cardinalidad de
+            resolved_user_ids" apoyandose en JSON_VALUE (determinista) a traves de la columna virtual
+            resolved_ids_cardinalidad, porque la CHECK no puede leer el CLOB directamente.
+
+            ck_res_dest_solo_identificadores materializa RN-06 / REQ-081: la lista solo admite
+            numeros, de modo que un correo corporativo en claro (una cadena) es rechazado por la BASE
+            DE DATOS, no por la aplicacion.
+        -->
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_request_type CHECK (request_type IN ('INDIVIDUAL','COLECTIVO'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_outcome CHECK (outcome IN ('OK','SIN_DESTINATARIOS','NO_ENCONTRADO','NO_NOTIFICABLE','ERROR_TECNICO'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_fallback CHECK (is_fallback_used IN ('Y','N'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_recipient_count_min CHECK (recipient_count &gt;= 0)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_subject_iff CHECK (
+    (request_type = 'INDIVIDUAL' AND subject_user_id IS NOT NULL)
+ OR (request_type = 'COLECTIVO' AND subject_user_id IS NULL)
+)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_sin_destinatarios CHECK (outcome &lt;&gt; 'SIN_DESTINATARIOS' OR recipient_count = 0)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_cardinalidad CHECK (recipient_count = resolved_ids_cardinalidad)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_solo_identificadores CHECK (resolved_ids_solo_numeros = 1)</sql>
+        <rollback>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_solo_identificadores</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_cardinalidad</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_sin_destinatarios</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_subject_iff</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_recipient_count_min</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_fallback</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_outcome</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_request_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-03" author="MIND">
+        <comment>Indices de consulta del registro: orden cronologico descendente y filtro por usuario sujeto</comment>
+        <sql>CREATE INDEX ix_res_dest_resolved_at ON resolucion_destinatario_log (resolved_at DESC)</sql>
+        <sql>CREATE INDEX ix_res_dest_subject_user ON resolucion_destinatario_log (subject_user_id)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_res_dest_subject_user</sql>
+            <sql>DROP INDEX ix_res_dest_resolved_at</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-04" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad del registro de resoluciones (REQ-081 RN-02, AC-DIR-05): UPDATE y DELETE rechazados con ORA-20005</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW): se dispara una vez por sentencia y rechaza
+            el UPDATE o el DELETE incluso cuando la sentencia no afecta a ninguna fila, de modo que
+            no hay forma de alterar ni de borrar un registro ya escrito.
+
+            La fila solo admite INSERT. La retencion de 2 anios se apoya en esta garantia.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_resolucion_dest_inmutable
+BEFORE UPDATE OR DELETE ON resolucion_destinatario_log
+BEGIN
+    RAISE_APPLICATION_ERROR(-20005, 'El registro de resoluciones de destinatarios es inmutable');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_resolucion_dest_inmutable</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-05" author="MIND">
+        <comment>Oraculo REQ-081 / AC-DIR-05: ninguna fila del registro contiene correos corporativos en claro</comment>
+        <!--
+            La prueba tiene dos mitades complementarias, y las dos se ejecutan contra el motor Oracle
+            real durante el propio despliegue.
+
+            MITAD 1, el DICCIONARIO: interroga USER_TAB_COLUMNS para demostrar que la tabla NO declara
+            ninguna columna de correo (nada que se llame EMAIL, MAIL, CORREO ni ADDRESS), de modo que
+            no existe siquiera un sitio donde guardar una direccion; y confirma que la tabla si existe
+            con sus 10 columnas fisicas esperadas, para que la mitad anterior no pase por un simple
+            error de nombre.
+
+            MITAD 2, el CONTENIDO: busca un patron de correo sobre el texto real de resolved_user_ids
+            en TODAS las filas del registro, incluidas las tres filas representativas que el propio
+            oraculo acaba de insertar (resolucion individual, colectiva y sin destinatarios).
+
+            MITAD 3, el RECHAZO ACTIVO: ademas de constatar que no hay correos, demuestra que la BASE
+            DE DATOS rechaza por si misma un intento de registrar un correo corporativo en claro, via
+            ck_res_dest_solo_identificadores.
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl y el
+            catalogo todavia esta vacio. El bloque deshace sus propios datos con un ROLLBACK final y
+            no deja ni una fila en la base de datos.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_emp1        NUMBER;
+    v_emp2        NUMBER;
+    v_col_correo  NUMBER;
+    v_cols        NUMBER;
+    v_con_correo  NUMBER;
+    v_sqlcode     NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 902);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Directorio Admin', 'oraculo.tsk059.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Directorio Empleado Uno', 'oraculo.tsk059.empleado1@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp1;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Directorio Empleado Dos', 'oraculo.tsk059.empleado2@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp2;
+
+    -- MITAD 1: el diccionario no conoce ninguna columna de correo en esta tabla.
+    SELECT COUNT(*) INTO v_col_correo
+      FROM user_tab_columns
+     WHERE table_name = 'RESOLUCION_DESTINATARIO_LOG'
+       AND (column_name LIKE '%EMAIL%' OR column_name LIKE '%MAIL%'
+         OR column_name LIKE '%CORREO%' OR column_name LIKE '%ADDRESS%');
+    IF v_col_correo <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20930, 'ORACULO REQ-081: la tabla declara ' || v_col_correo || ' columnas de correo; el registro solo admite identificadores');
+    END IF;
+
+    SELECT COUNT(*) INTO v_cols
+      FROM user_tab_columns
+     WHERE table_name = 'RESOLUCION_DESTINATARIO_LOG'
+       AND column_name IN ('RESOLUTION_ID','REQUEST_TYPE','REQUESTED_BY_MODULE','SUBJECT_USER_ID','RESOLVED_USER_IDS','RECIPIENT_COUNT','IS_FALLBACK_USED','OUTCOME','RESOLVED_AT','RESOLVED_BY_USER_ID');
+    IF v_cols <> 10 THEN
+        RAISE_APPLICATION_ERROR(-20931, 'ORACULO REQ-081: el diccionario declara ' || v_cols || ' de las 10 columnas fisicas esperadas en RESOLUCION_DESTINATARIO_LOG');
+    END IF;
+
+    -- Tres filas representativas de los casos del requisito.
+    -- a) Resolucion INDIVIDUAL: un unico destinatario, el propio empleado sujeto.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp1, '[' || v_emp1 || ']', 1, 'N', 'OK', v_admin);
+
+    -- b) Resolucion COLECTIVO: sin sujeto, dos destinatarios resueltos.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('COLECTIVO', 'MOD-002-AVISOS', NULL, '[' || v_emp1 || ',' || v_emp2 || ']', 2, 'N', 'OK', v_admin);
+
+    -- c) Resolucion COLECTIVO sin destinatarios: lista vacia y recuento cero.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('COLECTIVO', 'MOD-003-INCIDENCIAS', NULL, '[]', 0, 'N', 'SIN_DESTINATARIOS', v_admin);
+
+    -- MITAD 2: ninguna fila del registro contiene un correo en claro.
+    SELECT COUNT(*) INTO v_con_correo
+      FROM resolucion_destinatario_log
+     WHERE REGEXP_LIKE(resolved_user_ids, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}');
+    IF v_con_correo <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20932, 'ORACULO AC-DIR-05: hay ' || v_con_correo || ' filas con un correo en claro en resolved_user_ids');
+    END IF;
+
+    -- MITAD 3: la base de datos rechaza activamente registrar un correo corporativo en claro.
+    BEGIN
+        INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+             VALUES ('COLECTIVO', 'MOD-002-AVISOS', NULL, '["empleado.uno@mapfre.com"]', 1, 'N', 'OK', v_admin);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO REQ-081: la base de datos ha aceptado registrar un correo corporativo en claro');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-06" author="MIND">
+        <comment>Oraculo REQ-081 RN-05: una resolucion con 3 destinatarios registra recipient_count = 3</comment>
+        <!--
+            Comprueba la regla de cardinalidad en sus DOS sentidos, contra el motor Oracle real.
+
+            El sentido POSITIVO: una resolucion colectiva con tres identificadores se registra y, al
+            releerla, su recipient_count vale 3 y coincide con la cardinalidad real de la lista JSON
+            (columna virtual resolved_ids_cardinalidad), de modo que el recuento no es un dato suelto
+            sino un reflejo verificable del contenido.
+
+            El sentido NEGATIVO: un recuento mentiroso (los mismos 3 identificadores declarados como
+            2) es RECHAZADO por ck_res_dest_cardinalidad, no por la aplicacion. Y se comprueba de
+            paso la regla hermana RN-04: un resultado SIN_DESTINATARIOS con recuento distinto de 0 es
+            rechazado por ck_res_dest_sin_destinatarios.
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl. El
+            bloque deshace sus propios datos con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin    NUMBER;
+    v_u1       NUMBER;
+    v_u2       NUMBER;
+    v_u3       NUMBER;
+    v_res      NUMBER;
+    v_count    NUMBER;
+    v_card     NUMBER;
+    v_sqlcode  NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 902);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Cardinalidad Admin', 'oraculo.tsk059.card.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Cardinalidad Uno', 'oraculo.tsk059.card1@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_u1;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Cardinalidad Dos', 'oraculo.tsk059.card2@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_u2;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Cardinalidad Tres', 'oraculo.tsk059.card3@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_u3;
+
+    -- Caso correcto: 3 identificadores resueltos y recuento 3.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('COLECTIVO', 'MOD-002-AVISOS', NULL, '[' || v_u1 || ',' || v_u2 || ',' || v_u3 || ']', 3, 'N', 'OK', v_admin)
+      RETURNING resolution_id INTO v_res;
+
+    SELECT recipient_count, resolved_ids_cardinalidad
+      INTO v_count, v_card
+      FROM resolucion_destinatario_log
+     WHERE resolution_id = v_res;
+
+    IF v_count <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO REQ-081: recipient_count es ' || v_count || ' y se esperaban 3');
+    END IF;
+
+    IF v_card <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO REQ-081: la cardinalidad real de resolved_user_ids es ' || v_card || ' y no coincide con los 3 destinatarios registrados');
+    END IF;
+
+    -- Sentido negativo: un recuento incoherente con la lista es rechazado por la base de datos.
+    BEGIN
+        INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+             VALUES ('COLECTIVO', 'MOD-002-AVISOS', NULL, '[' || v_u1 || ',' || v_u2 || ',' || v_u3 || ']', 2, 'N', 'OK', v_admin);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO REQ-081: la base de datos ha aceptado un recipient_count incoherente con la cardinalidad de resolved_user_ids');
+    END IF;
+
+    -- Regla hermana RN-04: SIN_DESTINATARIOS exige recuento cero.
+    BEGIN
+        INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+             VALUES ('COLECTIVO', 'MOD-002-AVISOS', NULL, '[' || v_u1 || ']', 1, 'N', 'SIN_DESTINATARIOS', v_admin);
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO REQ-081 RN-04: SIN_DESTINATARIOS admitido con recipient_count distinto de 0');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-07" author="MIND">
+        <comment>Oraculo AC-DIR-05 / REQ-081 RN-02: UPDATE y DELETE sobre un registro devuelven ORA-20005 y lo dejan identico</comment>
+        <!--
+            Comprueba contra el motor Oracle real las DOS mitades de la inmutabilidad del registro de
+            resoluciones: que el UPDATE y que el DELETE sobre una fila ya escrita son rechazados con
+            ORA-20005, el error que lanza trg_resolucion_dest_inmutable.
+
+            Ademas de constatar el rechazo, verifica que la fila SIGUE EXISTIENDO y que es identica
+            byte a byte: toma una instantanea textual de todas sus columnas fisicas y su huella
+            SHA-256 antes de los intentos y las vuelve a calcular despues, de modo que ni un solo
+            caracter puede haber cambiado.
+
+            Oracle hace rollback a nivel de SENTENCIA cuando el trigger lanza el error, por lo que
+            los intentos fallidos no tumban los datos ya insertados por el propio oraculo y el bloque
+            puede seguir comprobando sobre ellos.
+
+            La ultima comprobacion cubre la vertiente de trigger de SENTENCIA: un UPDATE que no
+            afecta a ninguna fila tambien se rechaza con ORA-20005.
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl. El
+            bloque deshace sus propios datos con un ROLLBACK final y no deja ni una fila.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_emp       NUMBER;
+    v_res       NUMBER;
+    v_antes     VARCHAR2(4000);
+    v_despues   VARCHAR2(4000);
+    v_sqlcode   NUMBER;
+    v_filas     NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    FUNCTION instantanea(p_resolution_id NUMBER) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT resolution_id || '|' || request_type || '|' || requested_by_module || '|' ||
+               NVL(TO_CHAR(subject_user_id), '~') || '|' ||
+               TO_CHAR(resolved_user_ids) || '|' ||
+               recipient_count || '|' || is_fallback_used || '|' || outcome || '|' ||
+               TO_CHAR(resolved_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(TO_CHAR(resolved_by_user_id), '~')
+          INTO v_txt
+          FROM resolucion_destinatario_log
+         WHERE resolution_id = p_resolution_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Resolucion Inmutable Admin', 'oraculo.tsk059.inmutable.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Resolucion Inmutable', 'oraculo.tsk059.inmutable@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp;
+
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_admin)
+      RETURNING resolution_id INTO v_res;
+
+    v_antes := instantanea(v_res);
+
+    -- MITAD 1: el UPDATE sobre una fila existente es rechazado por el trigger.
+    BEGIN
+        UPDATE resolucion_destinatario_log SET outcome = 'ERROR_TECNICO' WHERE resolution_id = v_res;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-DIR-05: el UPDATE sobre resolucion_destinatario_log devolvio ' || v_sqlcode || ' en lugar de ORA-20005');
+    END IF;
+
+    -- MITAD 2: el DELETE sobre esa misma fila es rechazado por el trigger.
+    BEGIN
+        DELETE FROM resolucion_destinatario_log WHERE resolution_id = v_res;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-DIR-05: el DELETE sobre resolucion_destinatario_log devolvio ' || v_sqlcode || ' en lugar de ORA-20005');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas FROM resolucion_destinatario_log WHERE resolution_id = v_res;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-DIR-05: el registro ha desaparecido tras el intento de borrado');
+    END IF;
+
+    v_despues := instantanea(v_res);
+    IF v_antes <> v_despues
+       OR RAWTOHEX(STANDARD_HASH(v_antes, 'SHA256')) <> RAWTOHEX(STANDARD_HASH(v_despues, 'SHA256')) THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-DIR-05: el registro no es identico byte a byte tras el UPDATE y el DELETE rechazados');
+    END IF;
+
+    -- Trigger de SENTENCIA: una sentencia que no afecta a ninguna fila tambien se rechaza.
+    BEGIN
+        UPDATE resolucion_destinatario_log SET recipient_count = 99 WHERE resolution_id = -1;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO REQ-081 RN-02: un UPDATE que no afecta a ninguna fila no fue rechazado con ORA-20005');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-08" author="MIND">
+        <comment>Oraculo REQ-081 RN-03 / REQ-015: los registros de resolucion se conservan 2 anios</comment>
+        <!--
+            Demuestra de forma observable la conservacion a 2 anios del registro de resoluciones: un
+            registro fechado hace 23 MESES sigue disponible y consultable integro dentro de la
+            ventana de 24 meses, mientras que otro fechado hace 2 ANIOS Y UN DIA queda FUERA de esa
+            ventana (AC-DIR-05 / REQ-015). Las dos mitades juntas fijan el borde de la ventana, no
+            solo que "haya filas".
+
+            La fila de 23 meses se relee para comprobar que conserva integro su contenido (tipo de
+            peticion, recuento, resultado y lista de identificadores resueltos).
+
+            No hay ningun proceso de purga sobre resolucion_destinatario_log y el trigger de
+            inmutabilidad impide el borrado, de modo que la disponibilidad durante la ventana esta
+            garantizada por construccion.
+
+            [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+            implementa purga alguna al cumplirse los 2 anios]
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl. El
+            bloque deshace sus propios datos con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_emp         NUMBER;
+    v_res         NUMBER;
+    v_t23         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '23' MONTH;
+    v_t24         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH - INTERVAL '1' DAY;
+    v_en_ventana  NUMBER;
+    v_fuera       NUMBER;
+    v_tipo        VARCHAR2(20);
+    v_count       NUMBER;
+    v_outcome     VARCHAR2(30);
+    v_ids         VARCHAR2(4000);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Resolucion Retencion Admin', 'oraculo.tsk059.retencion.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Resolucion Retencion', 'oraculo.tsk059.retencion@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp;
+
+    -- Dentro de la ventana de retencion: hace 23 meses.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_at, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_t23, v_admin)
+      RETURNING resolution_id INTO v_res;
+
+    -- Fuera de la ventana de retencion: hace 2 anios y un dia.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_at, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_t24, v_admin);
+
+    SELECT COUNT(*) INTO v_en_ventana
+      FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_emp
+       AND resolved_at >= SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_en_ventana <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO REQ-081 RN-03: se esperaba 1 registro dentro de la ventana de retencion de 2 anios y hay ' || v_en_ventana);
+    END IF;
+
+    SELECT COUNT(*) INTO v_fuera
+      FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_emp
+       AND resolved_at < SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_fuera <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO REQ-015: se esperaba 1 registro fuera de la ventana de retencion y hay ' || v_fuera);
+    END IF;
+
+    SELECT request_type, recipient_count, outcome, TO_CHAR(resolved_user_ids)
+      INTO v_tipo, v_count, v_outcome, v_ids
+      FROM resolucion_destinatario_log
+     WHERE resolution_id = v_res;
+    IF v_tipo <> 'INDIVIDUAL' OR v_count <> 1 OR v_outcome <> 'OK' OR v_ids <> '[' || v_emp || ']' THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO REQ-081 RN-03: el registro de hace 23 meses no conserva integro su contenido');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

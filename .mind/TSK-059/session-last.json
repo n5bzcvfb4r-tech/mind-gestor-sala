@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-059",
+  "attempt": 1,
+  "at": "2026-10-07T12:58:05.322426+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-059 — `resolucion_destinatario_log`: registro inmutable de resoluciones del directorio sin correos en claro.\n\nENTREGA (un único fichero, dentro de la zona declarada):\n`sources/facilities/changelogs/0.0.1/ddl/16-resolucion-destinatario-log.xml` — 8 changesets Liquibase (`ddl-0.0.1-16-01` … `-16-08`, author MIND), todos con `<rollback>`.\n\nEstructura (ARC-120, nombres físicos del inventario T.5):\n- 16-01 CREATE TABLE con `resolution_id` NUMBER GENERATED ALWAYS AS IDENTITY (PK), `request_type`, ",
+  "model": "claude-opus-5",
+  "input_tokens": 1150300,
+  "output_tokens": 33276,
+  "llm_calls": 46,
+  "cost_usd": 3.7098864999999996,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "8a07eac3448aa095111bdbf95df1e226862585b6",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
