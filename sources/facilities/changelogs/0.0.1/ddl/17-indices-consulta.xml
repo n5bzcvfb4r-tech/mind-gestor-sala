@@ -1143,4 +1143,291 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-09" author="MIND">
+        <comment>Oraculo REQ-104 / AC-CLAS-05: la agregacion por categoria devuelve las 5 categorias del catalogo, incluidas las de recuento 0, y el LEFT JOIN no inventa un recuento 1 para los valores sin incidencias</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la agregacion por categoria que publica la vista
+            v_recuento_incidencias del changeset ddl-0.0.1-17-05.
+
+            EL RECUENTO 0 TIENE QUE SER VISIBLE
+            ===================================
+            AC-CLAS-05 no pide el recuento de los valores que tienen incidencias: pide el recuento de
+            CADA valor del catalogo, INCLUIDOS los que valen 0. Una sala sana, sin ninguna incidencia,
+            tiene que aparecer en el listado con un 0 bien visible; si se omite, el consumidor no
+            puede distinguir "esta sala no tiene incidencias" de "esta sala no existe", y justo la
+            informacion que mas interesa (que algo esta sano) desaparece del informe. De ahi que la
+            vista parta SIEMPRE del catalogo y alcance incidencia con LEFT JOIN, y nunca al reves.
+
+            LA TRAMPA DEL COUNT(*)
+            ======================
+            El fallo clasico de esa construccion no es el JOIN sino la funcion de agregacion. El LEFT
+            JOIN conserva la fila del catalogo con TODAS las columnas de incidencia a NULL, de modo
+            que COUNT(*) cuenta esa fila fantasma y devuelve 1 para un valor que NO tiene ninguna
+            incidencia. La forma correcta es COUNT(i.incident_id), que ignora los NULL y devuelve 0.
+            Como la diferencia entre ambas solo se manifiesta cuando existe un valor de catalogo
+            VACIO, el oraculo siembra a proposito dos de ellos: una sala (SAL-ORA60F) SIN NINGUNA
+            incidencia y una oficina (OF-ORA60E) SIN NINGUNA sala, y exige que las dos salgan con
+            recuento EXACTAMENTE 0. Con COUNT(*) ambas darian 1 y el oraculo fallaria.
+
+            POR QUE SE MIDE POR DELTA
+            =========================
+            Las comprobaciones sobre categorias no se hacen contra valores absolutos sino por DELTA
+            contra una linea base tomada ANTES de sembrar las incidencias: se guarda el recuento
+            previo de la categoria sembrada (OTROS) y el recuento previo del resto de categorias, y
+            despues se exige que el primero haya crecido exactamente en 7 y que el segundo no se haya
+            movido. Asi el oraculo es correcto tanto sobre una base recien creada y vacia como sobre
+            una ya poblada por otros changesets o por el seed real, sin depender del orden de
+            ejecucion.
+
+            Las cinco categorias del CHECK de cat_categoria_incidencia (MOBILIARIO, CLIMATIZACION,
+            AUDIOVISUAL, LIMPIEZA y OTROS) se siembran activas para que el catalogo este completo y la
+            dimension CATEGORY de la vista tenga que devolver exactamente 5 filas, cuatro de ellas con
+            el recuento intacto.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60D / OF-ORA60E / SAL-ORA60E / SAL-ORA60F), display_order y
+            sort_order 9xx y correos @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin            NUMBER;
+    v_tecnico          NUMBER;
+    v_office_d         NUMBER;
+    v_office_e         NUMBER;
+    v_room_e           NUMBER;
+    v_room_f           NUMBER;
+    v_cat_otros        NUMBER;
+
+    v_base_otros       NUMBER;
+    v_base_resto       NUMBER;
+
+    v_filas_cat        NUMBER;
+    v_faltan           NUMBER;
+    v_otros            NUMBER;
+    v_resto            NUMBER;
+    v_cero_vista       NUMBER;
+    v_cero_base        NUMBER;
+    v_sala_vacia       NUMBER;
+    v_oficina_vacia    NUMBER;
+    v_sala_sembrada    NUMBER;
+    v_oficina_sembrada NUMBER;
+    v_abierta          NUMBER;
+    v_cerrada          NUMBER;
+    v_top              NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+
+    -- Las CINCO categorias que admite el CHECK de cat_categoria_incidencia, todas activas: la
+    -- dimension CATEGORY de la vista tiene que devolver exactamente 5 filas.
+    sembrar_categoria('MOBILIARIO', 'Mobiliario', 901, 'Y');
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion', 902, 'Y');
+    sembrar_categoria('AUDIOVISUAL', 'Audiovisual', 903, 'Y');
+    sembrar_categoria('LIMPIEZA', 'Limpieza', 904, 'Y');
+    sembrar_categoria('OTROS', 'Otros', 905, 'Y');
+
+    SELECT category_id INTO v_cat_otros FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    -- LINEA BASE tomada ANTES de sembrar: las comprobaciones se hacen por delta y por eso el
+    -- oraculo vale tanto sobre una base vacia como sobre una ya poblada.
+    SELECT COUNT(*) INTO v_base_otros FROM incidencia WHERE category_id = v_cat_otros;
+
+    SELECT NVL(SUM(x.c), 0) INTO v_base_resto
+      FROM (SELECT COUNT(i.incident_id) AS c
+              FROM cat_categoria_incidencia c
+              LEFT JOIN incidencia i ON i.category_id = c.category_id
+             WHERE c.category_code <> 'OTROS'
+             GROUP BY c.category_id) x;
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Agregacion Admin', 'oraculo.tsk060.agr.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Agregacion Tecnico', 'oraculo.tsk060.agr.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60D' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60D', 'Oficina Oraculo Agregacion Con Salas', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_d FROM cat_oficina WHERE office_code = 'OF-ORA60D';
+
+    -- Oficina deliberadamente SIN NINGUNA SALA: con el segundo salto en LEFT JOIN tiene que salir
+    -- con 0, y con COUNT(*) saldria con 1.
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60E' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60E', 'Oficina Oraculo Agregacion Sin Salas', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_e FROM cat_oficina WHERE office_code = 'OF-ORA60E';
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60E' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60E', 'Sala Oraculo Agregacion Con Incidencias', v_office_d, 'Y', v_admin);
+    SELECT room_id INTO v_room_e FROM cat_sala WHERE room_code = 'SAL-ORA60E';
+
+    -- Sala deliberadamente SIN NINGUNA INCIDENCIA: es la sala sana que no puede desaparecer del
+    -- listado ni aparecer con un recuento inventado.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60F' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60F', 'Sala Oraculo Agregacion Sin Incidencias', v_office_d, 'Y', v_admin);
+    SELECT room_id INTO v_room_f FROM cat_sala WHERE room_code = 'SAL-ORA60F';
+
+    -- 7 incidencias, todas en SAL-ORA60E y todas de la categoria OTROS.
+    FOR i IN 1..7 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-E' || LPAD(i, 5, '0'), v_room_e, v_cat_otros,
+                     'Incidencia del oraculo de agregacion numero ' || i, v_tecnico);
+    END LOOP;
+
+    -- a) La dimension CATEGORY devuelve las 5 categorias del catalogo.
+    SELECT COUNT(*) INTO v_filas_cat FROM v_recuento_incidencias WHERE group_type = 'CATEGORY';
+    IF v_filas_cat <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20930, 'ORACULO AC-CLAS-05: la agregacion por categoria devuelve ' || v_filas_cat || ' filas en lugar de las 5 categorias del catalogo');
+    END IF;
+
+    -- b) Ninguna categoria del catalogo falta en la agregacion.
+    SELECT COUNT(*) INTO v_faltan
+      FROM (SELECT category_id FROM cat_categoria_incidencia
+            MINUS
+            SELECT group_id FROM v_recuento_incidencias WHERE group_type = 'CATEGORY');
+    IF v_faltan <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20931, 'ORACULO AC-CLAS-05: ' || v_faltan || ' categorias del catalogo no aparecen en la agregacion');
+    END IF;
+
+    -- c) Delta de la categoria sembrada: exactamente las 7 incidencias nuevas.
+    SELECT incident_count INTO v_otros
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND group_id = v_cat_otros;
+    IF v_otros <> v_base_otros + 7 THEN
+        RAISE_APPLICATION_ERROR(-20932, 'ORACULO AC-CLAS-05: el recuento de la categoria sembrada es ' || v_otros || ' y deberia ser ' || (v_base_otros + 7));
+    END IF;
+
+    -- d) Las otras cuatro categorias conservan su recuento de la linea base.
+    SELECT NVL(SUM(incident_count), 0) INTO v_resto
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND group_id <> v_cat_otros;
+    IF v_resto <> v_base_resto THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO AC-CLAS-05: la agregacion ha alterado el recuento de categorias que no se han sembrado, es ' || v_resto || ' y deberia ser ' || v_base_resto);
+    END IF;
+
+    -- e) El recuento 0 es visible y coherente con el catalogo.
+    SELECT COUNT(*) INTO v_cero_vista
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND incident_count = 0;
+
+    SELECT COUNT(*) INTO v_cero_base
+      FROM cat_categoria_incidencia c
+     WHERE NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id);
+
+    IF v_cero_vista <> v_cero_base THEN
+        RAISE_APPLICATION_ERROR(-20934, 'ORACULO AC-CLAS-05: la agregacion no refleja con recuento 0 las categorias sin incidencias, muestra ' || v_cero_vista || ' y deberian ser ' || v_cero_base);
+    END IF;
+
+    -- f) La sala SIN incidencias tiene que dar EXACTAMENTE 0: es la trampa del COUNT(*).
+    SELECT incident_count INTO v_sala_vacia
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_f;
+    IF v_sala_vacia <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20935, 'ORACULO AC-CLAS-05: una sala sin incidencias aparece con recuento ' || v_sala_vacia || ': el LEFT JOIN se esta contando con COUNT(*) en lugar de COUNT(incident_id)');
+    END IF;
+
+    -- g) La oficina SIN salas tambien tiene que dar EXACTAMENTE 0.
+    SELECT incident_count INTO v_oficina_vacia
+      FROM v_recuento_incidencias
+     WHERE group_type = 'OFFICE' AND group_id = v_office_e;
+    IF v_oficina_vacia <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20936, 'ORACULO AC-CLAS-05: una oficina sin salas aparece con recuento ' || v_oficina_vacia || ' en lugar de 0');
+    END IF;
+
+    -- h) Los recuentos sembrados: la sala con incidencias da 7 y su oficina tambien (7 + 0).
+    SELECT incident_count INTO v_sala_sembrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_e;
+
+    SELECT incident_count INTO v_oficina_sembrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'OFFICE' AND group_id = v_office_d;
+
+    IF v_sala_sembrada <> 7 OR v_oficina_sembrada <> 7 THEN
+        RAISE_APPLICATION_ERROR(-20937, 'ORACULO AC-CLAS-05: los recuentos sembrados deberian ser 7 para la sala y 7 para la oficina y son ' || v_sala_sembrada || ' y ' || v_oficina_sembrada);
+    END IF;
+
+    -- i) Desglose por estado: las 7 incidencias nacen ABIERTA y ninguna esta CERRADA.
+    SELECT incident_count_abierta, incident_count_cerrada
+      INTO v_abierta, v_cerrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_e;
+
+    IF v_abierta <> 7 OR v_cerrada <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20938, 'ORACULO AC-CLAS-05: el desglose por estado de la sala sembrada deberia ser 7 abiertas y 0 cerradas y es ' || v_abierta || ' y ' || v_cerrada);
+    END IF;
+
+    -- j) AC-CLAS-05 pide el resultado ordenado de mayor a menor: la categoria sembrada encabeza.
+    SELECT group_id INTO v_top
+      FROM (SELECT group_id
+              FROM v_recuento_incidencias
+             WHERE group_type = 'CATEGORY'
+             ORDER BY incident_count DESC, group_id)
+     WHERE ROWNUM = 1;
+
+    IF v_top <> v_cat_otros THEN
+        RAISE_APPLICATION_ERROR(-20939, 'ORACULO AC-CLAS-05: la categoria con mas incidencias no encabeza la agregacion ordenada de mayor a menor, encabeza la categoria ' || v_top || ' en lugar de la ' || v_cat_otros);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
