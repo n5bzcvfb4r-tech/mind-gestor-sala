@@ -892,4 +892,255 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-08" author="MIND">
+        <comment>Oraculo AC-BAN-03 / REQ-106: ordenar la bandeja por estado devuelve la secuencia del ciclo de vida ABIERTA, EN_CURSO, RESUELTA, CERRADA y no el orden alfabetico</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la ordenacion de la bandeja por estado. La regla 3 de REQ-106
+            exige que ese orden siga la SECUENCIA DEL CICLO DE VIDA de la incidencia (ABIERTA,
+            EN_CURSO, RESUELTA, CERRADA) y NO el orden alfabetico de la etiqueta que se muestra.
+
+            POR QUE EL ESCENARIO ES DEMOSTRATIVO
+            ====================================
+            Los dos ordenes son observablemente distintos, y esa diferencia es justo lo que convierte
+            el escenario en una prueba y no en una tautologia: alfabeticamente CERRADA iria en SEGUNDA
+            posicion (ABIERTA, CERRADA, EN_CURSO, RESUELTA) mientras que por ciclo de vida le
+            corresponde la CUARTA, porque es el estado terminal. Una implementacion que ordenase por
+            la etiqueta en vez de por la secuencia daria un resultado DIFERENTE y el oraculo lo
+            detectaria. Por eso el oraculo comprueba ademas la mitad negativa: calcula la secuencia
+            alfabetica sobre las mismas filas, verifica que efectivamente vale
+            'ABIERTA,CERRADA,EN_CURSO,RESUELTA' (si no, el escenario no seria demostrativo y se
+            falla) y exige que la secuencia obtenida al ordenar por estado NO coincida con ella.
+
+            DE DONDE SALE LA SECUENCIA
+            ==========================
+            La ordenacion no se apoya en una lista de estados escrita en el codigo ni en un CASE con
+            los cuatro valores enumerados, sino en cat_estado_incidencia.sort_order, que es la FUENTE
+            UNICA DE VERDAD del catalogo. La consulta de bandeja une la incidencia con su estado y
+            ordena por esa columna, de modo que anadir un estado nuevo o reordenar los existentes es
+            un cambio de DATO en el catalogo y no un cambio de codigo. Por eso el oraculo verifica
+            PRIMERO la propia fuente de verdad: los cuatro estados tienen que existir y sus
+            sort_order tienen que ordenarlos como el ciclo de vida, antes de mirar ninguna
+            incidencia. El desempate dentro de un mismo estado sigue siendo incident_id DESC, que es
+            la regla 4 de REQ-106.
+
+            Las cuatro incidencias se insertan en orden DELIBERADAMENTE DESORDENADO (primero la
+            CERRADA, luego la RESUELTA, luego la ABIERTA y por ultimo la EN_CURSO) para que el
+            resultado no pueda deberse al orden fisico de insercion. Cada una se siembra respetando
+            las restricciones del ciclo de vida de la tabla: coexistencia de cierre, cronologia de
+            marcas, asignacion y comentario de resolucion obligatorio solo en CERRADA.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60C / SAL-ORA60D), display_order y sort_order 9xx para no chocar
+            con el seed real del catalogo y correos @example.invalid, y deshace todos sus datos con
+            el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_creado          TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    v_admin           NUMBER;
+    v_tecnico         NUMBER;
+    v_office          NUMBER;
+    v_room            NUMBER;
+    v_cat             NUMBER;
+
+    v_estados         NUMBER;
+    v_so_abierta      NUMBER;
+    v_so_en_curso     NUMBER;
+    v_so_resuelta     NUMBER;
+    v_so_cerrada      NUMBER;
+
+    v_secuencia       VARCHAR2(200);
+    v_alfabetica      VARCHAR2(200);
+    v_descendente     VARCHAR2(200);
+    v_pos             NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        -- sort_order es UNIQUE: se siembra en el rango 9xx para no chocar con el seed real 1..4.
+        -- Como el MERGE solo inserta cuando no hay fila, en una base ya sembrada se respeta el
+        -- orden real del catalogo, que tambien es ABIERTA < EN_CURSO < RESUELTA < CERRADA.
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    sembrar_estado('ABIERTA',  'Abierta',  901, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 902, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 903, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  904, 'Y');
+
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    -- COMPROBACION PREVIA DE LA FUENTE DE VERDAD: el catalogo tiene que ordenar los cuatro estados
+    -- como la secuencia del ciclo de vida ANTES de mirar ninguna incidencia.
+    SELECT COUNT(*)
+      INTO v_estados
+      FROM cat_estado_incidencia
+     WHERE status_code IN ('ABIERTA', 'EN_CURSO', 'RESUELTA', 'CERRADA');
+
+    IF v_estados <> 4 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-BAN-03: el sort_order de cat_estado_incidencia no refleja la secuencia del ciclo de vida');
+    END IF;
+
+    SELECT sort_order INTO v_so_abierta  FROM cat_estado_incidencia WHERE status_code = 'ABIERTA';
+    SELECT sort_order INTO v_so_en_curso FROM cat_estado_incidencia WHERE status_code = 'EN_CURSO';
+    SELECT sort_order INTO v_so_resuelta FROM cat_estado_incidencia WHERE status_code = 'RESUELTA';
+    SELECT sort_order INTO v_so_cerrada  FROM cat_estado_incidencia WHERE status_code = 'CERRADA';
+
+    IF NOT (v_so_abierta < v_so_en_curso AND v_so_en_curso < v_so_resuelta AND v_so_resuelta < v_so_cerrada) THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-BAN-03: el sort_order de cat_estado_incidencia no refleja la secuencia del ciclo de vida');
+    END IF;
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60C' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60C', 'Oficina Oraculo Orden Estado', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60C';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Orden Admin', 'oraculo.tsk060.ord.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Orden Tecnico', 'oraculo.tsk060.ord.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60D' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60D', 'Sala Oraculo Orden Por Estado', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60D';
+
+    -- Cuatro incidencias, una por estado, insertadas en orden DELIBERADAMENTE DESORDENADO para que
+    -- la secuencia obtenida no pueda deberse al orden fisico de insercion.
+
+    -- 1) CERRADA: closed_at y closed_by obligatorios y resolution_comment obligatorio no vacio.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at, resolved_at, closed_at, closed_by, resolution_comment)
+         VALUES ('INC-9060-D00001', v_room, v_cat,
+                 'Proyector de la sala sin imagen ya cerrado tras la sustitucion', v_tecnico, l_creado,
+                 'CERRADA', v_tecnico, l_creado, l_creado, l_creado, v_tecnico,
+                 'Proyector sustituido y verificado con el portatil del usuario');
+
+    -- 2) RESUELTA: con marca de resolucion pero sin cierre ni comentario de resolucion.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at, resolved_at)
+         VALUES ('INC-9060-D00002', v_room, v_cat,
+                 'Silla de la mesa de reuniones rota a la espera de validacion', v_tecnico, l_creado,
+                 'RESUELTA', v_tecnico, l_creado, l_creado);
+
+    -- 3) ABIERTA: recien registrada, sin tecnico ni marcas posteriores.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9060-D00003', v_room, v_cat,
+                 'Aire acondicionado que no enfria en la sala de reuniones', v_tecnico, l_creado);
+
+    -- 4) EN_CURSO: asignada y con marca de inicio de trabajo.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at)
+         VALUES ('INC-9060-D00004', v_room, v_cat,
+                 'Cerradura de la puerta atascada en revision por el tecnico', v_tecnico, l_creado,
+                 'EN_CURSO', v_tecnico, l_creado);
+
+    -- ORDENACION POR ESTADO: la consulta de bandeja une con el catalogo y ordena por sort_order,
+    -- con incident_id DESC como desempate (REQ-106 regla 4).
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.sort_order, x.incident_id DESC)
+      INTO v_secuencia
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_secuencia <> 'ABIERTA,EN_CURSO,RESUELTA,CERRADA' THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO AC-BAN-03: la ordenacion por estado devuelve ' || v_secuencia || ' en lugar de la secuencia del ciclo de vida ABIERTA,EN_CURSO,RESUELTA,CERRADA');
+    END IF;
+
+    -- MITAD NEGATIVA: el orden alfabetico de la etiqueta sobre las MISMAS filas es distinto.
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.status)
+      INTO v_alfabetica
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_alfabetica <> 'ABIERTA,CERRADA,EN_CURSO,RESUELTA' THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO AC-BAN-03: el escenario no es demostrativo: la secuencia alfabetica esperada no se reproduce, se obtiene ' || v_alfabetica);
+    END IF;
+
+    IF v_secuencia = v_alfabetica THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-BAN-03: la ordenacion por estado esta siguiendo el orden alfabetico de la etiqueta y no la secuencia del ciclo de vida');
+    END IF;
+
+    -- CERRADA es el estado terminal: por ciclo de vida ocupa la CUARTA posicion, no la segunda.
+    SELECT rn
+      INTO v_pos
+      FROM (SELECT i.status,
+                   ROW_NUMBER() OVER (ORDER BY e.sort_order) AS rn
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room)
+     WHERE status = 'CERRADA';
+
+    IF v_pos <> 4 THEN
+        RAISE_APPLICATION_ERROR(-20944, 'ORACULO AC-BAN-03: CERRADA ocupa la posicion ' || v_pos || ' en la ordenacion por estado; por ciclo de vida le corresponde la 4');
+    END IF;
+
+    -- El sentido descendente tiene que invertir la secuencia del ciclo de vida.
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.sort_order DESC, x.incident_id DESC)
+      INTO v_descendente
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_descendente <> 'CERRADA,RESUELTA,EN_CURSO,ABIERTA' THEN
+        RAISE_APPLICATION_ERROR(-20945, 'ORACULO AC-BAN-03: el sentido descendente de la ordenacion por estado no invierte la secuencia del ciclo de vida, devuelve ' || v_descendente);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
