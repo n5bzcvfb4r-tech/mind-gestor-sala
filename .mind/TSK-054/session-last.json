@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-054",
+  "attempt": 1,
+  "at": "2026-10-07T13:59:46.100710+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-054 — Ciclo de vida, asignación, cierre y retención sobre `incidencia`.\n\nENTREGABLE (único fichero de zona): `sources/facilities/changelogs/0.0.1/ddl/11-incidencia-ciclo-vida.xml`, 10 changesets `ddl-0.0.1-11-01` .. `-11-10`, todos con `<rollback>`. La tabla `incidencia` de TSK-053 se EXTIENDE: no se redeclara `createTable` ni los snapshots, y no se tocan sus triggers. El maestro no necesita edición: `changelog-0.0.1.xml` usa `includeAll path=\"0.0.1/ddl\"` y recoge el fichero en orden (…09, 1",
+  "model": "claude-opus-5",
+  "input_tokens": 4948146,
+  "output_tokens": 57203,
+  "llm_calls": 145,
+  "cost_usd": 12.21027875,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "c8ba5fd59498d9366c048cef25a54128d04816f6",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
