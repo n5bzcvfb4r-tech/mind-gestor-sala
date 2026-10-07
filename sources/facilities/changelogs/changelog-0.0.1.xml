@@ -1,0 +1,17 @@
+<?xml version="1.1" encoding="UTF-8" standalone="no"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!--
+        Gracias a includeAll, las tareas siguientes solo tienen que depositar sus ficheros
+        de changeset en 0.0.1/ddl y 0.0.1/dml: NO hace falta editar este changelog maestro
+        de release. El orden de ejecucion es DDL primero y DML despues.
+    -->
+
+    <!-- DDL changesets: orden alfabetico por prefijo numerico del fichero (01-, 02-, ...) -->
+    <includeAll path="0.0.1/ddl" relativeToChangelogFile="true"/>
+
+    <!-- DML changesets: catalogos semilla, despues de crear las tablas -->
+    <includeAll path="0.0.1/dml" relativeToChangelogFile="true"/>
+
+</databaseChangeLog>

@@ -1,0 +1,10 @@
+# CLI de Liquibase para el entorno local.
+# La imagen oficial de Liquibase ya incluye el driver ojdbc de Oracle,
+# por lo que no hace falta descargar ni copiar ningun JAR adicional.
+FROM liquibase/liquibase:4.31-alpine
+
+USER root
+RUN mkdir -p /liquibase/project
+USER liquibase
+
+WORKDIR /liquibase/project

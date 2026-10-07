@@ -1,0 +1,49 @@
+# Entorno local de pruebas para la base de datos `facilities`.
+#   docker compose -f local/docker-compose.yml up -d oracle-facilities
+#   ./local/liquibase-local.sh update
+services:
+
+  oracle-facilities:
+    image: gvenzl/oracle-free:23-slim
+    container_name: oracle-facilities
+    environment:
+      ORACLE_PASSWORD: entornodev
+      ORACLE_DATABASE: facilities
+      APP_USER: liquibase
+      APP_USER_PASSWORD: entornodev
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-facilities-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    networks:
+      - facilities-net
+
+  liquibase:
+    build:
+      context: .
+      dockerfile: DockerfileLiquibase
+    container_name: liquibase-facilities
+    depends_on:
+      oracle-facilities:
+        condition: service_healthy
+    volumes:
+      - ../:/liquibase/project
+    working_dir: /liquibase/project
+    # Solo se arranca bajo demanda (perfil `cli`), nunca con un `up` normal.
+    profiles: ["cli"]
+    command: ["--version"]
+    networks:
+      - facilities-net
+
+volumes:
+  oracle-facilities-data:
+
+networks:
+  facilities-net:
+    driver: bridge
