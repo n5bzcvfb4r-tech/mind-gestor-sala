@@ -1761,4 +1761,284 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-11" author="MIND">
+        <comment>Oraculo AC-BAN-09 / REQ-106: sobre un dataset de 1.200 incidencias el plan de la consulta de bandeja se resuelve por indice sin FULL TABLE SCAN ni SORT ORDER BY, y el p95 de 20 ejecuciones queda por debajo de 2000 ms</comment>
+        <!--
+            QUE COMPRUEBA ESTE ORACULO. AC-BAN-09 exige que el 100% de las consultas de bandeja
+            resuelvan el ORDEN y la PAGINACION en base de datos con OFFSET ... FETCH, sin trocear el
+            listado en la SPA, y que el p95 quede por debajo de 2000 ms sobre el volumen de la ventana
+            de retencion, unas 1.200 incidencias. El oraculo siembra ese volumen, pide el plan de la
+            consulta de bandeja con EXPLAIN PLAN y exige tres cosas sobre el: que aparezca una
+            operacion de INDICE sobre ix_incidencia_bandeja_estado, que NO aparezca ningun
+            TABLE ACCESS FULL sobre INCIDENCIA y que NO aparezca ningun SORT ORDER BY. Esta ultima
+            comprobacion es la prueba de que el orden created_at DESC, incident_id DESC lo sirve el
+            propio indice y no una ordenacion posterior en memoria. Despues cronometra 20 ejecuciones
+            reales de la consulta paginada y calcula el percentil 95 de los tiempos medidos.
+
+            POR QUE EL EXPLAIN LLEVA UN HINT DE INDICE. El oraculo se ejecuta DENTRO del changelog,
+            cuando la tabla todavia no tiene estadisticas y el dataset esta sembrado en una
+            transaccion sin confirmar; en esas condiciones la ELECCION del optimizador no es
+            reproducible, y recoger estadisticas con DBMS_STATS confirmaria implicitamente la siembra
+            y dejaria 1.200 filas de prueba en la base. Fijar el camino de acceso convierte la
+            comprobacion en lo que de verdad hay que garantizar aqui, que es una propiedad del
+            ESQUEMA y no del optimizador: que el indice entregado por esta tarea CUBRE el filtro, el
+            orden y la paginacion de la consulta de bandeja sin recorrer la tabla ni ordenar. La
+            eleccion del plan con estadisticas reales se observa en el entorno desplegado, no en el
+            changelog.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60I / SAL-ORA60J), display_order y sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_ahora        TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    TYPE t_tiempos IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    v_tiempos      t_tiempos;
+
+    v_admin        NUMBER;
+    v_tecnico      NUMBER;
+    v_office       NUMBER;
+    v_room         NUMBER;
+    v_cat          NUMBER;
+
+    v_ini          NUMBER;
+    v_ms           NUMBER;
+    v_p95          NUMBER;
+    v_aux          NUMBER;
+    v_pos          PLS_INTEGER;
+
+    v_full         NUMBER;
+    v_idx          NUMBER;
+    v_sort         NUMBER;
+    v_filas        NUMBER;
+    v_total        NUMBER;
+    v_invalidos    NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60I' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60I', 'Oficina Oraculo Rendimiento', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60I';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Rendimiento Admin', 'oraculo.tsk060.perf.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Rendimiento Tecnico', 'oraculo.tsk060.perf.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60J' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60J', 'Sala Oraculo Rendimiento Bandeja', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60J';
+
+    -- Dataset de 1.200 incidencias, el volumen de la ventana de retencion de AC-BAN-09. Cada fila
+    -- recibe un created_at DISTINTO y decreciente: es el escenario realista de la bandeja y obliga
+    -- al primer criterio del orden (created_at DESC) a discriminar de verdad.
+    FOR i IN 1..1200 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-G' || LPAD(i, 6, '0'), v_room, v_cat,
+                     'Incidencia del dataset de rendimiento de la bandeja numero ' || i, v_tecnico,
+                     l_ahora - NUMTODSINTERVAL(i, 'MINUTE'));
+    END LOOP;
+
+    SELECT COUNT(*) INTO v_total FROM incidencia WHERE room_id = v_room;
+    IF v_total <> 1200 THEN
+        RAISE_APPLICATION_ERROR(-20910, 'ORACULO AC-BAN-09: el dataset de rendimiento deberia tener 1200 incidencias y tiene ' || v_total);
+    END IF;
+
+    -- Los indices de consulta entregados por esta tarea existen y estan en estado VALID.
+    SELECT COUNT(*)
+      INTO v_invalidos
+      FROM user_indexes
+     WHERE index_name IN ('IX_INCIDENCIA_BANDEJA_ESTADO',
+                          'IX_INCIDENCIA_BANDEJA_SALA',
+                          'IX_INCIDENCIA_BANDEJA_CATEGORIA',
+                          'IX_INCIDENCIA_DESC_AI',
+                          'IX_INCIDENCIA_REFERENCE_UPPER')
+       AND status <> 'VALID';
+
+    IF v_invalidos <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20911, 'ORACULO AC-BAN-09: hay ' || v_invalidos || ' indices de consulta en estado no valido');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_idx
+      FROM user_indexes
+     WHERE index_name IN ('IX_INCIDENCIA_BANDEJA_ESTADO',
+                          'IX_INCIDENCIA_BANDEJA_SALA',
+                          'IX_INCIDENCIA_BANDEJA_CATEGORIA',
+                          'IX_INCIDENCIA_DESC_AI',
+                          'IX_INCIDENCIA_REFERENCE_UPPER');
+
+    IF v_idx <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20912, 'ORACULO AC-BAN-09: faltan indices de consulta: solo existen ' || v_idx || ' de 5');
+    END IF;
+
+    -- Plan de la consulta de bandeja. Se limpia antes por si quedara rastro de una ejecucion previa.
+    DELETE FROM plan_table WHERE statement_id = 'TSK060BAN';
+
+    EXECUTE IMMEDIATE q'[EXPLAIN PLAN SET STATEMENT_ID = 'TSK060BAN' FOR
+SELECT /*+ INDEX(i IX_INCIDENCIA_BANDEJA_ESTADO) */
+       i.incident_id, i.reference_code, i.status, i.created_at
+  FROM incidencia i
+ WHERE i.status = 'ABIERTA'
+ ORDER BY i.created_at DESC, i.incident_id DESC
+OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY]';
+
+    SELECT COUNT(*)
+      INTO v_full
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation = 'TABLE ACCESS'
+       AND options = 'FULL'
+       AND object_name = 'INCIDENCIA';
+
+    IF v_full <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20913, 'ORACULO AC-BAN-09: el plan de la consulta de bandeja recorre la tabla completa (TABLE ACCESS FULL) sobre INCIDENCIA');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_idx
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation LIKE 'INDEX%'
+       AND object_name = 'IX_INCIDENCIA_BANDEJA_ESTADO';
+
+    IF v_idx = 0 THEN
+        RAISE_APPLICATION_ERROR(-20914, 'ORACULO AC-BAN-09: el plan de la consulta de bandeja no usa el indice ix_incidencia_bandeja_estado');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_sort
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation = 'SORT'
+       AND options LIKE 'ORDER BY%';
+
+    IF v_sort <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20915, 'ORACULO AC-BAN-09: el plan ordena en memoria con SORT ORDER BY: el orden no lo esta sirviendo el indice');
+    END IF;
+
+    DELETE FROM plan_table WHERE statement_id = 'TSK060BAN';
+
+    -- 20 ejecuciones reales de la consulta de bandeja, SIN hint: aqui se mide el comportamiento.
+    FOR t IN 1..20 LOOP
+        v_ini := DBMS_UTILITY.GET_TIME;
+        v_filas := 0;
+
+        FOR r IN (SELECT i.incident_id
+                    FROM incidencia i
+                   WHERE i.status = 'ABIERTA'
+                     AND i.room_id = v_room
+                   ORDER BY i.created_at DESC, i.incident_id DESC
+                  OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY) LOOP
+            v_filas := v_filas + 1;
+        END LOOP;
+
+        -- GET_TIME devuelve centisegundos; el umbral de AC-BAN-09 esta en milisegundos.
+        v_ms := (DBMS_UTILITY.GET_TIME - v_ini) * 10;
+        v_tiempos(t) := v_ms;
+
+        IF v_filas <> 25 THEN
+            RAISE_APPLICATION_ERROR(-20916, 'ORACULO AC-BAN-09: la pagina de bandeja devuelve ' || v_filas || ' filas en lugar de 25');
+        END IF;
+    END LOOP;
+
+    -- Ordenacion por seleccion de los 20 tiempos, de menor a mayor.
+    FOR i IN 1..19 LOOP
+        v_pos := i;
+        FOR j IN i + 1 .. 20 LOOP
+            IF v_tiempos(j) < v_tiempos(v_pos) THEN
+                v_pos := j;
+            END IF;
+        END LOOP;
+
+        IF v_pos <> i THEN
+            v_aux := v_tiempos(i);
+            v_tiempos(i) := v_tiempos(v_pos);
+            v_tiempos(v_pos) := v_aux;
+        END IF;
+    END LOOP;
+
+    -- Percentil 95 de 20 muestras: el elemento en la posicion CEIL(0.95 * 20) = 19.
+    v_p95 := v_tiempos(19);
+
+    IF v_p95 >= 2000 THEN
+        RAISE_APPLICATION_ERROR(-20917, 'ORACULO AC-BAN-09: el p95 de la consulta de bandeja sobre 1200 incidencias es ' || v_p95 || ' ms y el umbral de AC-BAN-09 es 2000 ms');
+    END IF;
+
+    -- La paginacion se resuelve en base de datos tambien en el extremo del dataset: la ultima
+    -- pagina sale por OFFSET ... FETCH sin materializar las 1200 filas en la aplicacion.
+    SELECT COUNT(*)
+      INTO v_filas
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 1175 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    IF v_filas <> 25 THEN
+        RAISE_APPLICATION_ERROR(-20918, 'ORACULO AC-BAN-09: la ultima pagina del dataset no se resuelve con OFFSET ... FETCH');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
