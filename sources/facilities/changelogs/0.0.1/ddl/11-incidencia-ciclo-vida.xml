@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-11-01" author="MIND">
+        <comment>Ciclo de vida de la incidencia (ARC-113): asignacion, liberacion, marcas de estado, cierre y autoria del cambio de estado</comment>
+        <!--
+            Este fichero EXTIENDE la tabla incidencia creada en 10-incidencia.xml; no vuelve a
+            declarar ninguna de sus columnas ni de sus triggers. El nucleo del alta ya existe y aqui
+            se anade exclusivamente el ciclo de vida.
+
+            Todas las columnas nacen NULLABLE salvo status_changed_at, porque una incidencia recien
+            abierta todavia no tiene tecnico, ni inicio de atencion, ni resolucion, ni cierre: son
+            datos que solo aparecen cuando el ciclo de vida avanza.
+
+            status_changed_at es la excepcion y lleva DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) por dos
+            razones distintas que coinciden:
+
+            (a) Es la misma marca NAIVE EN UTC que usa el resto del proyecto (incidencia.created_at,
+            usuario.created_at, cat_sala.created_at). SYSTIMESTAMP a secas grabaria la hora local del
+            servidor, que depende de su zona horaria y rompe cualquier comparacion entre marcas; el
+            orden cronologico que impone ck_incidencia_cronologia solo tiene sentido si todas las
+            marcas estan en la misma escala.
+
+            (b) Es la UNICA forma de anadir una columna NOT NULL a una tabla que ya puede contener
+            filas: Oracle rellena con el DEFAULT las filas preexistentes en el propio ALTER TABLE. Sin
+            DEFAULT, el ADD de una columna NOT NULL fallaria con ORA-01758 en cuanto la tabla tuviese
+            una sola fila. Y semanticamente es correcto: toda incidencia esta en ALGUN estado desde su
+            alta (ABIERTA), luego la marca del ultimo cambio de estado siempre existe; para una fila
+            ya existente ese instante es, como mucho, el del despliegue.
+
+            status_changed_by SI es nullable: el estado inicial ABIERTA lo fija el motor en el alta,
+            no un actor que decida un cambio de estado. El autor solo existe a partir de la primera
+            transicion.
+
+            El nombre FISICO del autor del cierre es closed_by, que es el que fija el DoD de esta
+            tarea y por tanto el que acepta el INSERT/UPDATE. El nombre del inventario T.5 ARC-113,
+            closed_by_user_id, se publica como columna VIRTUAL de solo lectura en el changeset
+            siguiente (ddl-0.0.1-11-02): exactamente la misma tecnica con la que status_code y
+            reported_by_user_id publican status y reported_by en 10-incidencia.xml. Asi hay un unico
+            dato almacenado y dos nombres visibles, sin duplicar informacion ni poder divergir.
+
+            release_reason se dimensiona a 500 CHAR, igual que description, porque REQ-154 exige un
+            motivo de liberacion de entre 10 y 500 caracteres (la cota la impone
+            ck_incidencia_liberacion en ddl-0.0.1-11-04).
+
+            resolution_comment es CLOB y no VARCHAR2 porque el comentario de resolucion no tiene cota
+            superior de negocio. Esa eleccion tiene una consecuencia tecnica que se explica en
+            ddl-0.0.1-11-04: Oracle no admite columnas LOB dentro de una condicion CHECK, de modo que
+            sus reglas se imponen en el trigger trg_incidencia_ciclo_vida.
+        -->
+        <addColumn tableName="incidencia">
+            <column name="assigned_technician_id" type="NUMBER"/>
+            <column name="assigned_at" type="TIMESTAMP(6)"/>
+            <column name="released_at" type="TIMESTAMP(6)"/>
+            <column name="released_by" type="NUMBER"/>
+            <column name="release_reason" type="VARCHAR2(500 CHAR)"/>
+            <column name="in_progress_at" type="TIMESTAMP(6)"/>
+            <column name="resolved_at" type="TIMESTAMP(6)"/>
+            <column name="closed_at" type="TIMESTAMP(6)"/>
+            <column name="closed_by" type="NUMBER"/>
+            <column name="resolution_comment" type="CLOB"/>
+            <column name="status_changed_at" type="TIMESTAMP(6)" defaultValueComputed="SYS_EXTRACT_UTC(SYSTIMESTAMP)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="status_changed_by" type="NUMBER"/>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="incidencia">
+                <column name="status_changed_by"/>
+                <column name="status_changed_at"/>
+                <column name="resolution_comment"/>
+                <column name="closed_by"/>
+                <column name="closed_at"/>
+                <column name="resolved_at"/>
+                <column name="in_progress_at"/>
+                <column name="release_reason"/>
+                <column name="released_by"/>
+                <column name="released_at"/>
+                <column name="assigned_at"/>
+                <column name="assigned_technician_id"/>
+            </dropColumn>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-02" author="MIND">
+        <comment>Columnas virtuales de solo lectura del ciclo de vida: closed_by_user_id (nombre T.5) y retention_expires_at (REQ-148 / AC-RET-01)</comment>
+        <!--
+            closed_by_user_id publica con el nombre del inventario T.5 ARC-113 la columna fisica
+            closed_by, que es el nombre del DoD. No duplica el dato: es una proyeccion de la misma
+            columna, de modo que ambos nombres no pueden divergir jamas. Misma tecnica que
+            status_code y reported_by_user_id en 10-incidencia.xml y que usuario.is_active.
+
+            retention_expires_at es la fecha de expiracion del periodo de retencion de la incidencia
+            (REQ-148 / AC-RET-01 / AC-TRZ-03) y es un dato DERIVADO y de SOLO LECTURA:
+
+            - Es derivado porque su valor es SIEMPRE created_at + 24 meses. No se calcula una vez y se
+              guarda: se recalcula en cada lectura a partir de created_at, que a su vez es inmutable
+              en la practica. No hay forma de que quede "desincronizado" de la fecha de alta.
+
+            - Es de solo lectura porque al ser una columna VIRTUAL Oracle responde ORA-54013
+              ("INSERT or UPDATE on virtual column not allowed") en cuanto alguien la menciona en la
+              lista de columnas de un INSERT o en el SET de un UPDATE. Es decir: un valor de retencion
+              enviado por el cliente de la API NUNCA puede sustituir al calculado por el motor, por
+              mucho que viaje en el cuerpo de la peticion. La garantia no depende de que el backend se
+              acuerde de ignorar el campo, la impone el motor.
+
+            - Ademas no ocupa almacenamiento alguno: no hay una fila con un valor que pueda ser
+              manipulado por una via lateral (un UPDATE directo en base de datos, un script de
+              migracion, una correccion manual).
+
+            El CAST a DATE es el mismo que usa usuario.retention_until
+            (CAST(deactivated_at + INTERVAL '24' MONTH AS DATE)): la expresion de una columna virtual
+            debe ser determinista, y sumar un INTERVAL YEAR TO MONTH a un TIMESTAMP devuelve un
+            TIMESTAMP que aqui se reduce a DATE porque la retencion se razona en dias, no en
+            microsegundos. Mantener identico tipo y expresion en las dos tablas hace que la purga de
+            retencion pueda tratar usuario e incidencia con el mismo criterio.
+
+            Se anaden con ALTER TABLE ... ADD (...) y no con <addColumn>, porque addColumn no sabe
+            generar la clausula GENERATED ALWAYS AS ... VIRTUAL de Oracle.
+        -->
+        <sql>ALTER TABLE incidencia ADD (
+    closed_by_user_id     GENERATED ALWAYS AS (closed_by) VIRTUAL,
+    retention_expires_at  DATE GENERATED ALWAYS AS (CAST(created_at + INTERVAL '24' MONTH AS DATE)) VIRTUAL
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE incidencia DROP (closed_by_user_id, retention_expires_at)</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-03" author="MIND">
+        <comment>Claves ajenas de los cuatro actores del ciclo de vida (tecnico asignado, liberador, cerrador y autor del cambio de estado) contra usuario</comment>
+        <!--
+            Las cuatro columnas de actor apuntan al censo de usuarios: un identificador de tecnico, de
+            liberador, de cerrador o de autor del cambio de estado que no corresponda a un usuario
+            real se rechaza con ORA-02291 y la incidencia no llega a escribirse.
+
+            NINGUNA de las cuatro declara ON DELETE, ni CASCADE ni SET NULL (REQ-087 / AC-TRZ-02),
+            exactamente igual que las cuatro FK de 10-incidencia.xml. La consecuencia es doble y
+            deliberada:
+
+            (a) El borrado FISICO de un usuario referenciado por una incidencia es imposible: Oracle
+            responde ORA-02292 (registro hijo encontrado). Por eso el ciclo de vida de las cuentas es
+            de DESACTIVACION y nunca de borrado (REQ-047): una cuenta desactivada sigue existiendo.
+
+            (b) Si se declarase ON DELETE SET NULL, el borrado tendria exito dejando la atribucion a
+            NULL, es decir, destruyendo la traza de QUIEN atendio, QUIEN libero y QUIEN cerro la
+            incidencia; si se declarase CASCADE, se llevaria por delante la incidencia entera. Al no
+            declarar ninguno, la ATRIBUCION SOBREVIVE a la desactivacion de la cuenta: el historico de
+            la incidencia sigue diciendo quien hizo cada cosa aunque esa persona ya no trabaje aqui.
+
+            Las columnas hijas de estas FK conviene que tengan indice para no bloquear la tabla padre;
+            assigned_technician_id lo recibe en ddl-0.0.1-11-05 como primera columna de
+            ix_incidencia_asignacion. released_by, closed_by y status_changed_by no lo llevan a
+            proposito: no se filtra por ellas en ninguna consulta de la aplicacion y los DELETE sobre
+            usuario no existen (ver punto (a)), de modo que un indice adicional solo encareceria la
+            escritura sin servir a nadie.
+        -->
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT fk_incidencia_assigned_technician FOREIGN KEY (assigned_technician_id) REFERENCES usuario (user_id)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT fk_incidencia_released_by FOREIGN KEY (released_by) REFERENCES usuario (user_id)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT fk_incidencia_closed_by FOREIGN KEY (closed_by) REFERENCES usuario (user_id)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT fk_incidencia_status_changed_by FOREIGN KEY (status_changed_by) REFERENCES usuario (user_id)</sql>
+        <rollback>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT fk_incidencia_status_changed_by</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT fk_incidencia_closed_by</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT fk_incidencia_released_by</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT fk_incidencia_assigned_technician</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-04" author="MIND">
+        <comment>Reglas declarativas del ciclo de vida: coexistencia del cierre, orden cronologico, coherencia de la liberacion y asignacion con instante</comment>
+        <!--
+            Las cuatro CHECK imponen reglas de negocio que no dependen de ningun actor ni de ninguna
+            otra fila: solo miran la propia incidencia. Por eso van como restriccion declarativa y no
+            como trigger: el motor las evalua SIEMPRE, venga la escritura de la API, de un script o de
+            una sesion manual, y no hay forma de desactivarlas sin un ALTER TABLE explicito.
+
+            1) ck_incidencia_cierre_coexiste (AC-CIE-01 / AC-CIE-02, REQ-111 RN-04). Los datos de
+            cierre son un bloque atomico: o la incidencia esta CERRADA y entonces closed_at y
+            closed_by son obligatorios, o no lo esta y entonces ambos tienen que estar vacios. Las dos
+            mitades importan por igual: la primera impide una incidencia "cerrada" sin fecha ni autor
+            de cierre (cierre sin traza); la segunda impide una incidencia ABIERTA o EN_PROCESO que
+            arrastre una fecha de cierre de una transicion anterior, lo que haria mentir a cualquier
+            informe de cierres.
+
+            2) ck_incidencia_cronologia (REQ-122 RN-02). Las marcas del ciclo de vida solo pueden
+            avanzar: alta -> inicio de atencion -> resolucion -> cierre. La condicion compara CADA
+            PAREJA SOLO SI AMBAS MARCAS ESTAN INFORMADAS; ese es el motivo de que cada termino empiece
+            con un "IS NULL OR". Una incidencia abierta que todavia no se ha empezado a atender tiene
+            in_progress_at, resolved_at y closed_at a NULL y debe pasar sin problema: la regla dice
+            "no puede haber un orden incorrecto", no "tienen que existir todas las marcas". Si se
+            hubiesen comparado sin proteger el NULL, la condicion se evaluaria a UNKNOWN, que una CHECK
+            acepta, y la regla no se impondria en los casos con marcas parciales... pero tampoco
+            fallaria donde debe; escribirlo explicito deja la intencion por escrito y la hace legible
+            para quien mantenga el esquema.
+
+            3) ck_incidencia_liberacion (REQ-154, AC-ASG-04). La liberacion tambien es un bloque
+            atomico de tres datos (cuando, quien y por que) y ademas el motivo tiene cota: entre 10 y
+            500 caracteres UTILES, es decir, medidos sobre TRIM(release_reason), de modo que 500
+            espacios en blanco no cuelan como motivo. Si la incidencia nunca se ha liberado, los tres
+            datos estan a NULL.
+
+            4) ck_incidencia_asignacion (T.5 ARC-113, REQ-153 RN-05). Toda incidencia con tecnico
+            responsable tiene instante de asignacion. La implicacion es en un solo sentido a
+            proposito: el par (tecnico, instante) nace junto, pero la regla no exige lo contrario,
+            porque tras una liberacion assigned_technician_id vuelve a NULL mientras assigned_at puede
+            conservarse como traza del ciclo anterior.
+
+            POR QUE resolution_comment NO APARECE EN NINGUNA DE ESTAS CHECK
+            ==============================================================
+            Oracle NO ADMITE columnas LOB dentro de la condicion de una restriccion CHECK: cualquier
+            intento de referenciar resolution_comment (que es CLOB) en una CHECK falla al crearla con
+            ORA-02437 / ORA-00932 segun la forma de la expresion, y no hay variante sintactica que lo
+            evite; tampoco sirve envolverla en DBMS_LOB.GETLENGTH o en TO_CHAR, porque una CHECK solo
+            admite expresiones deterministas sin funciones de usuario ni conversiones dependientes de
+            sesion.
+
+            Por eso las DOS reglas que afectan al comentario de resolucion:
+              - presencia obligatoria cuando status = 'CERRADA' (AC-CIE-01, REQ-111), y
+              - "no vacio tras TRIM", es decir, que contenga algun caracter que no sea espacio,
+            se imponen en el trigger trg_incidencia_ciclo_vida del changeset ddl-0.0.1-11-06, que si
+            puede manipular CLOB (alli se resuelven con REGEXP_INSTR sobre el CLOB completo).
+
+            Conviene subrayar lo que esto NO significa: la regla de negocio NO queda delegada en la
+            aplicacion ni se vuelve opcional. La sigue imponiendo el MOTOR, y una escritura que la
+            viole sigue siendo rechazada con error antes de tocar la fila. Cambia el MECANISMO
+            (trigger en lugar de CHECK), no la GARANTIA.
+
+            De ahi tambien que ck_incidencia_cierre_coexiste cubra solo closed_at y closed_by: la
+            coexistencia de los cuatro datos de cierre esta partida entre esta CHECK (los dos
+            escalares) y el trigger (el CLOB), y juntos imponen la regla completa de AC-CIE-02.
+        -->
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT ck_incidencia_cierre_coexiste CHECK (
+    (status = 'CERRADA' AND closed_at IS NOT NULL AND closed_by IS NOT NULL)
+ OR (status &lt;&gt; 'CERRADA' AND closed_at IS NULL AND closed_by IS NULL)
+)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT ck_incidencia_cronologia CHECK (
+    (in_progress_at IS NULL OR in_progress_at &gt;= created_at)
+AND (resolved_at IS NULL OR resolved_at &gt;= created_at)
+AND (closed_at IS NULL OR closed_at &gt;= created_at)
+AND (resolved_at IS NULL OR in_progress_at IS NULL OR resolved_at &gt;= in_progress_at)
+AND (closed_at IS NULL OR in_progress_at IS NULL OR closed_at &gt;= in_progress_at)
+AND (closed_at IS NULL OR resolved_at IS NULL OR closed_at &gt;= resolved_at)
+)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT ck_incidencia_liberacion CHECK (
+    (released_at IS NULL AND released_by IS NULL AND release_reason IS NULL)
+ OR (released_at IS NOT NULL AND released_by IS NOT NULL AND release_reason IS NOT NULL
+     AND LENGTH(TRIM(release_reason)) BETWEEN 10 AND 500)
+)</sql>
+        <sql>ALTER TABLE incidencia ADD CONSTRAINT ck_incidencia_asignacion CHECK (assigned_technician_id IS NULL OR assigned_at IS NOT NULL)</sql>
+        <rollback>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT ck_incidencia_asignacion</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT ck_incidencia_liberacion</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT ck_incidencia_cronologia</sql>
+            <sql>ALTER TABLE incidencia DROP CONSTRAINT ck_incidencia_cierre_coexiste</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-05" author="MIND">
+        <comment>Indices del historial de cierres por sala y categoria (REQ-113 / AC-CIE-08) y de los filtros de asignacion de la bandeja (REQ-107 / AC-BAN-04)</comment>
+        <!--
+            ix_incidencia_cierres_sala_categoria sirve a REQ-113 / AC-CIE-08: "cierres anteriores de
+            la MISMA sala y categoria". El orden de las columnas es el de la consulta: los dos
+            terminos de igualdad primero (room_id, category_id) y la marca de cierre despues, de modo
+            que el motor localiza el rango exacto por los dos primeros y lo recorre YA ORDENADO. El
+            DESC de closed_at es el del listado (cierre mas reciente arriba), asi que la consulta no
+            necesita ordenacion adicional ni un SORT sobre el resultado.
+
+            ix_incidencia_asignacion sirve a los filtros de asignacion de la bandeja del tecnico
+            (REQ-107 / AC-BAN-04), que son tres y se combinan con el estado:
+              - SIN_ASIGNAR      -> assigned_technician_id IS NULL
+              - ASIGNADAS_A_MI   -> assigned_technician_id = :session_user
+              - ASIGNADAS_A_OTRO -> assigned_technician_id IS NOT NULL AND <> :session_user
+            El caso SIN_ASIGNAR merece una nota: un indice B-tree de UNA sola columna NO indexa las
+            filas cuyo valor es NULL, de modo que sobre un indice simple de assigned_technician_id el
+            filtro IS NULL degeneraria en recorrido completo de tabla. Aqui SI queda indexado porque
+            el indice es COMPUESTO: una entrada de indice solo se omite cuando TODAS sus columnas son
+            NULL, y status es NOT NULL, asi que toda fila sin tecnico tiene su entrada
+            (NULL, 'ABIERTA') y el filtro SIN_ASIGNAR se resuelve por indice.
+
+            Ademas da indice a assigned_technician_id, que es la columna hija de
+            fk_incidencia_assigned_technician: sin el, un DELETE o un UPDATE de clave sobre la tabla
+            padre usuario bloquearia la tabla hija entera.
+        -->
+        <sql>CREATE INDEX ix_incidencia_cierres_sala_categoria ON incidencia (room_id, category_id, closed_at DESC)</sql>
+        <sql>CREATE INDEX ix_incidencia_asignacion ON incidencia (assigned_technician_id, status)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_asignacion</sql>
+            <sql>DROP INDEX ix_incidencia_cierres_sala_categoria</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-06" author="MIND" runOnChange="true">
+        <comment>REQ-119 / REQ-120 / REQ-122 / REQ-111 / REQ-118: marcas selladas una sola vez, ninguna marca futura, comentario de resolucion obligatorio al cerrar e incremento automatico de version</comment>
+        <!--
+            Este trigger impone las cuatro reglas del ciclo de vida que NO caben en una restriccion
+            declarativa, porque necesitan comparar :NEW con :OLD, leer el reloj del servidor o
+            manipular un CLOB. Son, en el orden en que se ejecutan:
+
+            (1) SELLADO UNA SOLA VEZ (REQ-119 RN-04, REQ-120 RN-03, DoD). in_progress_at, resolved_at
+            y assigned_at son marcas HISTORICAS: una vez escritas documentan un hecho que ya ocurrio y
+            no admiten correccion. Reescribirlas permitiria maquillar a posteriori los tiempos de
+            atencion, que es justamente lo que REQ-119 y REQ-120 prohiben. Cada una tiene su propio
+            codigo de error (-20050 inicio, -20051 resolucion, -20052 asignacion) para que la API
+            pueda distinguir cual se intento manipular.
+
+            La comparacion se hace con un centinela (TIMESTAMP '0001-01-01 00:00:00') en lugar de con
+            un simple "<>", y eso produce exactamente el comportamiento que pide el DoD:
+              - un UPDATE que reescriba el MISMO valor no se considera modificacion y pasa (es lo que
+                ocurre cuando el backend reenvia la fila entera en el SET);
+              - poner a NULL una marca ya sellada SI se rechaza, porque NULL se mapea al centinela y
+                deja de coincidir con el valor antiguo. Con un "<>" pelado esa comparacion habria dado
+                UNKNOWN y el borrado de la marca habria colado, que es la via de fuga mas evidente.
+            La guarda ":OLD.x IS NOT NULL" delante deja intacto el caso legitimo: escribir por PRIMERA
+            vez una marca que aun estaba vacia.
+
+            (2) NINGUNA MARCA EN EL FUTURO (REQ-122 RN-03, validacion 2). Ninguna de las siete marcas
+            del ciclo de vida puede ser posterior al instante actual: una fecha futura falsearia
+            cualquier metrica de tiempos y cualquier calculo de retencion (retention_expires_at se
+            deriva de created_at). Todas se comparan contra UNA UNICA variable local l_ahora sellada al
+            entrar en el trigger, y no contra SYS_EXTRACT_UTC(SYSTIMESTAMP) repetido: SYSTIMESTAMP
+            avanza entre llamadas, asi que siete lecturas distintas podrian dar veredictos
+            inconsistentes para marcas identicas dentro de la MISMA fila. Con una sola lectura, la
+            fila se valida entera contra el mismo instante.
+
+            La marca se lee en UTC (SYS_EXTRACT_UTC) porque esa es la escala en la que estan todas las
+            columnas del proyecto; compararlas contra SYSTIMESTAMP local daria falsos positivos o
+            falsos negativos de hasta la diferencia horaria del servidor.
+
+            (3) COMENTARIO DE RESOLUCION (AC-CIE-01 / AC-CIE-02, REQ-111). Aqui estan las dos reglas
+            del CLOB que, como se explica en ddl-0.0.1-11-04, no pueden ir en una CHECK porque Oracle
+            no admite columnas LOB en la condicion de una restriccion:
+              - cerrar sin comentario de resolucion se rechaza con -20054, y "sin comentario" incluye
+                NULL, cadena de longitud 0 y un texto que solo contenga espacios, tabuladores o saltos
+                de linea;
+              - un comentario de resolucion en una incidencia NO cerrada se rechaza con -20055, que es
+                la otra mitad de la coexistencia de los cuatro datos de cierre (los dos escalares
+                closed_at/closed_by los cubre ck_incidencia_cierre_coexiste).
+            El "no vacio tras TRIM" se resuelve con
+            NVL(REGEXP_INSTR(:NEW.resolution_comment, '[^[:space:]]'), 0) = 0 y no con
+            TRIM(:NEW.resolution_comment) IS NULL ni con SUBSTR: REGEXP_INSTR acepta el CLOB COMPLETO
+            como argumento sin truncarlo a 4000 bytes y devuelve 0 cuando no encuentra ni un solo
+            caracter distinto de espacio. El NVL cubre el caso del CLOB vacio.
+
+            (4) INCREMENTO DE version (REQ-118 RN-03, DoD). En todo UPDATE el motor hace
+            :NEW.version := NVL(:OLD.version, 0) + 1, SIEMPRE y sea cual sea el valor que traiga la
+            sentencia: ni una escritura que "olvide" tocar version, ni una que mande un valor
+            arbitrario, pueden dejar el contador estancado o retrocederlo. Va AL FINAL del trigger a
+            proposito, para que no se incremente en escrituras que terminan rechazadas por las reglas
+            anteriores (el RAISE_APPLICATION_ERROR aborta la sentencia antes de llegar aqui).
+
+            Esto NO rompe la concurrencia optimista de la API, y conviene dejarlo escrito porque es
+            contraintuitivo: el control optimista se resuelve en el PREDICADO de la sentencia, no en el
+            valor escrito. La API emite
+                UPDATE incidencia SET ... WHERE incident_id = :id AND version = :expected_version
+            y decide por el NUMERO DE FILAS AFECTADAS: si otra transaccion modifico la fila entretanto,
+            version ya no coincide, el UPDATE afecta a 0 filas y la API devuelve el conflicto (409).
+            Ese chequeo ocurre al SELECCIONAR la fila, antes de que el trigger llegue a ejecutarse, de
+            modo que lo que el trigger escriba en :NEW.version es irrelevante para la deteccion del
+            conflicto; lo unico que garantiza es que el contador avanza de uno en uno aunque el cliente
+            no lo gestione.
+
+            El trigger es BEFORE INSERT OR UPDATE FOR EACH ROW y no consulta la propia tabla
+            incidencia, de modo que no puede provocar ORA-04091 (tabla mutante). Convive sin solaparse
+            con los triggers ya existentes: trg_incidencia_snapshot_ro (BEFORE UPDATE OF los tres
+            snapshots) y trg_incidencia_clasificacion (BEFORE INSERT OR UPDATE OF room_id,
+            category_id) vigilan columnas distintas de las de aqui.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_ciclo_vida
+BEFORE INSERT OR UPDATE ON incidencia
+FOR EACH ROW
+DECLARE
+    -- Centinela para comparar marcas que pueden ser NULL: convierte el NULL en un valor
+    -- comparable, de modo que "poner a NULL una marca sellada" cuenta como modificacion.
+    c_centinela CONSTANT TIMESTAMP(6) := TIMESTAMP '0001-01-01 00:00:00';
+    -- Instante UNICO contra el que se valida la fila entera (coherencia dentro de la misma fila).
+    l_ahora     TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+BEGIN
+    -- (1) Marcas selladas: una vez escritas no admiten modificacion ni borrado.
+    IF UPDATING THEN
+        IF :OLD.in_progress_at IS NOT NULL
+           AND NVL(:NEW.in_progress_at, c_centinela) <> NVL(:OLD.in_progress_at, c_centinela) THEN
+            RAISE_APPLICATION_ERROR(-20050, 'La marca de inicio de atención ya está sellada y no admite modificación');
+        END IF;
+
+        IF :OLD.resolved_at IS NOT NULL
+           AND NVL(:NEW.resolved_at, c_centinela) <> NVL(:OLD.resolved_at, c_centinela) THEN
+            RAISE_APPLICATION_ERROR(-20051, 'La marca de resolución ya está sellada y no admite modificación');
+        END IF;
+
+        IF :OLD.assigned_at IS NOT NULL
+           AND NVL(:NEW.assigned_at, c_centinela) <> NVL(:OLD.assigned_at, c_centinela) THEN
+            RAISE_APPLICATION_ERROR(-20052, 'La marca de asignación ya está sellada y no admite modificación');
+        END IF;
+    END IF;
+
+    -- (2) Ninguna marca temporal del ciclo de vida puede ser futura.
+    IF (:NEW.created_at        IS NOT NULL AND :NEW.created_at        > l_ahora)
+    OR (:NEW.in_progress_at    IS NOT NULL AND :NEW.in_progress_at    > l_ahora)
+    OR (:NEW.resolved_at       IS NOT NULL AND :NEW.resolved_at       > l_ahora)
+    OR (:NEW.closed_at         IS NOT NULL AND :NEW.closed_at         > l_ahora)
+    OR (:NEW.status_changed_at IS NOT NULL AND :NEW.status_changed_at > l_ahora)
+    OR (:NEW.assigned_at       IS NOT NULL AND :NEW.assigned_at       > l_ahora)
+    OR (:NEW.released_at       IS NOT NULL AND :NEW.released_at       > l_ahora) THEN
+        RAISE_APPLICATION_ERROR(-20053, 'Una marca temporal del ciclo de vida no puede ser futura');
+    END IF;
+
+    -- (3) Comentario de resolucion: obligatorio al cerrar y prohibido fuera del cierre.
+    --     REGEXP_INSTR recorre el CLOB completo sin truncarlo y devuelve 0 si no hay
+    --     ningun caracter distinto de espacio (equivalente al "no vacio tras TRIM").
+    IF :NEW.status = 'CERRADA' THEN
+        IF :NEW.resolution_comment IS NULL
+           OR DBMS_LOB.GETLENGTH(:NEW.resolution_comment) = 0
+           OR NVL(REGEXP_INSTR(:NEW.resolution_comment, '[^[:space:]]'), 0) = 0 THEN
+            RAISE_APPLICATION_ERROR(-20054, 'Debe indicar un comentario de resolución para cerrar la incidencia');
+        END IF;
+    ELSIF :NEW.resolution_comment IS NOT NULL THEN
+        RAISE_APPLICATION_ERROR(-20055, 'El comentario de resolución solo existe en una incidencia cerrada');
+    END IF;
+
+    -- (4) Concurrencia optimista: version la lleva el motor, nunca la sentencia.
+    --     Va al final para no incrementarla en escrituras que las reglas anteriores rechazan.
+    IF UPDATING THEN
+        :NEW.version := NVL(:OLD.version, 0) + 1;
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_ciclo_vida</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
