@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-044",
+  "attempt": 1,
+  "at": "2026-10-07T10:46:09.876307+00:00",
+  "construction_id": "0924897c-2bf6-4285-967e-0b2a9d385eeb",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-044 — Changelog maestro Liquibase y catálogo de seguridad (arquetipo `database-relational`, BBDD `facilities`, Oracle 23ai).\n\nQUÉ SE HA CONSTRUIDO (todo dentro de zone_paths, nada fuera):\n\n1. `sources/facilities/master.xml` — maestro del arquetipo (cabecera literal del esqueleto, incl. ns ext/pro) con un único `<include file=\"/changelogs/changelog-0.0.1.xml\" relativeToChangelogFile=\"true\"/>`.\n\n2. `sources/facilities/changelogs/changelog-0.0.1.xml` — resuelve los cambios con `<includeAll path",
+  "model": "claude-opus-5",
+  "input_tokens": 1377139,
+  "output_tokens": 38581,
+  "llm_calls": 86,
+  "cost_usd": 3.30983775,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "c3dda998bd68b7e56dd68bd8c22986355e615072",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}

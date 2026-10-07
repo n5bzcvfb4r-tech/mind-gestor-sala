@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="dml-0.0.1-01" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_rol</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de roles de seguridad (cat_rol)</comment>
+        <insert tableName="cat_rol">
+            <column name="role_code" value="EMPLEADO"/>
+            <column name="role_name" value="Empleado"/>
+            <column name="role_description" value="Reporta incidencias de salas y consulta unicamente las suyas"/>
+            <column name="display_order" valueNumeric="1"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_rol">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="role_name" value="Tecnico de mantenimiento"/>
+            <column name="role_description" value="Consulta todas las incidencias, se autoasigna y gestiona su ciclo de vida"/>
+            <column name="display_order" valueNumeric="2"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_rol">
+            <column name="role_code" value="ADMINISTRADOR"/>
+            <column name="role_name" value="Administrador"/>
+            <column name="role_description" value="Gestiona el censo de usuarios, sus roles y la configuracion del sistema"/>
+            <column name="display_order" valueNumeric="3"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_rol">
+                <where>role_code IN ('EMPLEADO','TECNICO_MANTENIMIENTO','ADMINISTRADOR')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-02" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_operacion</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de operaciones de seguridad (cat_operacion)</comment>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_CREATE"/>
+            <column name="operation_name" value="Crear incidencia"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_LIST_OWN"/>
+            <column name="operation_name" value="Listar las incidencias propias"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_LIST_ALL"/>
+            <column name="operation_name" value="Listar todas las incidencias"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_VIEW"/>
+            <column name="operation_name" value="Consultar el detalle de una incidencia"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_HISTORY_VIEW"/>
+            <column name="operation_name" value="Consultar el historial de una incidencia"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_ASSIGN_SELF"/>
+            <column name="operation_name" value="Autoasignarse una incidencia"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_STATUS_CHANGE"/>
+            <column name="operation_name" value="Cambiar el estado de una incidencia"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="INCIDENT_CLOSE_WITH_COMMENT"/>
+            <column name="operation_name" value="Cerrar una incidencia con comentario de resolucion"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_operacion">
+            <column name="operation_code" value="USER_MANAGE"/>
+            <column name="operation_name" value="Gestionar el censo de usuarios"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_operacion">
+                <where>operation_code IN ('INCIDENT_CREATE','INCIDENT_LIST_OWN','INCIDENT_LIST_ALL','INCIDENT_VIEW','INCIDENT_HISTORY_VIEW','INCIDENT_ASSIGN_SELF','INCIDENT_STATUS_CHANGE','INCIDENT_CLOSE_WITH_COMMENT','USER_MANAGE')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-03" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM permiso_rol_operacion</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla de la matriz de permisos rol-operacion (permiso_rol_operacion)</comment>
+        <!--
+            Deny by default (AC-PERM-01 de REQ-021): solo existe fila para los pares
+            rol-operacion PERMITIDOS. La AUSENCIA de fila significa permiso DENEGADO;
+            no se insertan filas de denegacion explicita.
+            La columna permiso_id es GENERATED ALWAYS AS IDENTITY: no se informa en los insert.
+        -->
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="EMPLEADO"/>
+            <column name="operation_code" value="INCIDENT_CREATE"/>
+            <column name="data_scope" value="OWN"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="EMPLEADO"/>
+            <column name="operation_code" value="INCIDENT_LIST_OWN"/>
+            <column name="data_scope" value="OWN"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="EMPLEADO"/>
+            <column name="operation_code" value="INCIDENT_VIEW"/>
+            <column name="data_scope" value="OWN"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="EMPLEADO"/>
+            <column name="operation_code" value="INCIDENT_HISTORY_VIEW"/>
+            <column name="data_scope" value="OWN"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_LIST_ALL"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_VIEW"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_HISTORY_VIEW"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_ASSIGN_SELF"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_STATUS_CHANGE"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="TECNICO_MANTENIMIENTO"/>
+            <column name="operation_code" value="INCIDENT_CLOSE_WITH_COMMENT"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <insert tableName="permiso_rol_operacion">
+            <column name="role_code" value="ADMINISTRADOR"/>
+            <column name="operation_code" value="USER_MANAGE"/>
+            <column name="data_scope" value="ALL"/>
+        </insert>
+        <rollback>
+            <delete tableName="permiso_rol_operacion">
+                <where>role_code IN ('EMPLEADO','TECNICO_MANTENIMIENTO','ADMINISTRADOR')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

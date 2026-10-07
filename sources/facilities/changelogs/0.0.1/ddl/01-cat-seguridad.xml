@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-01" author="MIND">
+        <comment>Catalogo de roles de seguridad</comment>
+        <createTable tableName="cat_rol">
+            <column name="role_code" type="VARCHAR2(32 CHAR)">
+                <constraints primaryKey="true" primaryKeyName="pk_cat_rol" nullable="false"/>
+            </column>
+            <column name="role_name" type="VARCHAR2(60 CHAR)">
+                <constraints nullable="false" unique="true" uniqueConstraintName="uk_cat_rol_role_name"/>
+            </column>
+            <column name="role_description" type="VARCHAR2(200 CHAR)"/>
+            <column name="display_order" type="NUMBER">
+                <constraints nullable="false" unique="true" uniqueConstraintName="uk_cat_rol_display_order"/>
+            </column>
+            <column name="is_active" type="CHAR(1 CHAR)" defaultValue="Y">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="cat_rol"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-02" author="MIND">
+        <comment>Restricciones CHECK del catalogo de roles</comment>
+        <sql>ALTER TABLE cat_rol ADD CONSTRAINT ck_cat_rol_role_code CHECK (role_code IN ('EMPLEADO','TECNICO_MANTENIMIENTO','ADMINISTRADOR'))</sql>
+        <sql>ALTER TABLE cat_rol ADD CONSTRAINT ck_cat_rol_is_active CHECK (is_active IN ('Y','N'))</sql>
+        <rollback>
+            <sql>ALTER TABLE cat_rol DROP CONSTRAINT ck_cat_rol_role_code</sql>
+            <sql>ALTER TABLE cat_rol DROP CONSTRAINT ck_cat_rol_is_active</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-03" author="MIND">
+        <comment>Catalogo de operaciones de seguridad</comment>
+        <createTable tableName="cat_operacion">
+            <column name="operation_code" type="VARCHAR2(50 CHAR)">
+                <constraints primaryKey="true" primaryKeyName="pk_cat_operacion" nullable="false"/>
+            </column>
+            <column name="operation_name" type="VARCHAR2(100 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="is_active" type="CHAR(1 CHAR)" defaultValue="Y">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="cat_operacion"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-04" author="MIND">
+        <comment>Restricciones CHECK del catalogo de operaciones</comment>
+        <sql>ALTER TABLE cat_operacion ADD CONSTRAINT ck_cat_operacion_code CHECK (operation_code IN ('INCIDENT_CREATE','INCIDENT_LIST_OWN','INCIDENT_LIST_ALL','INCIDENT_VIEW','INCIDENT_HISTORY_VIEW','INCIDENT_ASSIGN_SELF','INCIDENT_STATUS_CHANGE','INCIDENT_CLOSE_WITH_COMMENT','USER_MANAGE'))</sql>
+        <sql>ALTER TABLE cat_operacion ADD CONSTRAINT ck_cat_operacion_is_active CHECK (is_active IN ('Y','N'))</sql>
+        <rollback>
+            <sql>ALTER TABLE cat_operacion DROP CONSTRAINT ck_cat_operacion_code</sql>
+            <sql>ALTER TABLE cat_operacion DROP CONSTRAINT ck_cat_operacion_is_active</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-05" author="MIND">
+        <comment>Matriz de permisos rol-operacion con PK compuesta (role_code, operation_code)</comment>
+        <sql>CREATE TABLE permiso_rol_operacion (
+    permiso_id     NUMBER GENERATED ALWAYS AS IDENTITY,
+    role_code      VARCHAR2(32 CHAR) NOT NULL,
+    operation_code VARCHAR2(50 CHAR) NOT NULL,
+    data_scope     VARCHAR2(10 CHAR) NOT NULL,
+    CONSTRAINT pk_permiso_rol_operacion PRIMARY KEY (role_code, operation_code),
+    CONSTRAINT uk_permiso_rol_operacion_id UNIQUE (permiso_id),
+    CONSTRAINT ck_permiso_data_scope CHECK (data_scope IN ('OWN','ALL')),
+    CONSTRAINT fk_permiso_role_code FOREIGN KEY (role_code) REFERENCES cat_rol (role_code),
+    CONSTRAINT fk_permiso_operation_code FOREIGN KEY (operation_code) REFERENCES cat_operacion (operation_code)
+)</sql>
+        <rollback>
+            <dropTable tableName="permiso_rol_operacion"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06" author="MIND">
+        <comment>Indice de apoyo para consultas por operacion</comment>
+        <createIndex indexName="ix_permiso_operation_code" tableName="permiso_rol_operacion">
+            <column name="operation_code"/>
+        </createIndex>
+        <rollback>
+            <dropIndex indexName="ix_permiso_operation_code" tableName="permiso_rol_operacion"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

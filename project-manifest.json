@@ -1,0 +1,20 @@
+{
+  "name": "mind-gestor-sala",
+  "version": "0.0.1",
+  "archetype": "database-relational",
+  "databases": [
+    {
+      "name": "facilities",
+      "engine": "oracle",
+      "engineVersion": "23ai",
+      "sourcesPath": "sources/facilities",
+      "masterChangeLog": "sources/facilities/master.xml",
+      "propertiesFile": "local/facilities.properties"
+    }
+  ],
+  "tooling": {
+    "liquibase": "4.31",
+    "oracleImage": "gvenzl/oracle-free:23-slim",
+    "liquibaseImage": "liquibase/liquibase:4.31-alpine"
+  }
+}
