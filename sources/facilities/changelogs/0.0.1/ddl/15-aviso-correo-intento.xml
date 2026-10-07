@@ -241,4 +241,388 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-15-05" author="MIND">
+        <comment>Oraculo AC-TRZ-01 / REQ-144: un aviso con 2 intentos fallidos y 1 exitoso deja exactamente 3 filas de intento con attempt_number 1, 2 y 3 en orden cronologico</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO de la traza de envios. Igual que los oraculos de
+            14-aviso-correo.xml (14-05, 14-06 y 14-07), se ejecuta contra el motor Oracle REAL durante
+            el propio despliegue: monta el escenario completo (catalogos, cuentas, oficina, sala,
+            categoria, incidencia y la fila de aviso_correo que se intenta entregar), escribe los tres
+            intentos sobre datos reales, comprueba las invariantes leyendolas DE LA TABLA y deshace
+            todo lo que ha sembrado.
+
+            POR QUE SE EJECUTA COMO CHANGESET DE DESPLIEGUE
+            ===============================================
+            Lo que el DoD pide demostrar no es que una capa de servicio sepa contar intentos, sino que
+            la TABLA sostiene la traza: que el correlativo es unico de verdad (lo impone
+            uk_aviso_intento_correlativo del changeset 15-03), que el orden por attempt_number es el
+            orden cronologico real y que la prueba de entrega (message_id) solo acompana al intento
+            SENT (lo impone ck_aviso_intento_message_id del 15-02). Esas garantias son del MOTOR, y la
+            unica forma de verificarlas contra el motor es ejecutar el escenario en el mismo
+            despliegue que acaba de crear los objetos: si una restriccion falta, esta mal escrita o
+            alguien la relaja en el futuro, el despliegue se cae aqui y no seis meses despues en
+            produccion con una auditoria de envios que ya no cuadra.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL, que provocaria un commit implicito y dejaria grabadas las filas
+            del oraculo. Los catalogos se siembran con MERGE y con el patron "buscar o insertar" de
+            los oraculos anteriores, porque los changelogs dml se aplican DESPUES de los ddl y aqui
+            pueden estar todavia vacios; al ser idempotente, el oraculo funciona igual sobre un
+            esquema recien creado que sobre uno ya poblado. Todos los identificadores llevan marca
+            propia de esta tarea (sufijo "trz", office_code 'ORA58', reference_code
+            'INC-ORA58-000001', display_order en el rango 977..979) para no chocar con los de ningun
+            oraculo anterior.
+
+            POR QUE LA LIMPIEZA ES SIEMPRE POR ROLLBACK Y NUNCA POR DELETE
+            ==============================================================
+            aviso_correo_intento es append-only: el trigger trg_aviso_correo_intento_inmutable del
+            changeset 15-04 rechaza con ORA-20004 CUALQUIER UPDATE o DELETE sobre la tabla, incluso el
+            que no afecta a ninguna fila, porque es un trigger de sentencia. Un "DELETE FROM
+            aviso_correo_intento WHERE ..." para recoger los datos del escenario no limpiaria nada:
+            reventaria el oraculo y con el todo el despliegue. La unica forma de deshacer lo escrito
+            en una tabla inmutable es NO confirmarlo, de modo que el oraculo trabaja dentro de una
+            transaccion y termina con ROLLBACK, que revierte a la vez los tres intentos, el aviso, la
+            incidencia, las cuentas y las semillas de catalogo. El manejador WHEN OTHERS hace el mismo
+            ROLLBACK antes de relanzar, para que tampoco un fallo deje restos. Esa es exactamente la
+            razon de que el <rollback> del changeset este vacio: el oraculo no cambia nada que
+            revertir.
+
+            QUE DEMUESTRA
+            =============
+            (1) AC-TRZ-01 / REQ-144: un aviso con dos fallos transitorios y una entrega final deja
+            EXACTAMENTE tres filas de intento, ni una mas (un intento duplicado) ni una menos (un
+            intento no trazado). Es el recuento el que convierte la traza en auditable.
+
+            (2) El correlativo es 1, 2 y 3: sin huecos (MIN=1 y MAX=3) y sin repetidos
+            (COUNT(DISTINCT attempt_number)=3). Un hueco significaria un intento perdido y un repetido
+            un historial ambiguo.
+
+            (3) El orden por attempt_number ES el orden cronologico: se cuenta con LAG cuantas filas
+            tienen un attempted_at que NO es posterior al del intento anterior, y tiene que ser cero.
+            Comprobarlo con LAG y no comparando las variables del escenario es lo que hace que la
+            verificacion sea sobre lo PERSISTIDO.
+
+            (4) La semantica del resultado: la unica fila SENT es la tercera y lleva su message_id
+            (prueba de entrega, AC-SMTP-06), y las dos primeras son TRANSIENT_ERROR con su error_code
+            informado y sin message_id. Un diagnostico de REQ-144 que no distinga el intento que
+            entrego del que fallo no sirve para nada.
+
+            (5) La unicidad del correlativo es REAL y no una convencion de la capa de servicio: un
+            cuarto INSERT que repite attempt_number = 3 para el mismo aviso tiene que ser rechazado
+            con ORA-00001 por uk_aviso_intento_correlativo. Se exige el SQLCODE -1 exacto para que el
+            oraculo no se conforme con "fallo algo"; si el INSERT se acepta, el oraculo falla.
+
+            TODAS las marcas temporales del escenario son PASADAS porque trg_incidencia_ciclo_vida
+            rechaza con ORA-20053 cualquier marca futura.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_empleado    NUMBER;
+    v_oficina     NUMBER;
+    v_sala        NUMBER;
+    v_categoria   NUMBER;
+    v_inc         NUMBER;
+    v_aviso       VARCHAR2(36 CHAR);
+    v_snapshot    VARCHAR2(400 CHAR);
+    v_now         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0          TIMESTAMP;
+    v_filas       NUMBER;
+    v_minimo      NUMBER;
+    v_maximo      NUMBER;
+    v_distintos   NUMBER;
+    v_desorden    NUMBER;
+    v_enviados    NUMBER;
+    v_entrega_ok  NUMBER;
+    v_fallidos    NUMBER;
+    v_sqlcode     NUMBER := 0;
+
+    c_prefijo       CONSTANT VARCHAR2(20 CHAR)  := 'ORACULO-TSK058|';
+    c_admin_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Traza Administrador';
+    c_empleado_nom  CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Traza Reportante';
+    c_empleado_mail CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk058.trz.reportante@example.invalid';
+    c_referencia    CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA58-000001';
+    c_descripcion   CONSTANT VARCHAR2(500 CHAR) := 'El climatizador de la sala de reuniones no enfria y la sala se queda inutilizable toda la manana';
+    c_sala_nom      CONSTANT VARCHAR2(80 CHAR)  := 'Sala del oraculo TSK-058';
+    c_oficina_nom   CONSTANT VARCHAR2(80 CHAR)  := 'Oficina del oraculo TSK-058';
+    c_categoria_nm  CONSTANT VARCHAR2(60 CHAR)  := 'Climatizacion oraculo TSK-058';
+    c_asunto        CONSTANT VARCHAR2(255 CHAR) := 'Nueva incidencia registrada (oraculo TSK-058)';
+    c_cuerpo        CONSTANT VARCHAR2(500 CHAR) := 'Cuerpo congelado del aviso de alta del oraculo TSK-058.';
+    c_message       CONSTANT VARCHAR2(255 CHAR) := '<oraculo-tsk058-trz-3@mapfre.invalid>';
+
+    -- Semillas idempotentes de los catalogos de clave fija: el oraculo tiene que funcionar tanto
+    -- sobre un esquema recien creado (catalogos vacios, los changelogs dml van despues) como sobre
+    -- uno ya poblado. Los display_order quedan fuera del rango de las semillas reales y fuera del de
+    -- los oraculos anteriores (901..903 y 971..976) porque uk_cat_rol_display_order y
+    -- uk_cat_categoria_display_order son UNIQUE.
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven con
+    -- el equivalente "buscar o insertar": si la fila ya existe se reutiliza (reactivandola, porque
+    -- los triggers de clasificacion rechazan oficinas, salas y categorias inactivas) y si no se crea
+    -- una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA58';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA58', c_oficina_nom, 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA58-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA58-SALA-01', c_sala_nom, p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        -- El oraculo NO puede usar un category_code propio porque ck_cat_categoria_code cierra el
+        -- enumerado, de modo que reutiliza CLIMATIZACION.
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', c_categoria_nm, 979, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+BEGIN
+    v_t0 := v_now - INTERVAL '2' HOUR;
+
+    -- ==================================================================================
+    -- MONTAJE: catalogos, cuentas, clasificacion, incidencia y el aviso a entregar
+    -- ==================================================================================
+    sembrar_rol('EMPLEADO',      'Empleado',      977);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 978);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk058.trz.admin@example.invalid',
+                 'oraculo.tsk058.trz.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk058-trz-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_empleado_nom, c_empleado_mail,
+                 'oraculo.tsk058.trz.reportante', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk058-trz-reportante', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t0, v_t0, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    -- El identificador del aviso lo genera el emisor (VARCHAR2(36)): SYS_GUID en hexadecimal
+    -- minuscula ocupa 32 caracteres y cabe de sobra.
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso FROM dual;
+
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              incident_id, history_entry_id,
+                              recipient_user_id, recipient_email, subject, body_text,
+                              status)
+         VALUES (v_aviso, c_prefijo || 'NEW_INCIDENT_ALERT|' || v_inc, 'NEW_INCIDENT_ALERT',
+                 v_inc, NULL,
+                 NULL, NULL, c_asunto, c_cuerpo,
+                 'PENDIENTE');
+
+    -- Instantanea de destinatarios CONGELADA (AC-SMTP-02): el mismo documento JSON en los tres
+    -- intentos, porque el directorio no cambio entre reintentos. Solo lleva el identificador y el
+    -- correo CORPORATIVO, jamas una credencial del servidor de correo (AC-SMTP-11).
+    v_snapshot := '[{"user_id":' || v_empleado || ',"corporate_email":"' || c_empleado_mail || '"}]';
+
+    -- ==================================================================================
+    -- EL ESCENARIO DE AC-TRZ-01: dos fallos transitorios y una entrega final
+    -- ==================================================================================
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (LOWER(RAWTOHEX(SYS_GUID())), v_aviso, v_inc,
+                 1, v_t0, 'TRANSIENT_ERROR',
+                 '451', 'SMTP_TEMP_UNAVAILABLE',
+                 'El servidor de correo respondio 451: buzon temporalmente no disponible, procede reintento',
+                 v_snapshot, 1, NULL);
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (LOWER(RAWTOHEX(SYS_GUID())), v_aviso, v_inc,
+                 2, v_t0 + INTERVAL '5' MINUTE, 'TRANSIENT_ERROR',
+                 '421', 'SMTP_SERVICE_NOT_AVAILABLE',
+                 'El servidor de correo respondio 421: servicio no disponible y cierre de conexion, procede reintento',
+                 v_snapshot, 1, NULL);
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (LOWER(RAWTOHEX(SYS_GUID())), v_aviso, v_inc,
+                 3, v_t0 + INTERVAL '12' MINUTE, 'SENT',
+                 '250', NULL, NULL,
+                 v_snapshot, 1, c_message);
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-TRZ-01 / REQ-144): la traza tiene EXACTAMENTE 3 filas. Se lee DE LA
+    -- TABLA y no de las variables del escenario.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_filas
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso;
+
+    IF v_filas <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20982, 'ORACULO AC-TRZ-01: un aviso con 2 intentos fallidos y 1 exitoso deberia dejar exactamente 3 filas de intento y hay ' || v_filas);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 (REQ-144): el correlativo es 1, 2 y 3, sin huecos y sin repetidos. Un
+    -- hueco significa un intento que nadie trazo y un repetido un historial ambiguo.
+    -- -------------------------------------------------------------------------------------
+    SELECT MIN(attempt_number), MAX(attempt_number), COUNT(DISTINCT attempt_number)
+      INTO v_minimo, v_maximo, v_distintos
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso;
+
+    IF v_minimo <> 1 OR v_maximo <> 3 OR v_distintos <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20983, 'ORACULO AC-TRZ-01: los attempt_number de la traza deberian ser exactamente 1, 2 y 3 sin huecos ni repetidos, y son MIN=' || v_minimo || ' MAX=' || v_maximo || ' DISTINTOS=' || v_distintos);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3 (REQ-144): el orden por correlativo ES el orden cronologico. Se cuentan
+    -- con LAG las filas cuyo attempted_at NO es posterior al del intento anterior; si el
+    -- recuento no es cero, leer la traza por attempt_number contaria una historia distinta de
+    -- la que ocurrio en el tiempo.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_desorden
+      FROM (SELECT attempted_at,
+                   LAG(attempted_at) OVER (ORDER BY attempt_number) AS anterior
+              FROM aviso_correo_intento
+             WHERE notification_id = v_aviso)
+     WHERE anterior IS NOT NULL
+       AND attempted_at <= anterior;
+
+    IF v_desorden <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20984, 'ORACULO AC-TRZ-01: el orden por attempt_number no coincide con el orden cronologico por attempted_at: hay ' || v_desorden || ' intento(s) cuya marca no es posterior a la del intento anterior');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 4 (AC-SMTP-06 / REQ-144): la semantica del resultado. La UNICA fila SENT es
+    -- la 3 y lleva su message_id (prueba de entrega); las otras dos son TRANSIENT_ERROR con su
+    -- error_code informado y sin message_id. Un diagnostico que no distinga el intento que
+    -- entrego del que fallo no sirve para REQ-144.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_enviados
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso AND result_code = 'SENT';
+
+    SELECT COUNT(*) INTO v_entrega_ok
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso
+       AND result_code = 'SENT'
+       AND attempt_number = 3
+       AND message_id IS NOT NULL;
+
+    SELECT COUNT(*) INTO v_fallidos
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso
+       AND attempt_number IN (1, 2)
+       AND result_code = 'TRANSIENT_ERROR'
+       AND error_code IS NOT NULL
+       AND message_id IS NULL;
+
+    IF v_enviados <> 1 OR v_entrega_ok <> 1 OR v_fallidos <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20985, 'ORACULO AC-TRZ-01: la traza deberia tener un unico intento SENT (el 3, con message_id) y dos TRANSIENT_ERROR con error_code y sin message_id, y hay SENT=' || v_enviados || ' SENT_CON_MESSAGE_ID_EN_EL_3=' || v_entrega_ok || ' FALLIDOS_BIEN_FORMADOS=' || v_fallidos);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 5 (REQ-135): el correlativo es unico DE VERDAD. Un cuarto INSERT que repite
+    -- attempt_number = 3 para el MISMO aviso tiene que ser rechazado por
+    -- uk_aviso_intento_correlativo con ORA-00001. Se exige el SQLCODE -1 exacto para que el
+    -- oraculo no se conforme con "fallo algo"; si el INSERT se acepta, el oraculo falla.
+    -- -------------------------------------------------------------------------------------
+    v_sqlcode := 0;
+    BEGIN
+        INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                          attempt_number, attempted_at, result_code,
+                                          smtp_response_code, error_code, error_message,
+                                          recipients_snapshot, recipient_count, message_id)
+             VALUES (LOWER(RAWTOHEX(SYS_GUID())), v_aviso, v_inc,
+                     3, v_t0 + INTERVAL '20' MINUTE, 'TRANSIENT_ERROR',
+                     '451', 'SMTP_TEMP_UNAVAILABLE',
+                     'Intento con correlativo duplicado que la traza no puede aceptar',
+                     v_snapshot, 1, NULL);
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode <> -1 THEN
+        RAISE_APPLICATION_ERROR(-20986, 'ORACULO AC-TRZ-01: el cuarto intento con attempt_number = 3 repetido para el mismo aviso NO fue rechazado con ORA-00001 (SQLCODE=' || v_sqlcode || '): uk_aviso_intento_correlativo no garantiza la unicidad del correlativo');
+    END IF;
+
+    -- La limpieza es SIEMPRE por ROLLBACK: trg_aviso_correo_intento_inmutable rechaza con
+    -- ORA-20004 cualquier DELETE sobre aviso_correo_intento, de modo que un borrado explicito
+    -- de los datos del escenario tumbaria el despliegue en lugar de limpiarlo.
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
