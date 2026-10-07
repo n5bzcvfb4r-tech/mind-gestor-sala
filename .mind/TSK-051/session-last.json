@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-051",
+  "attempt": 1,
+  "at": "2026-10-07T12:46:26.634103+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-051 · `sesion_usuario` (ARC-112): emisión, vencimiento y revocación de sesiones.\n\nENTREGABLE: un único fichero, dentro de la zona de la tarea y sin tocar nada más —\n`sources/facilities/changelogs/0.0.1/ddl/08-sesion-usuario.xml` — 8 changesets Liquibase, `author=\"MIND\"`, ids `ddl-0.0.1-08-01..08`, todos con `<rollback>` explícito, imitando el estilo de `05-usuario.xml`, `06-usuario-credenciales.xml` y `07-usuario-historico.xml`.\n\nCOMPOSITION ROOT: no requiere edición. `changelogs/changelog-0",
+  "model": "claude-opus-5",
+  "input_tokens": 2018168,
+  "output_tokens": 43319,
+  "llm_calls": 73,
+  "cost_usd": 4.8440797500000015,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "f2519d5e7ec0e9937af5e6c311320d97ed1af86d",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
