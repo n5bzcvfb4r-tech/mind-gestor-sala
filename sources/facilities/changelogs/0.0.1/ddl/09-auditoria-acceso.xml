@@ -380,4 +380,148 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-09-08" author="MIND">
+        <comment>Oraculo AC-TRZ-02 / AC-XFN-04: UPDATE y DELETE sobre una entrada devuelven ORA-20003 y la dejan identica</comment>
+        <!--
+            Comprueba contra el motor real las dos mitades de la inmutabilidad que exige el DoD: que
+            el UPDATE y el DELETE son rechazados con ORA-20003 y que tras ambos intentos la fila
+            sigue siendo identica byte a byte, verificado sobre una instantanea textual de todas sus
+            columnas y sobre su huella SHA-256.
+
+            Comprueba ademas que el catalogo cerrado de event_type y la regla de atribucion rechazan
+            lo que no cumple: un tipo de evento fuera de catalogo y un login_ok sin user_id devuelven
+            ORA-02290 (REQ-061 validaciones 1 y 3, escenarios de error 3 y 5). Oracle hace rollback a
+            nivel de SENTENCIA cuando una restriccion o un trigger lanzan el error, de modo que los
+            intentos fallidos no tumban los datos ya insertados por el propio oraculo.
+
+            El bloque deshace sus datos con un ROLLBACK final y no deja ninguna fila.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_user      NUMBER;
+    v_audit     VARCHAR2(36);
+    v_antes     VARCHAR2(4000);
+    v_despues   VARCHAR2(4000);
+    v_sqlcode   NUMBER;
+    v_filas     NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    FUNCTION instantanea(p_audit_id VARCHAR2) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT audit_id || '|' ||
+               NVL(TO_CHAR(user_id), '~') || '|' ||
+               NVL(username_attempted, '~') || '|' ||
+               event_type || '|' ||
+               NVL(operation, '~') || '|' ||
+               outcome || '|' ||
+               TO_CHAR(occurred_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(ip_address, '~') || '|' ||
+               NVL(user_agent, '~') || '|' ||
+               NVL(session_id, '~') || '|' ||
+               TO_CHAR(retention_until, 'YYYY-MM-DD')
+          INTO v_txt
+          FROM auditoria_acceso
+         WHERE audit_id = p_audit_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status, password_hash, password_algorithm)
+         VALUES ('Oraculo Inmutable Auditoria Admin', 'oraculo.tsk052.inmutable.admin@example.invalid',
+                 'oraculo.tsk052.inmutable.admin', 'ADMINISTRADOR', 'ACTIVO', '$argon2id$oraculo', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status, password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Inmutable Auditoria', 'oraculo.tsk052.inmutable@example.invalid',
+                 'oraculo.tsk052.inmutable', 'EMPLEADO', 'ACTIVO', '$argon2id$oraculo', 'argon2id', v_admin)
+      RETURNING user_id INTO v_user;
+
+    INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, operation, outcome, ip_address, user_agent, session_id)
+         VALUES (v_user, 'oraculo.tsk052.inmutable', 'permission_denied', 'GET /api/audit-log', 'DENIED_403',
+                 '10.0.0.7', 'oraculo-tsk052', 'd3f1c0de-0000-4000-8000-000000000002')
+      RETURNING audit_id INTO v_audit;
+
+    v_antes := instantanea(v_audit);
+
+    -- 1) el UPDATE es rechazado con ORA-20003
+    BEGIN
+        UPDATE auditoria_acceso SET outcome = 'OK' WHERE audit_id = v_audit;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20003 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-TRZ-02: el UPDATE sobre auditoria_acceso devolvio ' || v_sqlcode || ' en lugar de ORA-20003');
+    END IF;
+
+    -- 2) el DELETE es rechazado con ORA-20003
+    BEGIN
+        DELETE FROM auditoria_acceso WHERE audit_id = v_audit;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20003 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-TRZ-02: el DELETE sobre auditoria_acceso devolvio ' || v_sqlcode || ' en lugar de ORA-20003');
+    END IF;
+
+    -- 3) la entrada sigue ahi e identica byte a byte
+    SELECT COUNT(*) INTO v_filas FROM auditoria_acceso WHERE audit_id = v_audit;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-TRZ-02: la entrada de auditoria ha desaparecido tras el intento de borrado');
+    END IF;
+
+    v_despues := instantanea(v_audit);
+    IF v_antes <> v_despues
+       OR RAWTOHEX(STANDARD_HASH(v_antes, 'SHA256')) <> RAWTOHEX(STANDARD_HASH(v_despues, 'SHA256')) THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-TRZ-02: la entrada de auditoria no es identica byte a byte tras el UPDATE y el DELETE rechazados');
+    END IF;
+
+    -- 4) un tipo de evento fuera del catalogo cerrado es rechazado
+    BEGIN
+        INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, outcome)
+             VALUES (v_user, 'oraculo.tsk052.inmutable', 'password_sniffed', 'OK');
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO REQ-061: un event_type fuera del catalogo devolvio ' || v_sqlcode || ' en lugar de ORA-02290');
+    END IF;
+
+    -- 5) solo login_failed admite entrada sin usuario atribuido
+    BEGIN
+        INSERT INTO auditoria_acceso (user_id, username_attempted, event_type, outcome)
+             VALUES (NULL, 'oraculo.tsk052.inmutable', 'login_ok', 'OK');
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO REQ-061: un login_ok sin user_id devolvio ' || v_sqlcode || ' en lugar de ORA-02290');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
