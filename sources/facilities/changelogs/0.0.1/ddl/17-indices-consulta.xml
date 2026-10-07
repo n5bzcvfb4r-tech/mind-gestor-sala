@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-17-01" author="MIND">
+        <comment>Indices compuestos de la bandeja del tecnico (REQ-106 / AC-BAN-02 / AC-BAN-09)</comment>
+        <!--
+            El orden de las columnas de cada indice NO es arbitrario: sigue el orden en que la
+            consulta de la bandeja usa los datos. Primero los terminos de IGUALDAD (los filtros
+            exactos que seleccionan el rango de filas) y despues las columnas del ORDEN del
+            listado. Asi el motor localiza por los primeros terminos un tramo contiguo del indice
+            y lo recorre YA ORDENADO, sin necesidad de una operacion de ordenacion posterior.
+
+            ix_incidencia_bandeja_estado sirve a la bandeja filtrada por estado. Su cola,
+            created_at DESC, incident_id DESC, es EXACTAMENTE el orden por defecto de REQ-106: la
+            incidencia mas reciente arriba y, ante dos incidencias con la misma marca de alta, el
+            identificador mayor primero. Ese segundo criterio es el DESEMPATE ESTABLE y no es un
+            adorno: sin el, dos filas con el mismo created_at quedan en un orden que el motor puede
+            resolver de forma distinta en cada ejecucion, de modo que una misma fila podria
+            aparecer en DOS paginas consecutivas o en NINGUNA al avanzar por el listado. Como la
+            SPA pagina con OFFSET ... FETCH y cada pagina es una consulta nueva, ese troceo es
+            observable por el usuario en cuanto hay altas masivas en el mismo segundo.
+
+            Con el indice en ese mismo orden, el OFFSET ... FETCH se resuelve recorriendo el indice
+            y descartando las primeras entradas, sin SORT y sin materializar el resultado completo:
+            el coste de la pagina N no crece con el tamano total de la bandeja mas alla del salto.
+
+            ix_incidencia_bandeja_sala e ix_incidencia_bandeja_categoria sirven a la combinacion
+            mas frecuente de la bandeja, el filtro de clasificacion CRUZADO con el de estado
+            (sala + estado, categoria + estado). Los indices de una sola columna que ya existen
+            (ix_incidencia_room, ix_incidencia_category) resuelven solo la mitad del predicado y
+            obligan a visitar la tabla para descartar por estado; estos cubren ambos terminos
+            dentro del propio indice.
+        -->
+        <sql>CREATE INDEX ix_incidencia_bandeja_estado ON incidencia (status, created_at DESC, incident_id DESC)</sql>
+        <sql>CREATE INDEX ix_incidencia_bandeja_sala ON incidencia (room_id, status)</sql>
+        <sql>CREATE INDEX ix_incidencia_bandeja_categoria ON incidencia (category_id, status)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_bandeja_categoria</sql>
+            <sql>DROP INDEX ix_incidencia_bandeja_sala</sql>
+            <sql>DROP INDEX ix_incidencia_bandeja_estado</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-02" author="MIND">
+        <preConditions onFailMessage="El indice (assigned_technician_id, status) ya existe sobre incidencia: aportado por ddl-0.0.1-11-05" onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM (SELECT ic.index_name FROM user_ind_columns ic WHERE ic.table_name = 'INCIDENCIA' GROUP BY ic.index_name HAVING LISTAGG(ic.column_name, ',') WITHIN GROUP (ORDER BY ic.column_position) = 'ASSIGNED_TECHNICIAN_ID,STATUS')</sqlCheck>
+        </preConditions>
+        <comment>Indice de bandeja por tecnico asignado (REQ-106); se marca como ejecutado si ya lo aporta ddl-0.0.1-11-05</comment>
+        <!--
+            El DoD de esta tarea pide un indice sobre (assigned_technician_id, status) para el
+            filtro de asignacion de la bandeja. Ese indice YA EXISTE en el esquema con el nombre
+            ix_incidencia_asignacion, creado en ddl-0.0.1-11-05, con exactamente esas dos columnas
+            y en ese mismo orden.
+
+            Crear un segundo indice con el MISMO conjunto de columnas en el MISMO orden no es un
+            duplicado inofensivo: Oracle lo rechaza con ORA-01408 ("such column list already
+            indexed") y el despliegue entero se detendria. Por eso este changeset no crea el indice
+            a ciegas, sino que se AUTODECLARA REDUNDANTE mediante una precondicion: consulta
+            user_ind_columns, reconstruye con LISTAGG la lista ordenada de columnas de cada indice
+            de la tabla y comprueba si alguno es ya 'ASSIGNED_TECHNICIAN_ID,STATUS'. La comparacion
+            se hace por COLUMNAS y no por NOMBRE de indice a proposito: lo que provoca el ORA-01408
+            es la coincidencia del conjunto de columnas, llamese como se llame el indice existente.
+
+            Si lo encuentra, la precondicion falla y onFail="MARK_RAN" deja el changeset anotado
+            como ejecutado en DATABASECHANGELOG sin tocar la base de datos, de modo que el
+            despliegue continua y queda constancia explicita de POR QUE no se creo nada.
+
+            Si una evolucion futura retirase ix_incidencia_asignacion, la precondicion pasaria y
+            este changeset repondria la cobertura del filtro bajo el nombre
+            ix_incidencia_bandeja_tecnico, sin que el requisito quede huerfano.
+        -->
+        <sql>CREATE INDEX ix_incidencia_bandeja_tecnico ON incidencia (assigned_technician_id, status)</sql>
+        <rollback>
+            <!--
+                El rollback es DEFENSIVO a proposito. Cuando la precondicion marca el changeset como
+                MARK_RAN el indice NO llega a crearse, pero la entrada queda igualmente registrada en
+                DATABASECHANGELOG; un DROP INDEX seco fallaria entonces con ORA-01418 y pondria en
+                rojo el rollback-count. El bloque solo suelta el indice si existe, de modo que el
+                rollback es correcto tanto si el changeset se ejecuto como si se marco.
+            -->
+            <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_count NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO l_count FROM user_indexes WHERE index_name = 'IX_INCIDENCIA_BANDEJA_TECNICO';
+    IF l_count > 0 THEN
+        EXECUTE IMMEDIATE 'DROP INDEX ix_incidencia_bandeja_tecnico';
+    END IF;
+END;]]></sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-03" author="MIND">
+        <comment>Indices funcionales de la busqueda textual acento e insensible a mayusculas (REQ-110 / AC-BAN-07)</comment>
+        <!--
+            REQ-110 / AC-BAN-07 exigen que la busqueda por texto de la bandeja ignore tanto las
+            tildes como las mayusculas: 'proyector', 'Proyector' y 'PROYECTOR' con tilde tienen que
+            encontrar las mismas incidencias.
+
+            NLSSORT con un juego de ordenacion terminado en _AI hace exactamente eso. El sufijo _AI
+            significa "accent insensitive" y en Oracle es a la vez insensible a ACENTOS y a
+            MAYUSCULAS (el _AI incluye el comportamiento del _CI), de modo que las tres formas del
+            ejemplo producen la MISMA clave de ordenacion y comparan como iguales.
+
+            La consulta de busqueda activa ese juego en la sesion con
+                ALTER SESSION SET NLS_COMP = LINGUISTIC
+                ALTER SESSION SET NLS_SORT = SPANISH_AI
+            y a partir de ahi la igualdad y el LIKE se resuelven LINGUISTICAMENTE en lugar de byte a
+            byte. Es esa resolucion linguistica la que puede apoyarse en un indice construido sobre
+            la misma expresion NLSSORT(..., 'NLS_SORT=SPANISH_AI'); sin el indice, cada busqueda
+            obligaria a calcular la clave linguistica de TODAS las filas de la tabla.
+
+            description es VARCHAR2(500 CHAR) y NO un CLOB, y eso es lo que hace viable este indice:
+            sobre una columna LOB Oracle rechazaria el indice de arbol B y la busqueda textual
+            requeriria Oracle Text con su propio indice de dominio y su mantenimiento asociado. La
+            cota de 500 caracteres de la descripcion (REQ del alta) es por tanto tambien una
+            decision de indexabilidad.
+
+            UPPER(reference_code) cubre el otro camino de la busqueda, el del codigo de incidencia:
+            escribir 'inc-2024-000123' tiene que encontrar 'INC-2024-000123'. Aqui basta con UPPER y
+            no hace falta el tratamiento de acentos, porque el codigo de referencia es ASCII por
+            construccion (prefijo, ano y secuencia) y no contiene ni una sola letra acentuada.
+        -->
+        <sql>CREATE INDEX ix_incidencia_desc_ai ON incidencia (NLSSORT(description, 'NLS_SORT=SPANISH_AI'))</sql>
+        <sql>CREATE INDEX ix_incidencia_reference_upper ON incidencia (UPPER(reference_code))</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_reference_upper</sql>
+            <sql>DROP INDEX ix_incidencia_desc_ai</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-04" author="MIND" runOnChange="true">
+        <comment>Vistas de alimentacion de los filtros de sala, oficina y categoria (REQ-103 / REQ-159)</comment>
+        <!--
+            Estas tres vistas resuelven QUE VALORES aparecen en los desplegables de filtro de la
+            bandeja y de los listados: salas, oficinas y categorias.
+
+            La regla 2 de REQ-103 es la que dicta su forma. Un valor de catalogo DESACTIVADO no
+            desaparece sin mas de los filtros: aparece UNICAMENTE si tiene al menos una incidencia
+            asociada, y cuando aparece va MARCADO como inactivo. El motivo es que, si una sala se
+            desactiva despues de que se registrasen incidencias en ella, retirarla del filtro
+            volveria INALCANZABLES esas incidencias historicas; y mostrarla sin marca haria creer
+            que sigue operativa. De ahi las dos piezas de cada vista:
+
+              - el OR EXISTS, que recupera el valor inactivo solo cuando tiene incidencias
+                asociadas (un catalogo inactivo y sin uso no ensucia el desplegable), y
+              - la columna es_inactivo, que es la marca que la interfaz necesita para distinguirlo.
+
+            El flag se publica como 'Y'/'N' y no como 0/1 ni como booleano, por coherencia con la
+            convencion booleana del proyecto: is_active en los catalogos es CHAR(1 CHAR) con 'Y' o
+            'N'. Notese que es_inactivo es la NEGACION de is_active ('Y' cuando is_active = 'N'),
+            porque lo que la interfaz quiere saber es si debe marcar el valor; la API lo traduce al
+            literal '(inactiva)' junto al nombre.
+
+            La rama de la oficina llega a incidencia a traves de cat_sala, porque una incidencia no
+            referencia la oficina directamente: la hereda de la sala en la que se reporto.
+
+            MUY IMPORTANTE: estas vistas NO ACOTAN POR ROL ni por propiedad. No saben quien
+            consulta. El alcance de datos (OWN para el empleado, ALL para tecnico y administrador)
+            lo aplica el repositorio en su predicado sobre la tabla incidencia; estas vistas solo
+            responden a la pregunta de que VALORES ofrece cada desplegable. Mezclar ambas
+            responsabilidades aqui obligaria a parametrizar la vista por usuario y duplicaria la
+            regla de seguridad en dos sitios.
+        -->
+        <sql>CREATE OR REPLACE VIEW v_filtro_sala AS
+SELECT s.room_id,
+       s.room_code,
+       s.room_name,
+       s.office_id,
+       o.office_name,
+       CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_sala s
+  JOIN cat_oficina o ON o.office_id = s.office_id
+ WHERE s.is_active = 'Y'
+    OR EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)</sql>
+        <sql>CREATE OR REPLACE VIEW v_filtro_oficina AS
+SELECT o.office_id,
+       o.office_code,
+       o.office_name,
+       o.city,
+       CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_oficina o
+ WHERE o.is_active = 'Y'
+    OR EXISTS (SELECT 1
+                 FROM incidencia i
+                 JOIN cat_sala s ON s.room_id = i.room_id
+                WHERE s.office_id = o.office_id)</sql>
+        <sql>CREATE OR REPLACE VIEW v_filtro_categoria AS
+SELECT c.category_id,
+       c.category_code,
+       c.category_name,
+       c.display_order,
+       CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_categoria_incidencia c
+ WHERE c.is_active = 'Y'
+    OR EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)</sql>
+        <rollback>
+            <sql>DROP VIEW v_filtro_categoria</sql>
+            <sql>DROP VIEW v_filtro_oficina</sql>
+            <sql>DROP VIEW v_filtro_sala</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-05" author="MIND" runOnChange="true">
+        <comment>Vista de recuento agregado por oficina, sala y categoria (REQ-104 / AC-CLAS-05)</comment>
+        <!--
+            Esta vista sirve el recuento de incidencias por las tres dimensiones de clasificacion
+            (oficina, sala y categoria) en una sola estructura, de modo que el consumidor elige la
+            dimension con WHERE group_type = 'CATEGORY' y ordena de mayor a menor con
+            ORDER BY incident_count DESC.
+
+            EL LEFT JOIN ES LA REGLA, NO UNA OPTIMIZACION
+            ============================================
+            REQ-104 regla 2 y AC-CLAS-05 exigen que TODO valor del catalogo aparezca en el recuento
+            aunque su total sea 0. Una categoria sin ninguna incidencia tiene que figurar con un 0
+            visible; omitirla haria creer que no existe. Por eso cada rama parte del CATALOGO y
+            alcanza incidencia con LEFT JOIN, y nunca al reves.
+
+            Y por eso se cuenta COUNT(i.incident_id) y NO COUNT(*). Es la trampa clasica de este
+            patron: el LEFT JOIN conserva la fila del catalogo con TODAS las columnas de incidencia
+            a NULL, de modo que COUNT(*) contaria esa fila fantasma y devolveria 1 alli donde la
+            respuesta correcta es 0. COUNT(columna) ignora los NULL y por tanto devuelve 0.
+
+            La rama OFFICE encadena DOS LEFT JOIN (cat_oficina -> cat_sala -> incidencia) y no uno:
+            si el segundo salto fuese un JOIN interno, una oficina SIN SALAS desapareceria del
+            resultado en lugar de salir con 0. Con los dos en LEFT, el recorrido sobrevive tanto a
+            la oficina sin salas como a la sala sin incidencias.
+
+            DESGLOSE POR ESTADO
+            ===================
+            Los cuatro COUNT(CASE WHEN ...) permiten servir el filtro por status de REQ-104 sin
+            volver a la tabla base: el consumidor que quiere "abiertas por categoria" lee
+            incident_count_abierta en lugar de lanzar una agregacion nueva. Se cuenta sobre la
+            columna FISICA status (status_code es una columna virtual de solo lectura que publica
+            el mismo dato con el nombre del inventario).
+
+            primera_incidencia_at y ultima_incidencia_at dan el rango temporal de cada agrupacion y
+            son NULL de forma natural cuando el recuento es 0, que es la respuesta correcta: una
+            categoria sin incidencias no tiene ni primera ni ultima.
+
+            LOS CAST EXPLICITOS
+            ===================
+            En un UNION ALL, Oracle fija el tipo de cada columna del resultado a partir de la
+            PRIMERA rama. Sin CAST, group_type tomaria el tipo del literal 'OFFICE' (6 caracteres) y
+            truncaria 'CATEGORY' de la tercera rama; y group_name heredaria la longitud de
+            cat_oficina.office_name, de modo que un cambio futuro de longitud en una sola de las
+            tres tablas alteraria en silencio el tipo publicado por la vista. Los CAST fijan el tipo
+            de CADA rama de forma explicita y hacen la vista independiente tanto de la longitud de
+            los literales como del orden de las ramas.
+
+            Como las vistas de filtro del changeset anterior, esta vista TAMPOCO acota por rol: el
+            alcance de datos lo aplica el consumidor sobre incidencia.
+        -->
+        <sql>CREATE OR REPLACE VIEW v_recuento_incidencias AS
+SELECT CAST('OFFICE' AS VARCHAR2(10 CHAR)) AS group_type,
+       o.office_id   AS group_id,
+       CAST(o.office_name AS VARCHAR2(80 CHAR)) AS group_name,
+       CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo,
+       COUNT(i.incident_id) AS incident_count,
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END) AS incident_count_abierta,
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END) AS incident_count_en_curso,
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END) AS incident_count_resuelta,
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END) AS incident_count_cerrada,
+       MIN(i.created_at) AS primera_incidencia_at,
+       MAX(i.created_at) AS ultima_incidencia_at
+  FROM cat_oficina o
+  LEFT JOIN cat_sala s   ON s.office_id = o.office_id
+  LEFT JOIN incidencia i ON i.room_id   = s.room_id
+ GROUP BY o.office_id, o.office_name, o.is_active
+UNION ALL
+SELECT CAST('ROOM' AS VARCHAR2(10 CHAR)),
+       s.room_id,
+       CAST(s.room_name AS VARCHAR2(80 CHAR)),
+       CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END,
+       COUNT(i.incident_id),
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END),
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END),
+       MIN(i.created_at),
+       MAX(i.created_at)
+  FROM cat_sala s
+  LEFT JOIN incidencia i ON i.room_id = s.room_id
+ GROUP BY s.room_id, s.room_name, s.is_active
+UNION ALL
+SELECT CAST('CATEGORY' AS VARCHAR2(10 CHAR)),
+       c.category_id,
+       CAST(c.category_name AS VARCHAR2(80 CHAR)),
+       CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END,
+       COUNT(i.incident_id),
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END),
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END),
+       MIN(i.created_at),
+       MAX(i.created_at)
+  FROM cat_categoria_incidencia c
+  LEFT JOIN incidencia i ON i.category_id = c.category_id
+ GROUP BY c.category_id, c.category_name, c.is_active</sql>
+        <rollback>
+            <sql>DROP VIEW v_recuento_incidencias</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
