@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-13-01" author="MIND">
+        <comment>Historico inmutable de la incidencia (ARC-118): traza append-only de alta, cambio de estado, asignacion, reclasificacion y comentario de resolucion</comment>
+        <!--
+            Esta tabla es el gemelo de usuario_historico para la incidencia: append-only, con actor y
+            fecha en cada asiento, y encadenada por huella (previous_entry_hash / entry_hash) para que
+            cualquier manipulacion posterior sea detectable.
+
+            Las columnas FISICAS de escritura desdoblan el valor anterior y el nuevo de cada dimension
+            (estado, sala, categoria, tecnico) en lugar de guardar una unica columna de texto: solo
+            asi se pueden declarar FK reales contra cat_estado_incidencia, cat_sala,
+            cat_categoria_incidencia y usuario. value_before y value_after son columnas VIRTUALES de
+            solo lectura que publican sobre esas mismas columnas fisicas los nombres del inventario
+            T.5 ARC-118; misma tecnica que usuario_historico.previous_value / new_value y que
+            incidencia.status_code. No ocupan almacenamiento y Oracle responde ORA-54013 si alguien
+            intenta escribirlas.
+
+            DECISION 1 - entry_comment, y no "comment". entry_comment es el nombre FISICO del
+            inventario T.5 ARC-118 y es ademas el unico posible: COMMENT es palabra RESERVADA de
+            Oracle y no se admite como nombre de columna sin comillas dobles, que obligarian a citar
+            la columna en cada sentencia y a arrastrar la sensibilidad a mayusculas. De modo que el
+            "comment" que nombra el DoD se materializa como entry_comment, con la misma semantica:
+            el texto libre asociado al asiento (motivo de la liberacion, nota del cambio de estado o
+            comentario de resolucion).
+
+            DECISION 2 - changed_at con DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) y no SYSTIMESTAMP a
+            secas. REQ-125 exige el instante UTC del servidor: SYSTIMESTAMP crudo grabaria la hora
+            local de la maquina, que depende de su zona horaria y rompe tanto la ordenacion
+            cronologica de la traza como su comparacion con las marcas de incidencia. Es ademas la
+            convencion ya aplicada en usuario_historico.changed_at y en incidencia.created_at: toda
+            marca del proyecto es naive en UTC.
+
+            assigned_technician_name conserva la denominacion del tecnico VIGENTE EN EL ASIENTO, de
+            modo que un renombrado o una baja posterior de la cuenta no reescriben la traza ya
+            registrada; el identificador queda en assigned_technician_id con su FK.
+
+            resolution_comment_ref apunta a la PROPIA incidencia y solo se informa en la transicion
+            RESUELTA -> CERRADA (lo impone ck_inc_hist_resolucion_ref del changeset 13-02): es la
+            referencia 1:1 entre el asiento de cierre y el comentario de resolucion guardado en
+            incidencia.resolution_comment.
+
+            NINGUNA FK declara ON DELETE, ni CASCADE ni SET NULL: la traza sobrevive al ciclo de vida
+            de catalogos y cuentas, que es de desactivacion y nunca de borrado (REQ-087 / REQ-102).
+        -->
+        <sql>CREATE TABLE incidencia_historico (
+    history_id               NUMBER GENERATED ALWAYS AS IDENTITY,
+    incident_id              NUMBER NOT NULL,
+    entry_type               VARCHAR2(30 CHAR) NOT NULL,
+    from_status              VARCHAR2(20 CHAR),
+    to_status                VARCHAR2(20 CHAR) NOT NULL,
+    previous_room_id         NUMBER,
+    new_room_id              NUMBER,
+    previous_category_id     NUMBER,
+    new_category_id          NUMBER,
+    previous_technician_id   NUMBER,
+    assigned_technician_id   NUMBER,
+    assigned_technician_name VARCHAR2(150 CHAR),
+    actor_user_id            NUMBER NOT NULL,
+    actor_display_name       VARCHAR2(150 CHAR) NOT NULL,
+    changed_at               TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    entry_comment            VARCHAR2(500 CHAR),
+    resolution_comment_ref   NUMBER,
+    previous_entry_hash      VARCHAR2(64 CHAR),
+    entry_hash               VARCHAR2(64 CHAR) NOT NULL,
+    value_before             GENERATED ALWAYS AS (
+        CASE entry_type
+            WHEN 'RECLASIFICACION' THEN SUBSTR('room_id=' || previous_room_id || ';category_id=' || previous_category_id, 1, 200)
+            WHEN 'ASIGNACION'      THEN SUBSTR('assigned_technician_id=' || previous_technician_id, 1, 200)
+            ELSE CAST(from_status AS VARCHAR2(200 CHAR))
+        END) VIRTUAL,
+    value_after              GENERATED ALWAYS AS (
+        CASE entry_type
+            WHEN 'RECLASIFICACION' THEN SUBSTR('room_id=' || new_room_id || ';category_id=' || new_category_id, 1, 200)
+            WHEN 'ASIGNACION'      THEN SUBSTR('assigned_technician_id=' || assigned_technician_id, 1, 200)
+            ELSE CAST(to_status AS VARCHAR2(200 CHAR))
+        END) VIRTUAL,
+    CONSTRAINT pk_incidencia_historico PRIMARY KEY (history_id),
+    CONSTRAINT fk_inc_hist_incidencia FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id),
+    CONSTRAINT fk_inc_hist_from_status FOREIGN KEY (from_status) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_inc_hist_to_status FOREIGN KEY (to_status) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_inc_hist_prev_room FOREIGN KEY (previous_room_id) REFERENCES cat_sala (room_id),
+    CONSTRAINT fk_inc_hist_new_room FOREIGN KEY (new_room_id) REFERENCES cat_sala (room_id),
+    CONSTRAINT fk_inc_hist_prev_category FOREIGN KEY (previous_category_id) REFERENCES cat_categoria_incidencia (category_id),
+    CONSTRAINT fk_inc_hist_new_category FOREIGN KEY (new_category_id) REFERENCES cat_categoria_incidencia (category_id),
+    CONSTRAINT fk_inc_hist_prev_tecnico FOREIGN KEY (previous_technician_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_inc_hist_tecnico FOREIGN KEY (assigned_technician_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_inc_hist_actor FOREIGN KEY (actor_user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_inc_hist_resolucion_ref FOREIGN KEY (resolution_comment_ref) REFERENCES incidencia (incident_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="incidencia_historico"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-13-02" author="MIND">
+        <comment>Reglas de coherencia del historico: tipos de asiento, apertura de la traza, inmovilidad del estado en la asignacion, referencia de resolucion y formato de la cadena de huellas</comment>
+        <!--
+            ck_inc_hist_entry_type fija el enumerado de asientos de T.5 ARC-118: el alta
+            (CREACION), el cambio de estado, la asignacion a tecnico, la reclasificacion de sala o
+            categoria y el comentario de resolucion.
+
+            ck_inc_hist_from_status_creacion materializa "from_status es nulo SI Y SOLO SI el asiento
+            es el de alta": antes del alta no hay estado de origen, y despues toda transicion parte
+            de uno conocido. Es la vertiente de FORMA; la UNICIDAD del asiento de alta no se puede
+            expresar con una CHECK y la impone el indice ux_inc_hist_creacion del changeset 13-03.
+
+            ck_inc_hist_creacion_abierta: toda incidencia nace ABIERTA (REQ-125), de modo que el
+            asiento de alta solo admite ese estado destino.
+
+            ck_inc_hist_asignacion: la asignacion de un tecnico NO es una transicion de estado; la
+            entrada deja el estado como estaba (from_status = to_status) y lleva obligatoriamente el
+            tecnico destino.
+
+            ck_inc_hist_resolucion_ref: la referencia al comentario de resolucion se informa si y
+            solo si el asiento es la transicion RESUELTA -> CERRADA, y apunta a la PROPIA incidencia
+            (relacion 1:1 con el cierre). En cualquier otro asiento va nula.
+
+            ck_inc_hist_entry_hash y ck_inc_hist_previous_hash imponen el formato de la cadena de
+            integridad: 64 caracteres hexadecimales en mayusculas, que es la representacion
+            RAWTOHEX(STANDARD_HASH(..., 'SHA256')) que usa el proyecto. El asiento de alta ABRE la
+            cadena y por eso es el unico sin huella anterior; todos los demas la encadenan.
+        -->
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_entry_type CHECK (
+    entry_type IN ('CREACION','CAMBIO_ESTADO','ASIGNACION','RECLASIFICACION','COMENTARIO_RESOLUCION')
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_from_status_creacion CHECK (
+    (entry_type = 'CREACION' AND from_status IS NULL)
+ OR (entry_type &lt;&gt; 'CREACION' AND from_status IS NOT NULL)
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_creacion_abierta CHECK (
+    entry_type &lt;&gt; 'CREACION' OR to_status = 'ABIERTA'
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_asignacion CHECK (
+    entry_type &lt;&gt; 'ASIGNACION'
+ OR (from_status = to_status AND assigned_technician_id IS NOT NULL)
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_resolucion_ref CHECK (
+    (from_status = 'RESUELTA' AND to_status = 'CERRADA' AND resolution_comment_ref = incident_id)
+ OR ((from_status IS NULL OR from_status &lt;&gt; 'RESUELTA' OR to_status &lt;&gt; 'CERRADA')
+        AND resolution_comment_ref IS NULL)
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_entry_hash CHECK (
+    REGEXP_LIKE(entry_hash, '^[0-9A-F]{64}$')
+)</sql>
+        <sql>ALTER TABLE incidencia_historico ADD CONSTRAINT ck_inc_hist_previous_hash CHECK (
+    (entry_type = 'CREACION' AND previous_entry_hash IS NULL)
+ OR (entry_type &lt;&gt; 'CREACION' AND REGEXP_LIKE(previous_entry_hash, '^[0-9A-F]{64}$'))
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_previous_hash</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_entry_hash</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_resolucion_ref</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_asignacion</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_creacion_abierta</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_from_status_creacion</sql>
+            <sql>ALTER TABLE incidencia_historico DROP CONSTRAINT ck_inc_hist_entry_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-13-03" author="MIND">
+        <comment>Indices de acceso del historico y invariantes de unicidad: un unico asiento de alta y un unico asiento de cierre por incidencia</comment>
+        <!--
+            ix_inc_hist_incident_changed sirve la TRAZA CRONOLOGICA ASCENDENTE de una incidencia
+            (REQ-124 / REQ-151): cubre a la vez el filtro por incident_id y el orden por changed_at
+            con desempate por history_id, de modo que la pantalla de detalle no necesita ordenacion
+            adicional. El desempate es imprescindible porque dos asientos pueden compartir el mismo
+            changed_at hasta la microsegunda.
+
+            ix_inc_hist_actividad sirve el REGISTRO DE ACTIVIDAD RECIENTE paginado de 25 en 25
+            (REQ-129 / AC-HIST-CONS-07): el orden descendente por changed_at con desempate estable
+            por history_id DESC garantiza que ninguna entrada se repita ni se pierda entre paginas.
+
+            ux_inc_hist_creacion y ux_inc_hist_cierre son indices unicos FUNCIONALES sobre
+            expresiones CASE, misma tecnica que ux_usuario_hist_alta: la expresion vale NULL en las
+            filas que no interesan y Oracle NO indexa las claves integramente nulas, de modo que la
+            unicidad solo aplica al subconjunto relevante y el resto de asientos de la misma
+            incidencia pasa sin estorbar.
+
+            ux_inc_hist_creacion deja pasar un unico asiento de alta por incidencia (REQ-125).
+
+            ux_inc_hist_cierre deja pasar un unico asiento de transicion RESUELTA -> CERRADA por
+            incidencia, que es la cardinalidad 1:1 entre el cierre y su comentario de resolucion
+            (AC-HIS-06).
+        -->
+        <sql>CREATE INDEX ix_inc_hist_incident_changed ON incidencia_historico (incident_id, changed_at, history_id)</sql>
+        <sql>CREATE INDEX ix_inc_hist_actividad ON incidencia_historico (changed_at DESC, history_id DESC)</sql>
+        <sql>CREATE UNIQUE INDEX ux_inc_hist_creacion ON incidencia_historico (CASE WHEN entry_type = 'CREACION' THEN incident_id END)</sql>
+        <sql>CREATE UNIQUE INDEX ux_inc_hist_cierre ON incidencia_historico (CASE WHEN from_status = 'RESUELTA' AND to_status = 'CERRADA' THEN incident_id END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_inc_hist_cierre</sql>
+            <sql>DROP INDEX ux_inc_hist_creacion</sql>
+            <sql>DROP INDEX ix_inc_hist_actividad</sql>
+            <sql>DROP INDEX ix_inc_hist_incident_changed</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-13-04" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad del historial de cambios de estado (REQ-123): UPDATE y DELETE rechazados con ORA-20002</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW), igual que trg_usuario_historico_inmutable:
+            se dispara una vez por sentencia y rechaza el UPDATE o el DELETE incluso cuando no afecta
+            a ninguna fila, de modo que no hay forma de alterar ni de borrar un asiento ya escrito.
+
+            La tabla solo admite INSERT. Sobre esa garantia se apoyan la cadena de huellas
+            (previous_entry_hash / entry_hash) y la retencion de la traza: si el historial pudiera
+            reescribirse, la cadena podria recalcularse y la manipulacion dejaria de ser detectable.
+
+            El texto del error y el codigo ORA-20002 son exactamente los que fijan el DoD y REQ-123.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_historico_inmutable
+BEFORE UPDATE OR DELETE ON incidencia_historico
+BEGIN
+    RAISE_APPLICATION_ERROR(-20002, 'El historial de cambios de estado es inmutable');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_historico_inmutable</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
