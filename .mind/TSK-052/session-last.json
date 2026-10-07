@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-052",
+  "attempt": 1,
+  "at": "2026-10-07T12:45:19.066417+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-052 — `auditoria_acceso` (ARC-117): registro inmutable de eventos de acceso y denegaciones.\n\nENTREGA (un solo fichero nuevo, dentro de la zona declarada): `sources/facilities/changelogs/0.0.1/ddl/09-auditoria-acceso.xml`, con 8 changesets `ddl-0.0.1-09-01..08` (author=\"MIND\"), en el estilo exacto de los changelogs ya mergeados (05/06/07). NO se creó un segundo maestro: `changelog-0.0.1.xml` usa `<includeAll path=\"0.0.1/ddl\">`, así que el fichero queda montado en `sources/facilities/master.xm",
+  "model": "claude-opus-5",
+  "input_tokens": 1836433,
+  "output_tokens": 39673,
+  "llm_calls": 69,
+  "cost_usd": 4.599288249999999,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "3df00f6ba45e91f06df8f99119d8ed00e40b6d69",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
