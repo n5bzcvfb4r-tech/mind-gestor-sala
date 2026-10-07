@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-08-01" author="MIND">
+        <comment>Sesiones de usuario (ARC-112): emision, vigencia absoluta y revocacion server-side</comment>
+        <!--
+            session_id es un uuid de 36 caracteres y es la CLAVE PRIMARIA de la sesion. NUNCA viaja
+            en la URL (T.5 ARC-112): se transporta fuera del recurso y por eso el identificador es
+            opaco y no adivinable. En esta tabla no hay ninguna columna de credencial ni de token en
+            claro: la contrasenia y su hash viven en usuario_credenciales, aqui solo esta el estado
+            de la sesion.
+
+            role_code congela el rol VIGENTE en el instante de la emision, con FK real contra
+            cat_rol: la sesion recuerda con que rol se emitio aunque el rol del usuario cambie
+            despues.
+
+            last_seen_at es una columna VIRTUAL de solo lectura que publica el nombre del DoD de
+            TSK-051 sobre la columna FISICA last_activity_at del inventario T.5 ARC-112; misma
+            tecnica que usuario.is_active y que usuario_historico.event_type. Oracle responde
+            ORA-54013 si alguien intenta escribirla.
+
+            revocation_cause es otra columna VIRTUAL que publica en MAYUSCULAS el nombre y el
+            enumerado de REQ-086 (ACCOUNT_DEACTIVATED|PASSWORD_CHANGE|LOGOUT|EXPIRED) sobre la
+            columna fisica revocation_reason, cuyos valores persistidos son los del DoD en
+            minusculas. Asi la MISMA fila satisface literalmente REQ-057 (logout, expired, admin) y
+            REQ-086 RN-07 (revocation_cause = ACCOUNT_DEACTIVATED) sin duplicar el dato ni poder
+            desincronizarse.
+
+            issued_at y last_activity_at usan DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la marca naive
+            en UTC que es convencion del proyecto para toda marca temporal.
+
+            Esta tabla NO lleva contador de intentos fallidos ni locked_until: el contador es por
+            CUENTA y vive en usuario (REQ-072 RN-04), invariante que ya vigila el oraculo
+            ddl-0.0.1-06-08.
+        -->
+        <sql>CREATE TABLE sesion_usuario (
+    session_id               VARCHAR2(36 CHAR),
+    user_id                  NUMBER NOT NULL,
+    role_code                VARCHAR2(32 CHAR) NOT NULL,
+    issued_at                TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    expires_at               TIMESTAMP(6) NOT NULL,
+    last_activity_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    permissions_refreshed_at TIMESTAMP(6),
+    revoked_at               TIMESTAMP(6),
+    revocation_reason        VARCHAR2(30 CHAR),
+    last_seen_at             GENERATED ALWAYS AS (CAST(last_activity_at AS TIMESTAMP(6))) VIRTUAL,
+    revocation_cause         GENERATED ALWAYS AS (CAST(UPPER(revocation_reason) AS VARCHAR2(30 CHAR))) VIRTUAL,
+    CONSTRAINT pk_sesion_usuario PRIMARY KEY (session_id),
+    CONSTRAINT fk_sesion_usuario_user FOREIGN KEY (user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_sesion_usuario_role FOREIGN KEY (role_code) REFERENCES cat_rol (role_code)
+)</sql>
+        <rollback>
+            <dropTable tableName="sesion_usuario"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-08-02" author="MIND">
+        <comment>Reglas de coherencia de la sesion: enumerado de revocacion, vigencia y formato uuid</comment>
+        <!--
+            ck_sesion_usuario_reason_enum cierra el enumerado de motivos a los valores persistidos en
+            minusculas, que son los que la columna virtual revocation_cause publica en mayusculas.
+
+            ck_sesion_usuario_revocacion es la que materializa el "si y solo si" del DoD:
+            revocation_reason esta informado EXACTAMENTE cuando lo esta revoked_at, en los dos
+            sentidos. Ni puede existir una sesion viva (revoked_at nulo) que lleve motivo de
+            revocacion, ni una sesion revocada sin motivo registrado. Toda sesion revocada dice por
+            que lo esta.
+
+            ck_sesion_usuario_vigencia impone el VENCIMIENTO ABSOLUTO posterior a la emision
+            (T.5 ARC-112): expires_at siempre por detras de issued_at, de modo que no cabe una sesion
+            nacida ya caducada ni con vigencia invertida.
+
+            ck_sesion_usuario_actividad mantiene la linea temporal coherente: ni la actividad ni la
+            revocacion pueden ser anteriores a la emision de la propia sesion.
+
+            ck_sesion_usuario_id_uuid obliga a que session_id sea un uuid CANONICO en minusculas
+            (8-4-4-4-12 hexadecimal), no un identificador adivinable, un contador ni la clave primaria
+            numerica interna del usuario.
+        -->
+        <sql>ALTER TABLE sesion_usuario ADD CONSTRAINT ck_sesion_usuario_reason_enum CHECK (revocation_reason IS NULL OR revocation_reason IN ('logout','expired','admin','password_change','account_deactivated'))</sql>
+        <sql>ALTER TABLE sesion_usuario ADD CONSTRAINT ck_sesion_usuario_revocacion CHECK ((revoked_at IS NULL AND revocation_reason IS NULL) OR (revoked_at IS NOT NULL AND revocation_reason IS NOT NULL))</sql>
+        <sql>ALTER TABLE sesion_usuario ADD CONSTRAINT ck_sesion_usuario_vigencia CHECK (expires_at &gt; issued_at)</sql>
+        <sql>ALTER TABLE sesion_usuario ADD CONSTRAINT ck_sesion_usuario_actividad CHECK (last_activity_at &gt;= issued_at AND (revoked_at IS NULL OR revoked_at &gt;= issued_at))</sql>
+        <sql>ALTER TABLE sesion_usuario ADD CONSTRAINT ck_sesion_usuario_id_uuid CHECK (REGEXP_LIKE(session_id, '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))</sql>
+        <rollback>
+            <sql>ALTER TABLE sesion_usuario DROP CONSTRAINT ck_sesion_usuario_id_uuid</sql>
+            <sql>ALTER TABLE sesion_usuario DROP CONSTRAINT ck_sesion_usuario_actividad</sql>
+            <sql>ALTER TABLE sesion_usuario DROP CONSTRAINT ck_sesion_usuario_vigencia</sql>
+            <sql>ALTER TABLE sesion_usuario DROP CONSTRAINT ck_sesion_usuario_revocacion</sql>
+            <sql>ALTER TABLE sesion_usuario DROP CONSTRAINT ck_sesion_usuario_reason_enum</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-08-03" author="MIND">
+        <comment>Indice de resolucion de sesiones vigentes por usuario (REQ-057, REQ-070, REQ-086)</comment>
+        <!--
+            Es el indice que exige el DoD. Cubre a la vez el filtro por user_id y el predicado
+            revoked_at IS NULL, que son juntos las tres consultas calientes de la sesion: validar la
+            sesion en CADA peticion, revocar TODAS las sesiones al cambiar la contrasenia y revocar
+            TODAS las sesiones al desactivar la cuenta.
+
+            Gracias a el la revocacion masiva ataca solo las sesiones vivas de ese usuario y no
+            recorre la tabla entera, que crece con cada inicio de sesion del sistema.
+        -->
+        <sql>CREATE INDEX ix_sesion_usuario_user_revoked ON sesion_usuario (user_id, revoked_at)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_sesion_usuario_user_revoked</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-08-04" author="MIND" runOnChange="true">
+        <comment>Idempotencia e irreversibilidad de la revocacion (REQ-057 RN-01/RN-04, REQ-086 RN-04)</comment>
+        <!--
+            Una vez revocada, la sesion queda CONGELADA en la base de datos. El trigger solo actua
+            sobre las filas que ya tenian revoked_at informado (clausula WHEN) y devuelve a su valor
+            original las cuatro columnas que definen el cierre.
+
+            Consecuencias, todas exigidas por el DoD:
+
+            - Una SEGUNDA revocacion no altera revoked_at ni revocation_reason y NO produce error:
+              esa es exactamente la idempotencia del cierre de sesion de REQ-057 RN-04 y AC-SES-03.
+
+            - Poner revoked_at a NULL no RESUCITA la sesion: la revocacion es irreversible
+              (REQ-057 RN-01 y REQ-086 RN-04, una reactivacion de cuenta no restituye ninguna sesion
+              previamente revocada).
+
+            - Tampoco se prolonga su vigencia ni su actividad: expires_at y last_activity_at quedan
+              fijos (T.5 ARC-112, "si esta informado la sesion es invalida y no se prolonga").
+
+            Al vivir la garantia en la base de datos y no en la aplicacion, se cumple aunque el
+            codigo de negocio olvide comprobarlo o aunque alguien actue por SQL directo.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_sesion_usuario_revocacion
+BEFORE UPDATE ON sesion_usuario
+FOR EACH ROW
+WHEN (OLD.revoked_at IS NOT NULL)
+BEGIN
+    :NEW.revoked_at        := :OLD.revoked_at;
+    :NEW.revocation_reason := :OLD.revocation_reason;
+    :NEW.expires_at        := :OLD.expires_at;
+    :NEW.last_activity_at  := :OLD.last_activity_at;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_sesion_usuario_revocacion</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-08-05" author="MIND" runAlways="true">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0"><![CDATA[SELECT COUNT(*)
+  FROM sesion_usuario s
+  JOIN usuario u
+    ON u.user_id = s.user_id
+ WHERE u.status = 'INACTIVO'
+   AND s.revoked_at IS NULL]]></sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-086 RN-01 / AC-ACC-03: una cuenta INACTIVO no tiene ninguna sesion con revoked_at nulo</comment>
+        <!--
+            Esta es la consulta que el DoD exige que devuelva 0 filas: cuenta las sesiones vivas
+            (revoked_at nulo) que cuelgan de una cuenta desactivada. Si la desactivacion revoca todas
+            las sesiones del usuario, el resultado es necesariamente 0.
+
+            Se declara con runAlways="true" y preCondition onFail="HALT" para que sea una GUARDIA
+            PERMANENTE: la consulta se reevalua en CADA despliegue, no solo en el primero, de modo
+            que si una carga futura dejase una cuenta desactivada con sesiones vivas el despliegue se
+            detiene.
+
+            Sobre la tabla recien creada y vacia el resultado es 0 de forma trivial; la demostracion
+            con datos reales la hace el oraculo de desactivacion.
+        -->
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
