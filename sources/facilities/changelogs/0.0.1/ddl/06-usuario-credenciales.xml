@@ -165,4 +165,128 @@ END;</sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-06-07" author="MIND">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM user_tab_columns
+ WHERE table_name IN ('USUARIO','USUARIO_PASSWORD_HISTORICO')
+   AND ( column_name IN ('PASSWORD','PWD','CLAVE','CONTRASENA','PASSWORD_PLAIN','PLAIN_PASSWORD','PASSWORD_CLEAR','CLEAR_PASSWORD','CURRENT_PASSWORD','NEW_PASSWORD','TEMPORARY_PASSWORD','PASSWORD_VALUE')
+      OR ( column_name LIKE '%PASSWORD%'
+           AND column_name NOT IN ('PASSWORD_HASH','PASSWORD_SALT','PASSWORD_ALGORITHM','PASSWORD_UPDATED_AT','PASSWORD_EXPIRES_AT','MUST_CHANGE_PASSWORD','FAILED_PASSWORD_ATTEMPTS','PASSWORD_HISTORY_ID') ) )</sqlCheck>
+            <sqlCheck expectedResult="3">SELECT COUNT(*) FROM user_tab_columns
+ WHERE (table_name = 'USUARIO' AND column_name IN ('PASSWORD_HASH','PASSWORD_SALT'))
+    OR (table_name = 'USUARIO_PASSWORD_HISTORICO' AND column_name = 'PASSWORD_HASH')</sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-076/AC-G-08: ninguna columna de contrasenia en claro en usuario ni en su historico</comment>
+        <!--
+            La inspeccion de USER_TAB_COLUMNS de usuario y de usuario_password_historico no devuelve
+            ninguna columna de contrasenia en claro: el unico material de credencial persistido son
+            las tres columnas de hash y sal (usuario.password_hash, usuario.password_salt y
+            usuario_password_historico.password_hash), que es lo que exige REQ-076 / AC-G-08.
+
+            Si una tarea futura anadiese una columna tipo password o temporary_password a cualquiera
+            de las dos tablas, este changeset haria fallar el update y el fallo saldria en el PR.
+        -->
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-08" author="MIND">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="1">SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'USUARIO' AND column_name = 'FAILED_PASSWORD_ATTEMPTS'</sqlCheck>
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM user_tab_columns WHERE table_name &lt;&gt; 'USUARIO' AND column_name IN ('FAILED_PASSWORD_ATTEMPTS','FAILED_LOGIN_ATTEMPTS','LOCKED_UNTIL')</sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-072/AC-AUT-04: el contador de intentos fallidos es por cuenta, no por sesion</comment>
+        <!--
+            El contador de fallos y el bloqueo viven en la fila de usuario y en ninguna otra tabla
+            (en particular, no en sesion_usuario): esa es la forma fisica de la regla "el contador es
+            por cuenta, no por sesion ni por IP" (REQ-072 RN-04).
+
+            Un duplicado de failed_password_attempts, failed_login_attempts o locked_until en una
+            tabla de sesiones significaria que cambiar de navegador reinicia el contador, y este
+            oraculo lo impide haciendo fallar el update.
+        -->
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-09" author="MIND">
+        <comment>Oraculo REQ-069 / AC-PWD-04: cuatro contrasenias sucesivas dejan exactamente 3 filas en el historico</comment>
+        <!--
+            Este changeset es un oraculo EJECUTABLE contra el Oracle real, no una comprobacion de
+            metadatos: no mira USER_TAB_COLUMNS ni USER_TRIGGERS, sino que inserta cuatro
+            contrasenias sucesivas para un mismo usuario y verifica que el trigger de purga deja
+            EXACTAMENTE las 3 ultimas y que la mas antigua ha desaparecido (REQ-069 / AC-PWD-04).
+            Comprobar que el trigger existe no demuestra que recorte bien; ejecutarlo, si.
+
+            Los datos que crea son EFIMEROS y se los procura el propio bloque: como el DDL se aplica
+            antes que las semillas DML, cat_rol puede estar vacio, asi que el oraculo crea el rol
+            que necesita y lo retira si fue el quien lo creo. El usuario y sus filas de historico se
+            borran en el mismo bloque ANTES de evaluar el resultado, de modo que el esquema queda
+            exactamente igual que estaba y el oraculo es repetible.
+
+            Los RAISE_APPLICATION_ERROR van DESPUES del borrado a proposito: asi la limpieza ocurre
+            tambien cuando la invariante falla, y aun asi el update termina en rojo y el fallo sale
+            en el PR en lugar de pasar inadvertido.
+        -->
+        <sql splitStatements="false" stripComments="false">DECLARE
+    v_user_id      usuario.user_id%TYPE;
+    v_rol_creado   BOOLEAN := FALSE;
+    v_n            NUMBER;
+    v_filas        NUMBER;
+    v_mas_antigua  NUMBER;
+BEGIN
+    -- El DDL se aplica antes que las semillas DML, asi que cat_rol puede estar vacio:
+    -- el oraculo se procura el rol que necesita y lo retira si fue el quien lo creo.
+    SELECT COUNT(*) INTO v_n FROM cat_rol WHERE role_code = 'EMPLEADO';
+    IF v_n = 0 THEN
+        INSERT INTO cat_rol (role_code, role_name, display_order, is_active)
+        VALUES ('EMPLEADO', 'Empleado (oraculo TSK-049)', 9049, 'Y');
+        v_rol_creado := TRUE;
+    END IF;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm)
+    VALUES ('Oraculo Historico TSK-049', 'oraculo.tsk049.historico@mind.local',
+            'oraculo.tsk049.historico@mind.local', 'EMPLEADO',
+            'hash-oraculo-0', 'argon2id')
+    RETURNING user_id INTO v_user_id;
+
+    -- Cuatro contrasenias sucesivas: la mas antigua debe caer al insertarse la cuarta.
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+    VALUES (v_user_id, 'hash-oraculo-1', SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '3' HOUR);
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+    VALUES (v_user_id, 'hash-oraculo-2', SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '2' HOUR);
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+    VALUES (v_user_id, 'hash-oraculo-3', SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '1' HOUR);
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+    VALUES (v_user_id, 'hash-oraculo-4', SYS_EXTRACT_UTC(SYSTIMESTAMP));
+
+    SELECT COUNT(*) INTO v_filas
+      FROM usuario_password_historico WHERE user_id = v_user_id;
+    SELECT COUNT(*) INTO v_mas_antigua
+      FROM usuario_password_historico WHERE user_id = v_user_id AND password_hash = 'hash-oraculo-1';
+
+    DELETE FROM usuario_password_historico WHERE user_id = v_user_id;
+    DELETE FROM usuario WHERE user_id = v_user_id;
+    IF v_rol_creado THEN
+        DELETE FROM cat_rol WHERE role_code = 'EMPLEADO';
+    END IF;
+
+    IF v_filas &lt;&gt; 3 THEN
+        RAISE_APPLICATION_ERROR(-20069,
+            'REQ-069: tras cuatro contrasenias el historico conserva ' || v_filas || ' filas en lugar de 3');
+    END IF;
+    IF v_mas_antigua &lt;&gt; 0 THEN
+        RAISE_APPLICATION_ERROR(-20069,
+            'REQ-069: la contrasenia mas antigua sigue en el historico tras la cuarta');
+    END IF;
+END;</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
