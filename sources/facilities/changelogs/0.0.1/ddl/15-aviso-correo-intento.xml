@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-15-01" author="MIND">
+        <comment>Traza append-only de los intentos de entrega de cada aviso por correo (ARC-119): una fila por intento, con su resultado, su destinatario congelado y jamas una credencial SMTP</comment>
+        <!--
+            Esta es la tabla hija del outbox aviso_correo (ARC-115): el despachador escribe UNA fila
+            por cada intento de entrega, y esa fila NO se vuelve a tocar nunca (REQ-135, REQ-144). El
+            historial de envios de un aviso es por tanto la coleccion de sus intentos ordenados por
+            attempt_number, y el estado agregado que vive en aviso_correo (status, attempt_count,
+            last_error_code) es un resumen de esta traza, nunca su sustituto. El changeset 15-04 cierra
+            la tabla con un trigger de inmutabilidad para que "append-only" sea una garantia del motor
+            y no una buena intencion de la capa de servicio.
+
+            DECISION 1 - notification_id es la columna FISICA y dispatch_id su columna VIRTUAL, y lo
+            mismo con result_code y result. Es exactamente la misma tecnica y la misma justificacion
+            que en el changeset 14-01 (aviso_correo.dispatch_id / aviso_correo.status_code): el
+            inventario T.5 ARC-119 nombra las columnas notification_id y result_code, mientras que
+            REQ-135 las llama dispatch_id y result. La fisica tiene que ser notification_id porque una
+            columna virtual no puede ser destino ni origen de una clave ajena, y tiene que ser
+            result_code porque un enumerado CHECK solo se declara sobre la columna fisica. La virtual
+            publica el nombre del requisito en SOLO LECTURA, no ocupa almacenamiento y Oracle responde
+            ORA-54013 a quien intente escribirla, de modo que ambos nombres conviven sin que exista un
+            segundo dato que pueda divergir del primero.
+
+            DECISION 2 - incident_id es NULABLE a proposito. Los avisos CREDENTIAL_ISSUED y
+            PASSWORD_RESET de aviso_correo no cuelgan de ninguna incidencia (ver
+            ck_aviso_correo_vinculo en el changeset 14-02), y sus intentos de entrega tampoco pueden
+            hacerlo; exigirlo NOT NULL impediria registrar el intento de un aviso de credencial, que es
+            justo lo que el DoD pide trazar. Las unicas columnas NOT NULL que fija el DoD son
+            dispatch_id (aqui notification_id, la fisica que la virtual publica), attempt_number,
+            attempted_at y result (aqui result_code).
+
+            DECISION 3 - recipients_snapshot es un CLOB con la lista de destinatarios CONGELADA en el
+            instante del intento (AC-SMTP-02). No es una referencia al directorio ni una consulta
+            diferida: es el documento JSON con los destinatarios tal y como se resolvieron para ESE
+            intento concreto, de modo que un reintento posterior sobre un directorio ya cambiado deja
+            constancia de a quien se escribio cada vez y la traza sigue siendo auditable anios despues.
+            El changeset 15-02 lo valida con IS JSON. Es un CLOB y por eso NINGUN indice de arbol B lo
+            toca: Oracle rechaza de plano indexar un LOB.
+
+            DECISION 4 - NO existe, ni existira, ninguna columna de credencial SMTP en esta tabla
+            (AC-SMTP-11). Ni usuario, ni contrasenia, ni token, ni cabecera de autenticacion: las
+            credenciales del servidor de correo viven unicamente en la configuracion del despliegue y
+            jamas se persisten junto a la traza. Los unicos datos personales que esta tabla puede
+            contener son el nombre y el correo CORPORATIVO de los destinatarios (REQ-049, REQ-076),
+            dentro de recipients_snapshot; cualquier otro dato de la persona queda fuera.
+
+            smtp_response_code guarda el codigo de tres digitos que devolvio el servidor (250, 421,
+            550...) y error_code / error_message la clasificacion y el texto del fallo, que son los que
+            alimentan el diagnostico de REQ-144. message_id es el identificador que devuelve el
+            servidor cuando acepta el mensaje y es la prueba de entrega del intento SENT (AC-SMTP-06).
+
+            attempted_at lleva DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la misma marca naive en UTC que
+            aviso_correo.created_at y que el resto de marcas de auditoria del proyecto.
+
+            NINGUNA FK declara ON DELETE, ni CASCADE ni SET NULL, por la misma razon que en el
+            changeset 14-01: la traza sobrevive al ciclo de vida de avisos e incidencias, que es de
+            desactivacion y nunca de borrado.
+        -->
+        <sql>CREATE TABLE aviso_correo_intento (
+    attempt_id              VARCHAR2(36 CHAR) NOT NULL,
+    notification_id         VARCHAR2(36 CHAR) NOT NULL,
+    incident_id             NUMBER,
+    attempt_number          NUMBER NOT NULL,
+    attempted_at            TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    result_code             VARCHAR2(30 CHAR) NOT NULL,
+    smtp_response_code      VARCHAR2(3 CHAR),
+    error_code              VARCHAR2(50 CHAR),
+    error_message           VARCHAR2(500 CHAR),
+    recipients_snapshot     CLOB,
+    recipient_count         NUMBER DEFAULT 0 NOT NULL,
+    message_id              VARCHAR2(255 CHAR),
+    suppression_reason_code VARCHAR2(30 CHAR),
+    dispatch_id             GENERATED ALWAYS AS (CAST(notification_id AS VARCHAR2(36 CHAR))) VIRTUAL,
+    result                  GENERATED ALWAYS AS (CAST(result_code AS VARCHAR2(30 CHAR))) VIRTUAL,
+    CONSTRAINT pk_aviso_correo_intento PRIMARY KEY (attempt_id),
+    CONSTRAINT fk_aviso_intento_aviso FOREIGN KEY (notification_id) REFERENCES aviso_correo (notification_id),
+    CONSTRAINT fk_aviso_intento_incidencia FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="aviso_correo_intento"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-15-02" author="MIND">
+        <comment>Enumerados y reglas de coherencia del intento de entrega (REQ-135, REQ-144): resultado cerrado, correlativo valido, prueba de entrega, codigo SMTP de tres digitos y destinatarios coherentes</comment>
+        <!--
+            ck_aviso_intento_result es el enumerado CERRADO de resultados de T.5 ARC-119 y REQ-135:
+            SENT para la entrega aceptada por el servidor, TRANSIENT_ERROR para el fallo que admite
+            reintento (REQ-134), PERMANENT_ERROR para el que no lo admite, NO_RECIPIENTS cuando la
+            resolucion de destinatarios no devolvio ninguno, COMPOSE_ERROR cuando el mensaje no se
+            pudo componer y CONFIG_ERROR cuando falta o es invalida la configuracion del servidor de
+            correo. Son los valores que se PERSISTEN, no etiquetas de presentacion.
+
+            ck_aviso_intento_numero acota por abajo el correlativo: el primer intento de un aviso es
+            el numero 1, nunca el 0 ni un negativo. Su unicidad por aviso la impone el indice unico
+            del changeset 15-03.
+
+            ck_aviso_intento_message_id materializa AC-SMTP-06 y la validacion 5 de REQ-135: un
+            intento con resultado SENT TIENE que llevar el message_id que devolvio el servidor. Sin el
+            no hay prueba de entrega y la idempotencia del reproceso (un aviso ya entregado no se
+            vuelve a enviar) se quedaria sin apoyo. Se escribe como implicacion (result_code
+            distinto de SENT, O message_id informado) porque una CHECK solo rechaza la fila cuando su
+            predicado evalua a FALSE.
+
+            ck_aviso_intento_smtp_code acota el formato del codigo de respuesta del servidor: o no hay
+            codigo (el intento ni siquiera llego a hablar con el servidor, caso tipico de
+            COMPOSE_ERROR o CONFIG_ERROR) o son exactamente tres digitos, que es lo que define el
+            protocolo. Deliberadamente NO se exige error_code en todo intento no SENT: un
+            NO_RECIPIENTS no es un error tecnico del servidor, sino una ausencia de destinatarios, y
+            se explica por suppression_reason_code.
+
+            ck_aviso_intento_recipients y ck_aviso_intento_sin_dest transcriben la nota de T.5 ARC-119:
+            el recuento nunca es negativo y un recuento de 0 obliga a que el resultado sea
+            NO_RECIPIENTS. Es decir, no se puede registrar un envio "exitoso" a nadie: si no habia
+            destinatarios, el resultado tiene nombre propio y queda trazado como tal.
+
+            ck_aviso_intento_snapshot_json valida con IS JSON que recipients_snapshot sea un documento
+            JSON bien formado, de modo que la instantanea de destinatarios es explotable por consulta y
+            no un texto libre. Se admite NULL porque hay intentos que fallan antes de resolver
+            destinatario alguno.
+
+            ck_aviso_intento_motivo_sup reutiliza EXACTAMENTE el mismo enumerado cerrado que
+            ck_aviso_correo_motivo_sup del changeset 14-02, para que el motivo que registra el intento
+            y el que acaba quedando en el outbox hablen el mismo idioma y sean comparables sin
+            traduccion.
+        -->
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_result CHECK (
+    result_code IN ('SENT','TRANSIENT_ERROR','PERMANENT_ERROR','NO_RECIPIENTS','COMPOSE_ERROR','CONFIG_ERROR')
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_numero CHECK (
+    attempt_number &gt;= 1
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_message_id CHECK (
+    result_code &lt;&gt; 'SENT' OR message_id IS NOT NULL
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_smtp_code CHECK (
+    smtp_response_code IS NULL OR REGEXP_LIKE(smtp_response_code, '^[0-9]{3}$')
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_recipients CHECK (
+    recipient_count &gt;= 0
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_sin_dest CHECK (
+    recipient_count &gt; 0 OR result_code = 'NO_RECIPIENTS'
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_snapshot_json CHECK (
+    recipients_snapshot IS NULL OR recipients_snapshot IS JSON
+)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT ck_aviso_intento_motivo_sup CHECK (
+    suppression_reason_code IN ('USUARIO_DESACTIVADO','SIN_CORREO','DESTINATARIO_NO_RESOLUBLE','NO_RECIPIENTS','COMPOSICION_INCOMPLETA')
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_motivo_sup</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_snapshot_json</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_sin_dest</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_recipients</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_smtp_code</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_message_id</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_numero</sql>
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT ck_aviso_intento_result</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-15-03" author="MIND">
+        <comment>Unicidad del correlativo de intento por aviso e indices de consulta de la traza: un indice unico que la constraint reutiliza, orden cronologico y filtro por incidencia</comment>
+        <!--
+            El DoD pide a la vez una restriccion UNIQUE (dispatch_id, attempt_number) y un INDICE
+            sobre (dispatch_id, attempt_number): no se puede registrar dos veces el mismo numero de
+            intento para el mismo aviso, y la consulta del historial de envios de un aviso debe
+            resolverse por indice. Oracle, sin embargo, rechaza con ORA-01408 la creacion de un
+            segundo indice sobre la MISMA lista de columnas, y una restriccion UNIQUE crea su propio
+            indice de respaldo si no encuentra uno utilizable.
+
+            Por eso el orden importa y es deliberado: PRIMERO se crea el indice unico
+            ux_aviso_intento_correlativo y DESPUES la restriccion uk_aviso_intento_correlativo, que al
+            encontrarlo lo REUTILIZA como indice de respaldo en lugar de intentar crear uno nuevo. El
+            resultado cumple las dos exigencias con un unico segmento fisico: existe la restriccion
+            declarada y existe el indice consultable. Si se invirtiera el orden, el CREATE INDEX
+            posterior fallaria con ORA-01408 y el despliegue se caeria.
+
+            Las columnas del indice son las FISICAS (notification_id, attempt_number). dispatch_id es
+            una columna virtual que no es mas que un CAST de notification_id, de modo que la unicidad
+            sobre la fisica es exactamente la unicidad sobre el nombre que publica el requisito.
+
+            ix_aviso_intento_cronologico sirve la lectura natural de la traza (REQ-144): todos los
+            intentos de un aviso en orden de ocurrencia, con igualdad por aviso y rango/orden por
+            fecha, de modo que el indice resuelve filtro y ordenacion sin ordenacion adicional.
+
+            ix_aviso_intento_incidencia sirve la consulta administrativa de envios de una incidencia
+            (REQ-145) y evita ademas el bloqueo de tabla hija que Oracle toma sobre aviso_correo_intento
+            ENTERA al operar sobre incidencia con una FK no indexada.
+
+            NINGUN indice toca recipients_snapshot: es un CLOB y Oracle rechaza un indice de arbol B
+            sobre el.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_aviso_intento_correlativo ON aviso_correo_intento (notification_id, attempt_number)</sql>
+        <sql>ALTER TABLE aviso_correo_intento ADD CONSTRAINT uk_aviso_intento_correlativo UNIQUE (notification_id, attempt_number)</sql>
+        <sql>CREATE INDEX ix_aviso_intento_cronologico ON aviso_correo_intento (notification_id, attempted_at)</sql>
+        <sql>CREATE INDEX ix_aviso_intento_incidencia ON aviso_correo_intento (incident_id)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_aviso_intento_incidencia</sql>
+            <sql>DROP INDEX ix_aviso_intento_cronologico</sql>
+            <!--
+                KEEP INDEX es obligatorio aqui: sin esa clausula Oracle decide por su cuenta si
+                arrastra o no el indice que sostiene la constraint, y el DROP INDEX siguiente se
+                arriesga a un ORA-01418 sobre un indice ya desaparecido. Con KEEP INDEX el borrado
+                del indice unico queda bajo control explicito del rollback, en orden inverso al alta.
+            -->
+            <sql>ALTER TABLE aviso_correo_intento DROP CONSTRAINT uk_aviso_intento_correlativo KEEP INDEX</sql>
+            <sql>DROP INDEX ux_aviso_intento_correlativo</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-15-04" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad del registro de envios (REQ-135, REQ-144): UPDATE y DELETE rechazados con ORA-20004</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW), igual que trg_incidencia_historico_inmutable
+            del changeset 13-04 y que trg_resolucion_dest_inmutable del 16-04: se dispara una vez por
+            sentencia y rechaza el UPDATE o el DELETE incluso cuando la sentencia NO afecta a ninguna
+            fila, de modo que no hay forma de alterar ni de borrar un intento ya registrado, ni
+            siquiera a traves de una sentencia de prueba con un predicado que no case con nada.
+
+            La tabla solo admite INSERT: eso es lo que convierte la traza de envios en append-only y lo
+            que permite que el historial de intentos de un aviso se pueda auditar sin sospechar que
+            alguien reescribio un resultado fallido como SENT.
+
+            El codigo ORA-20004 lo fija el DoD de esta tarea y NO esta usado por ningun otro trigger
+            del esquema (-20002 es el historico de incidencias, -20005 el registro de resoluciones de
+            destinatarios y -20060 la terminalidad de ENVIADO en aviso_correo), de modo que la capa de
+            API puede traducirlo sin ambiguedad a un HTTP 409.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_aviso_correo_intento_inmutable
+BEFORE UPDATE OR DELETE ON aviso_correo_intento
+BEGIN
+    RAISE_APPLICATION_ERROR(-20004, 'El registro de envios es inmutable.');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_aviso_correo_intento_inmutable</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
