@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-050",
+  "attempt": 1,
+  "at": "2026-10-07T11:42:23.572530+00:00",
+  "construction_id": "0dd29ccc-5e93-4a69-a357-8a2b88f8993f",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-050 · `usuario_historico` (ARC-116): histórico inmutable de rol y de estado de cuenta.\n\nENTREGABLE (un único fichero, dentro de la zona de la tarea):\n`sources/facilities/changelogs/0.0.1/ddl/07-usuario-historico.xml` — 9 changesets Liquibase, `author=\"MIND\"`, todos con `<rollback>`, imitando el estilo de `05-usuario.xml`.\n\n- **07-01** `CREATE TABLE usuario_historico`: `history_id` NUMBER GENERATED ALWAYS AS IDENTITY (PK), `user_id` NOT NULL, `change_type`, `previous_role_code`, `new_role_cod",
+  "model": "claude-opus-5",
+  "input_tokens": 2038508,
+  "output_tokens": 61137,
+  "llm_calls": 78,
+  "cost_usd": 5.2424940000000015,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "c8fcabe6c854550c786e5555c832b2763d7d7e23",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
