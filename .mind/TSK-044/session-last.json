@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-044",
+  "attempt": 1,
+  "at": "2026-10-07T10:39:04.794171+00:00",
+  "construction_id": "b2152b82-e8fb-4cce-98b1-1583e7b93899",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-044 · Changelog maestro Liquibase y catálogo de seguridad (arquetipo `database-relational`, BBDD `facilities`).\n\nQUÉ SE HA CONSTRUIDO\n- `sources/facilities/master.xml` (ya presente de la zona, revisado): incluye `changelogs/changelog-0.0.1.xml`.\n- `sources/facilities/changelogs/changelog-0.0.1.xml` (revisado): resuelve los cambios con `includeAll path=\"0.0.1/ddl\"` y DESPUÉS `includeAll path=\"0.0.1/dml\"`, con `relativeToChangelogFile=\"true\"`. Las TSK siguientes solo depositan ficheros con pre",
+  "model": "claude-opus-5",
+  "input_tokens": 1558703,
+  "output_tokens": 30192,
+  "llm_calls": 74,
+  "cost_usd": 2.53694175,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "c3dda998bd68b7e56dd68bd8c22986355e615072",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
