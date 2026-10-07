@@ -175,4 +175,308 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-08-06" author="MIND">
+        <comment>Oraculo REQ-057 / AC-SES-03: la segunda revocacion es idempotente (misma fila, revoked_at inalterado)</comment>
+        <!--
+            Oraculo de COMPORTAMIENTO, no de metadatos: no mira el diccionario de datos, sino que se
+            ejecuta contra el Oracle real durante el despliegue, cierra una sesion, la vuelve a
+            cerrar y comprueba SOBRE LOS DATOS que el segundo cierre alcanza LA MISMA fila, no
+            produce ningun error y no altera revoked_at ni revocation_reason. Esa es literalmente la
+            idempotencia que exigen REQ-057 RN-04 y AC-SES-03, "repetir el cierre no produce error
+            al usuario".
+
+            Comprueba ademas que poner revoked_at a NULL no resucita la sesion: REQ-057 RN-01 manda
+            que una sesion revocada nunca vuelva a ser valida, garantia que impone el trigger
+            trg_sesion_usuario_revocacion y que aqui se verifica contando las sesiones vivas que
+            quedan tras el intento de reactivacion.
+
+            Verifica tambien que la columna virtual revocation_cause publica el valor en mayusculas
+            ('LOGOUT') que consume REQ-086.
+
+            El bloque entero es una UNICA sentencia JDBC, deshace sus propios datos con un ROLLBACK
+            final y no contiene ninguna sentencia DDL: un DDL provocaria un commit implicito y los
+            datos del oraculo quedarian grabados en la base.
+
+            Siembra por MERGE el rol que necesita porque los changelogs dml se aplican DESPUES de los
+            ddl y cat_rol todavia esta vacio en este punto; el ROLLBACK revierte tambien esa semilla.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_user      NUMBER;
+    v_sid       VARCHAR2(36);
+    v_t0        TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_rev1      TIMESTAMP;
+    v_rev2      TIMESTAMP;
+    v_reason    VARCHAR2(30);
+    v_cause     VARCHAR2(30);
+    v_afectadas NUMBER;
+    v_filas     NUMBER;
+    v_vivas     NUMBER;
+
+    FUNCTION nuevo_uuid RETURN VARCHAR2 IS
+    BEGIN
+        RETURN LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5'));
+    END nuevo_uuid;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 951);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm)
+         VALUES ('Oraculo Sesion Idempotente', 'oraculo.tsk051.idempotente@example.invalid',
+                 'oraculo.tsk051.idempotente@example.invalid', 'EMPLEADO', 'hash-oraculo-tsk051', 'argon2id')
+      RETURNING user_id INTO v_user;
+
+    v_sid  := nuevo_uuid;
+    v_rev1 := v_t0 + INTERVAL '1' HOUR;
+
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_sid, v_user, 'EMPLEADO', v_t0, v_t0 + INTERVAL '8' HOUR, v_t0);
+
+    -- Primer cierre de sesion explicito (REQ-057): revoked_at informado con motivo 'logout'.
+    UPDATE sesion_usuario
+       SET revoked_at = v_rev1, revocation_reason = 'logout', last_activity_at = v_rev1
+     WHERE session_id = v_sid;
+
+    -- Segundo cierre sobre la misma sesion, con otro instante y otro motivo: debe ser INOCUO.
+    UPDATE sesion_usuario
+       SET revoked_at        = v_t0 + INTERVAL '5' HOUR,
+           revocation_reason = 'admin',
+           last_activity_at  = v_t0 + INTERVAL '5' HOUR,
+           expires_at        = v_t0 + INTERVAL '48' HOUR
+     WHERE session_id = v_sid;
+    v_afectadas := SQL%ROWCOUNT;
+
+    IF v_afectadas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-SES-03: la segunda revocacion afecto a ' || v_afectadas || ' filas en lugar de a la misma unica fila');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas FROM sesion_usuario WHERE user_id = v_user;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-SES-03: la segunda revocacion ha dejado ' || v_filas || ' sesiones en lugar de la misma fila');
+    END IF;
+
+    SELECT revoked_at, revocation_reason, revocation_cause
+      INTO v_rev2, v_reason, v_cause
+      FROM sesion_usuario WHERE session_id = v_sid;
+
+    IF v_rev2 <> v_rev1 THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-SES-03: revoked_at ha cambiado con la segunda revocacion');
+    END IF;
+    IF v_reason <> 'logout' THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO AC-SES-03: revocation_reason ha cambiado a ' || v_reason || ' con la segunda revocacion');
+    END IF;
+    IF v_cause <> 'LOGOUT' THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO REQ-086: la columna virtual revocation_cause vale ' || v_cause || ' en lugar de LOGOUT');
+    END IF;
+
+    -- REQ-057 RN-01: una sesion revocada nunca vuelve a ser valida.
+    UPDATE sesion_usuario
+       SET revoked_at = NULL, revocation_reason = NULL
+     WHERE session_id = v_sid;
+
+    SELECT COUNT(*) INTO v_vivas
+      FROM sesion_usuario WHERE session_id = v_sid AND revoked_at IS NULL;
+    IF v_vivas <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20956, 'ORACULO REQ-057 RN-01: una sesion revocada ha vuelto a quedar vigente');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-08-07" author="MIND">
+        <comment>Oraculo AC-ACC-01 / AC-ACC-03: desactivar un usuario con dos sesiones abiertas deja la consulta del invariante en 0 filas</comment>
+        <!--
+            Este es el oraculo de COMPORTAMIENTO que exige el DoD para la desactivacion de cuentas:
+            monta un usuario ACTIVO con DOS sesiones abiertas, lo desactiva y comprueba con la MISMA
+            consulta del guardia permanente ddl-0.0.1-08-05 que no queda NINGUNA sesion con
+            revoked_at nulo colgando de una cuenta INACTIVO (REQ-086 RN-01, AC-ACC-01). El guardia
+            evalua esa consulta sobre una tabla vacia; aqui se demuestra sobre datos reales.
+
+            Antes demuestra AC-ACC-03 con datos reales: tras un SAVEPOINT desactiva la cuenta y
+            provoca A PROPOSITO un fallo en la revocacion de sus sesiones (marcar revoked_at sin
+            motivo, combinacion que la CHECK ck_sesion_usuario_revocacion rechaza). Al revertir hasta
+            el SAVEPOINT, la cuenta vuelve a estar ACTIVO con sus dos sesiones vivas: es decir, NO
+            existe ningun estado intermedio observable con la cuenta INACTIVA y sesiones todavia
+            vivas, porque cuenta y sesiones se mueven en la MISMA transaccion.
+
+            Comprueba REQ-086 RN-07: las sesiones revocadas por la desactivacion publican
+            revocation_cause = ACCOUNT_DEACTIVATED a traves de la columna virtual, calculada sobre el
+            valor FISICO account_deactivated del enumerado del DoD.
+
+            Comprueba AC-ACC-04 / REQ-086 RN-04: una reactivacion posterior de la cuenta no restituye
+            ninguna sesion previamente revocada, porque el trigger trg_sesion_usuario_revocacion
+            congela la revocacion y el intento de poner revoked_at a NULL queda sin efecto.
+
+            El bloque entero es una UNICA sentencia JDBC y no contiene ninguna sentencia DDL: un DDL
+            provocaria un commit implicito y los datos del oraculo quedarian grabados en la base.
+            Siembra por MERGE los catalogos que necesita (cat_rol y cat_motivo_desactivacion) porque
+            los changelogs dml se aplican DESPUES de los ddl y todavia estan vacios en este punto, y
+            deshace todos sus datos, semillas incluidas, con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_user        NUMBER;
+    v_s1          VARCHAR2(36);
+    v_s2          VARCHAR2(36);
+    v_t0          TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t1          TIMESTAMP;
+    v_status      VARCHAR2(10);
+    v_sqlcode     NUMBER;
+    v_vivas       NUMBER;
+    v_revocadas   NUMBER;
+    v_invariante  NUMBER;
+    v_causa       NUMBER;
+
+    FUNCTION nuevo_uuid RETURN VARCHAR2 IS
+    BEGIN
+        RETURN LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5'));
+    END nuevo_uuid;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    v_t1 := v_t0 + INTERVAL '2' HOUR;
+
+    sembrar_rol('EMPLEADO', 'Empleado', 951);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 953);
+
+    MERGE INTO cat_motivo_desactivacion d
+    USING (SELECT 'BAJA_EMPRESA' AS reason_code FROM dual) s
+       ON (d.reason_code = s.reason_code)
+    WHEN NOT MATCHED THEN
+        INSERT (reason_code, reason_name, is_active)
+        VALUES ('BAJA_EMPRESA', 'Baja en la empresa', 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm)
+         VALUES ('Oraculo Desactivacion Admin', 'oraculo.tsk051.desact.admin@example.invalid',
+                 'oraculo.tsk051.desact.admin@example.invalid', 'ADMINISTRADOR', 'hash-oraculo-tsk051', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash, password_algorithm, created_at, created_by)
+         VALUES ('Oraculo Desactivacion', 'oraculo.tsk051.desact@example.invalid',
+                 'oraculo.tsk051.desact@example.invalid', 'EMPLEADO', 'hash-oraculo-tsk051', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_user;
+
+    v_s1 := nuevo_uuid;
+    v_s2 := nuevo_uuid;
+
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_s1, v_user, 'EMPLEADO', v_t0, v_t0 + INTERVAL '8' HOUR, v_t0);
+    INSERT INTO sesion_usuario (session_id, user_id, role_code, issued_at, expires_at, last_activity_at)
+         VALUES (v_s2, v_user, 'EMPLEADO', v_t0 + INTERVAL '1' HOUR, v_t0 + INTERVAL '9' HOUR, v_t0 + INTERVAL '1' HOUR);
+
+    SELECT COUNT(*) INTO v_vivas FROM sesion_usuario WHERE user_id = v_user AND revoked_at IS NULL;
+    IF v_vivas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO AC-ACC-01: el escenario deberia partir de 2 sesiones abiertas y hay ' || v_vivas);
+    END IF;
+
+    -- AC-ACC-03: si falla la revocacion, la desactivacion se revierte entera.
+    SAVEPOINT antes_de_desactivar;
+
+    UPDATE usuario
+       SET status = 'INACTIVO', deactivated_at = v_t1, deactivated_by = v_admin,
+           deactivation_reason_code = 'BAJA_EMPRESA'
+     WHERE user_id = v_user;
+
+    BEGIN
+        UPDATE sesion_usuario SET revoked_at = v_t1
+         WHERE user_id = v_user AND revoked_at IS NULL;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode = 0 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO DoD: revoked_at sin revocation_reason deberia haber sido rechazado por la CHECK');
+    END IF;
+
+    ROLLBACK TO SAVEPOINT antes_de_desactivar;
+
+    SELECT status INTO v_status FROM usuario WHERE user_id = v_user;
+    IF v_status <> 'ACTIVO' THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO AC-ACC-03: la cuenta quedo en ' || v_status || ' pese a fallar la revocacion de sesiones');
+    END IF;
+
+    SELECT COUNT(*) INTO v_vivas FROM sesion_usuario WHERE user_id = v_user AND revoked_at IS NULL;
+    IF v_vivas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20963, 'ORACULO AC-ACC-03: tras revertir la desactivacion quedan ' || v_vivas || ' sesiones vivas en lugar de 2');
+    END IF;
+
+    -- Desactivacion correcta: cuenta y sesiones en la MISMA transaccion (REQ-086 RN-02).
+    UPDATE usuario
+       SET status = 'INACTIVO', deactivated_at = v_t1, deactivated_by = v_admin,
+           deactivation_reason_code = 'BAJA_EMPRESA'
+     WHERE user_id = v_user;
+
+    UPDATE sesion_usuario
+       SET revoked_at = v_t1, revocation_reason = 'account_deactivated'
+     WHERE user_id = v_user AND revoked_at IS NULL;
+    v_revocadas := SQL%ROWCOUNT;
+
+    IF v_revocadas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20964, 'ORACULO AC-ACC-01: la desactivacion revoco ' || v_revocadas || ' sesiones en lugar de las 2 vigentes');
+    END IF;
+
+    -- La consulta del invariante (la misma del guardia ddl-0.0.1-08-05) devuelve 0 filas.
+    SELECT COUNT(*) INTO v_invariante
+      FROM sesion_usuario s
+      JOIN usuario u ON u.user_id = s.user_id
+     WHERE u.status = 'INACTIVO' AND s.revoked_at IS NULL;
+    IF v_invariante <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20965, 'ORACULO REQ-086 RN-01: hay ' || v_invariante || ' sesiones vivas sobre cuentas INACTIVO');
+    END IF;
+
+    SELECT COUNT(*) INTO v_causa
+      FROM sesion_usuario WHERE user_id = v_user AND revocation_cause = 'ACCOUNT_DEACTIVATED';
+    IF v_causa <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20966, 'ORACULO REQ-086 RN-07: solo ' || v_causa || ' sesiones publican revocation_cause = ACCOUNT_DEACTIVATED');
+    END IF;
+
+    -- AC-ACC-04: la reactivacion no restituye ninguna sesion revocada.
+    UPDATE usuario
+       SET status = 'ACTIVO', deactivated_at = NULL, deactivated_by = NULL,
+           deactivation_reason_code = NULL
+     WHERE user_id = v_user;
+
+    UPDATE sesion_usuario SET revoked_at = NULL, revocation_reason = NULL WHERE user_id = v_user;
+
+    SELECT COUNT(*) INTO v_vivas FROM sesion_usuario WHERE user_id = v_user AND revoked_at IS NULL;
+    IF v_vivas <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20967, 'ORACULO AC-ACC-04: la reactivacion ha restituido ' || v_vivas || ' sesiones revocadas');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
