@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-053",
+  "attempt": 1,
+  "at": "2026-10-07T13:05:44.841104+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-053 — Tabla `incidencia`: núcleo, clasificación obligatoria y snapshots históricos de denominación.\n\nENTREGA (un solo fichero, dentro de `zone_paths`): `sources/facilities/changelogs/0.0.1/ddl/10-incidencia.xml`, 9 changesets `ddl-0.0.1-10-01..09`, autor MIND, todos con `<rollback>`. El changelog maestro `sources/facilities/master.xml` → `changelogs/changelog-0.0.1.xml` lo recoge solo vía `<includeAll path=\"0.0.1/ddl\">`: no hubo que editar el composition root y NO se creó un segundo maestro.",
+  "model": "claude-opus-5",
+  "input_tokens": 3293176,
+  "output_tokens": 41316,
+  "llm_calls": 101,
+  "cost_usd": 6.9978225000000025,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "7c705404982574278529d1900be55bcfe0bc1cb7",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
