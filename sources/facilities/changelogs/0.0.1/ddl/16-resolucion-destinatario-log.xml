@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-16-01" author="MIND">
+        <comment>Registro inmutable de resoluciones de destinatarios del directorio (ARC-120): quien se resolvio, nunca su correo</comment>
+        <!--
+            resolved_user_ids es un CLOB que guarda un documento JSON (la lista de identificadores de
+            los destinatarios resueltos) validado por la restriccion IS JSON (STRICT). El DoD de
+            TSK-059 fija CLOB + IS JSON, y esa decision prevalece sobre el VARCHAR2(4000) que figura
+            en el inventario T.5 ARC-120.
+
+            resolved_ids_cardinalidad y resolved_ids_solo_numeros son columnas VIRTUALES de solo
+            lectura (misma tecnica que usuario.is_active y usuario_historico.event_type): proyectan
+            sobre NUMBER el tamanio de la lista y si todos sus elementos son numeros, para poder
+            declarar CHECKs deterministas SIN referenciar el CLOB, porque Oracle solo admite la
+            condicion IS JSON sobre una columna LOB. Oracle responde ORA-54013 si alguien intenta
+            escribirlas.
+
+            resolved_at usa DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), la misma marca naive en UTC que
+            usuario.created_at y usuario_historico.changed_at, convencion del proyecto para toda
+            marca de auditoria; el DoD pide "default SYSTIMESTAMP" y esta es su forma normalizada a
+            UTC.
+
+            NO hay indice de arbol B sobre resolved_user_ids: Oracle rechaza indexar un CLOB.
+        -->
+        <sql>CREATE TABLE resolucion_destinatario_log (
+    resolution_id           NUMBER GENERATED ALWAYS AS IDENTITY,
+    request_type            VARCHAR2(20 CHAR) NOT NULL,
+    requested_by_module     VARCHAR2(50 CHAR) NOT NULL,
+    subject_user_id         NUMBER,
+    resolved_user_ids       CLOB NOT NULL,
+    recipient_count         NUMBER NOT NULL,
+    is_fallback_used        CHAR(1) DEFAULT 'N' NOT NULL,
+    outcome                 VARCHAR2(30 CHAR) NOT NULL,
+    resolved_at             TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    resolved_by_user_id     NUMBER,
+    resolved_ids_cardinalidad NUMBER GENERATED ALWAYS AS (JSON_VALUE(resolved_user_ids, '$.size()' RETURNING NUMBER NULL ON ERROR)) VIRTUAL,
+    resolved_ids_solo_numeros NUMBER GENERATED ALWAYS AS (CASE WHEN JSON_EXISTS(resolved_user_ids, '$[*]?(@.type() &lt;&gt; "number")') THEN 0 ELSE 1 END) VIRTUAL,
+    CONSTRAINT pk_resolucion_destinatario_log PRIMARY KEY (resolution_id),
+    CONSTRAINT ck_res_dest_ids_json CHECK (resolved_user_ids IS JSON (STRICT)),
+    CONSTRAINT fk_res_dest_subject_user FOREIGN KEY (subject_user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_res_dest_resolved_by FOREIGN KEY (resolved_by_user_id) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="resolucion_destinatario_log"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-02" author="MIND">
+        <comment>Reglas de coherencia del registro de resoluciones (REQ-081): enumerados, sujeto solo en INDIVIDUAL y cardinalidad</comment>
+        <!--
+            ck_res_dest_subject_iff materializa "sujeto informado si y solo si la peticion es
+            INDIVIDUAL": en una resolucion COLECTIVO no hay usuario sujeto y la columna va nula.
+
+            ck_res_dest_cardinalidad materializa "recipient_count coincide con la cardinalidad de
+            resolved_user_ids" apoyandose en JSON_VALUE (determinista) a traves de la columna virtual
+            resolved_ids_cardinalidad, porque la CHECK no puede leer el CLOB directamente.
+
+            ck_res_dest_solo_identificadores materializa RN-06 / REQ-081: la lista solo admite
+            numeros, de modo que un correo corporativo en claro (una cadena) es rechazado por la BASE
+            DE DATOS, no por la aplicacion.
+        -->
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_request_type CHECK (request_type IN ('INDIVIDUAL','COLECTIVO'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_outcome CHECK (outcome IN ('OK','SIN_DESTINATARIOS','NO_ENCONTRADO','NO_NOTIFICABLE','ERROR_TECNICO'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_fallback CHECK (is_fallback_used IN ('Y','N'))</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_recipient_count_min CHECK (recipient_count &gt;= 0)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_subject_iff CHECK (
+    (request_type = 'INDIVIDUAL' AND subject_user_id IS NOT NULL)
+ OR (request_type = 'COLECTIVO' AND subject_user_id IS NULL)
+)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_sin_destinatarios CHECK (outcome &lt;&gt; 'SIN_DESTINATARIOS' OR recipient_count = 0)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_cardinalidad CHECK (recipient_count = resolved_ids_cardinalidad)</sql>
+        <sql>ALTER TABLE resolucion_destinatario_log ADD CONSTRAINT ck_res_dest_solo_identificadores CHECK (resolved_ids_solo_numeros = 1)</sql>
+        <rollback>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_solo_identificadores</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_cardinalidad</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_sin_destinatarios</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_subject_iff</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_recipient_count_min</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_fallback</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_outcome</sql>
+            <sql>ALTER TABLE resolucion_destinatario_log DROP CONSTRAINT ck_res_dest_request_type</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-03" author="MIND">
+        <comment>Indices de consulta del registro: orden cronologico descendente y filtro por usuario sujeto</comment>
+        <sql>CREATE INDEX ix_res_dest_resolved_at ON resolucion_destinatario_log (resolved_at DESC)</sql>
+        <sql>CREATE INDEX ix_res_dest_subject_user ON resolucion_destinatario_log (subject_user_id)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_res_dest_subject_user</sql>
+            <sql>DROP INDEX ix_res_dest_resolved_at</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-04" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad del registro de resoluciones (REQ-081 RN-02, AC-DIR-05): UPDATE y DELETE rechazados con ORA-20005</comment>
+        <!--
+            Es un trigger de SENTENCIA (sin FOR EACH ROW): se dispara una vez por sentencia y rechaza
+            el UPDATE o el DELETE incluso cuando la sentencia no afecta a ninguna fila, de modo que
+            no hay forma de alterar ni de borrar un registro ya escrito.
+
+            La fila solo admite INSERT. La retencion de 2 anios se apoya en esta garantia.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_resolucion_dest_inmutable
+BEFORE UPDATE OR DELETE ON resolucion_destinatario_log
+BEGIN
+    RAISE_APPLICATION_ERROR(-20005, 'El registro de resoluciones de destinatarios es inmutable');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_resolucion_dest_inmutable</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
