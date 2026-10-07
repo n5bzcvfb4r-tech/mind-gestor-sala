@@ -302,4 +302,327 @@ SELECT CAST('CATEGORY' AS VARCHAR2(10 CHAR)),
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-06" author="MIND">
+        <comment>Oraculo AC-BAN-02 / REQ-106: las 3 paginas de 25 sobre un conjunto filtrado de 60 no repiten ni omiten ninguna fila y el total_count se calcula sobre el conjunto filtrado</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la paginacion de la bandeja. Siembra el escenario literal de
+            AC-BAN-02: SESENTA incidencias en la sala filtrada (SAL-ORA60A) y QUINCE mas en OTRA sala
+            (SAL-ORA60B). El total global del escenario es por tanto 75 y el del conjunto filtrado 60,
+            y esa diferencia es deliberada: permite DEMOSTRAR que total_count = 60 se calcula sobre el
+            conjunto YA FILTRADO y no sobre la tabla entera. Si ambos recuentos coincidiesen, el
+            oraculo no podria distinguir un total_count correcto de uno que ignora el filtro, y por eso
+            una tercera comprobacion falla explicitamente cuando el total filtrado y el global son
+            iguales.
+
+            Las 60 incidencias del conjunto filtrado se insertan con el MISMO created_at a proposito.
+            No es un atajo de la siembra: es el nucleo de la prueba. Con la marca de alta empatada en
+            las 60 filas, el primer criterio del orden por defecto de REQ-106 (created_at DESC) no
+            discrimina nada y el desempate por incident_id DESC pasa a ser el UNICO criterio que
+            decide la posicion de cada fila. Asi la ESTABILIDAD del orden queda realmente puesta a
+            prueba: sin ese desempate el motor podria devolver las filas empatadas en un orden
+            distinto en cada una de las tres consultas de pagina y una misma incidencia apareceria en
+            dos paginas o en ninguna, que es exactamente el defecto que AC-BAN-02 prohibe.
+
+            El recorrido de las tres paginas se hace con OFFSET ... ROWS FETCH NEXT ... ROWS ONLY, que
+            es la paginacion resuelta EN BASE DE DATOS que exige AC-BAN-09: cada pagina es una
+            consulta independiente que trae solo sus 25 filas, sin materializar el listado completo en
+            la aplicacion. Esas consultas se apoyan en los indices creados en este mismo changelog,
+            ix_incidencia_bandeja_sala para el termino de igualdad del filtro e
+            ix_incidencia_bandeja_estado para la cola de ordenacion.
+
+            Las comprobaciones son cinco: el tamano de cada pagina (25, 25 y 10), que el recorrido
+            completo devuelve 60 filas y 60 distintas (ni repetidas ni omitidas), que el conjunto
+            filtrado queda cubierto por entero (MINUS vacio), que la pagina 2 contiene exactamente los
+            elementos 26 a 50 del conjunto ordenado (contrastados contra ROW_NUMBER) y que el
+            desempate es determinista (primera fila de la pagina 1 = incident_id maximo, ultima fila
+            de la pagina 3 = incident_id minimo).
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60A / SAL-ORA60A / SAL-ORA60B), display_order y sort_order 9xx y
+            correos @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_creado          TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    v_admin           NUMBER;
+    v_tecnico         NUMBER;
+    v_office          NUMBER;
+    v_room_a          NUMBER;
+    v_room_b          NUMBER;
+    v_cat             NUMBER;
+
+    v_total_filtrado  NUMBER;
+    v_total_global    NUMBER;
+    v_total_pages     NUMBER;
+    v_p1              NUMBER;
+    v_p2              NUMBER;
+    v_p3              NUMBER;
+    v_filas           NUMBER;
+    v_distintas       NUMBER;
+    v_faltan          NUMBER;
+    v_dif             NUMBER;
+    v_primera         NUMBER;
+    v_maxima          NUMBER;
+    v_ultima          NUMBER;
+    v_minima          NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60A' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60A', 'Oficina Oraculo Paginacion', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60A';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Paginacion Admin', 'oraculo.tsk060.ban.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Paginacion Tecnico', 'oraculo.tsk060.ban.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60A' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60A', 'Sala Oraculo Paginacion Filtrada', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room_a FROM cat_sala WHERE room_code = 'SAL-ORA60A';
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60B' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60B', 'Sala Oraculo Paginacion Fuera Filtro', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room_b FROM cat_sala WHERE room_code = 'SAL-ORA60B';
+
+    -- 60 incidencias en la sala filtrada, TODAS con el mismo created_at: el desempate por
+    -- incident_id DESC es el unico criterio que decide el orden.
+    FOR i IN 1..60 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-A' || LPAD(i, 5, '0'), v_room_a, v_cat,
+                     'Incidencia del conjunto filtrado de la bandeja numero ' || i, v_tecnico, l_creado);
+    END LOOP;
+
+    -- 15 incidencias en OTRA sala: quedan fuera del filtro y elevan el total global a 75.
+    FOR i IN 1..15 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-B' || LPAD(i, 5, '0'), v_room_b, v_cat,
+                     'Incidencia fuera del filtro de la bandeja numero ' || i, v_tecnico, l_creado);
+    END LOOP;
+
+    -- total_count se calcula sobre el CONJUNTO FILTRADO, no sobre la tabla entera.
+    SELECT COUNT(*) INTO v_total_filtrado FROM incidencia WHERE room_id = v_room_a;
+    IF v_total_filtrado <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO AC-BAN-02: el conjunto filtrado deberia tener 60 incidencias y tiene ' || v_total_filtrado);
+    END IF;
+
+    SELECT COUNT(*) INTO v_total_global FROM incidencia WHERE room_id IN (v_room_a, v_room_b);
+    IF v_total_global <> 75 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO AC-BAN-02: el escenario deberia tener 75 incidencias en total y tiene ' || v_total_global);
+    END IF;
+
+    IF v_total_filtrado = v_total_global THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO AC-BAN-02: el total_count se esta calculando sobre la tabla entera y no sobre el conjunto filtrado');
+    END IF;
+
+    -- total_pages = CEIL(total_count / page_size) con page_size = 25.
+    v_total_pages := CEIL(v_total_filtrado / 25);
+    IF v_total_pages <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20963, 'ORACULO AC-BAN-02: total_pages deberia ser 3 y es ' || v_total_pages);
+    END IF;
+
+    -- Tamano de cada pagina: 25, 25 y 10, con la paginacion resuelta en base de datos.
+    SELECT COUNT(*) INTO v_p1
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    SELECT COUNT(*) INTO v_p2
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    SELECT COUNT(*) INTO v_p3
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    IF v_p1 <> 25 OR v_p2 <> 25 OR v_p3 <> 10 THEN
+        RAISE_APPLICATION_ERROR(-20964, 'ORACULO AC-BAN-02: los tamanos de las 3 paginas deberian ser 25, 25 y 10 y son ' || v_p1 || ', ' || v_p2 || ' y ' || v_p3);
+    END IF;
+
+    -- Ni repetidas ni omitidas: el recorrido de las 3 paginas devuelve 60 filas y 60 distintas.
+    SELECT COUNT(*), COUNT(DISTINCT incident_id)
+      INTO v_filas, v_distintas
+      FROM (
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+            UNION ALL
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)
+            UNION ALL
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)
+           );
+
+    IF v_filas <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20965, 'ORACULO AC-BAN-02: el recorrido de las 3 paginas devuelve ' || v_filas || ' filas en lugar de 60: hay filas omitidas o de mas');
+    END IF;
+
+    IF v_distintas <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20966, 'ORACULO AC-BAN-02: el recorrido de las 3 paginas repite ' || (v_filas - v_distintas) || ' filas: la paginacion no es estable');
+    END IF;
+
+    -- Cobertura exacta: ninguna incidencia del conjunto filtrado se queda fuera de las 3 paginas.
+    SELECT COUNT(*) INTO v_faltan
+      FROM (SELECT incident_id FROM incidencia WHERE room_id = v_room_a
+            MINUS
+            (SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+             UNION ALL
+             SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)
+             UNION ALL
+             SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)));
+
+    IF v_faltan <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20967, 'ORACULO AC-BAN-02: ' || v_faltan || ' incidencias del conjunto filtrado no aparecen en ninguna pagina');
+    END IF;
+
+    -- La pagina 2 es exactamente la ventana 26-50 del conjunto ordenado.
+    SELECT COUNT(*) INTO v_dif
+      FROM ((SELECT incident_id
+               FROM (SELECT incident_id,
+                            ROW_NUMBER() OVER (ORDER BY created_at DESC, incident_id DESC) AS rn
+                       FROM incidencia
+                      WHERE room_id = v_room_a)
+              WHERE rn BETWEEN 26 AND 50)
+            MINUS
+            (SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)));
+
+    IF v_dif <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20968, 'ORACULO AC-BAN-02: la pagina 2 no contiene exactamente los elementos 26-50 del conjunto ordenado');
+    END IF;
+
+    -- Desempate estable: con created_at empatado, la primera fila de la pagina 1 tiene que ser el
+    -- incident_id maximo del conjunto filtrado y la ultima de la pagina 3 el minimo.
+    SELECT incident_id
+      INTO v_primera
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+     WHERE ROWNUM = 1;
+
+    SELECT MAX(incident_id) INTO v_maxima FROM incidencia WHERE room_id = v_room_a;
+
+    SELECT incident_id
+      INTO v_ultima
+      FROM (SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)
+             ORDER BY incident_id ASC)
+     WHERE ROWNUM = 1;
+
+    SELECT MIN(incident_id) INTO v_minima FROM incidencia WHERE room_id = v_room_a;
+
+    IF v_primera <> v_maxima OR v_ultima <> v_minima THEN
+        RAISE_APPLICATION_ERROR(-20969, 'ORACULO AC-BAN-02: el desempate por incident_id DESC no es determinista');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
