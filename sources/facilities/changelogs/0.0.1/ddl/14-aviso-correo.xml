@@ -1030,4 +1030,275 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-14-08" author="MIND">
+        <comment>Oraculo REQ-132 / AC-SMTP-02: dos despachadores concurrentes con SELECT ... FOR UPDATE SKIP LOCKED toman filas DISTINTAS en orden FIFO y ninguna solicitud se entrega dos veces</comment>
+        <!--
+            ATENCION: ESTE ORACULO CONFIRMA SUS DATOS, Y ES EL UNICO DEL REPO QUE LO HACE
+            ===========================================================================
+            Los demas oraculos (14-05, 14-06, 14-07) montan su escenario y lo deshacen con un
+            ROLLBACK final, sin confirmar nada. Este NO puede: la comprobacion 2 necesita una SEGUNDA
+            transaccion real (PRAGMA AUTONOMOUS_TRANSACTION) y una transaccion autonoma NO VE los
+            cambios sin confirmar de la transaccion principal. Sin el COMMIT del escenario, la
+            segunda conexion no encontraria fila alguna y la comprobacion pasaria por la razon
+            equivocada: "el segundo despachador no recibio la misma fila" seria cierto simplemente
+            porque la cola le parece vacia. Confirmar es ademas lo que hace CREIBLE el escenario,
+            porque el patron outbox entrega al despachador solicitudes YA CONFIRMADAS.
+
+            A cambio, el oraculo se obliga a dos cosas. PRIMERA: todo lo que confirma lo BORRA al
+            final con el procedimiento local `limpiar` (DELETE de los avisos del prefijo, del usuario
+            del escenario y del rol EMPLEADO solo si lo creo este oraculo, mas su COMMIT), de modo
+            que la base queda exactamente como estaba. SEGUNDA: la limpieza corre tambien en el
+            camino de error, dentro del manejador EXCEPTION WHEN OTHERS, que primero hace ROLLBACK,
+            despues invoca `limpiar` envuelto en su propio bloque con WHEN OTHERS THEN NULL (para que
+            un fallo de limpieza no enmascare el error original) y por ultimo RAISE. Tras limpiar se
+            COMPRUEBA que no queda rastro, y si lo hay el oraculo falla.
+
+            NO HAY NI UNA SOLA SENTENCIA DDL en el bloque, igual que en los oraculos anteriores: el
+            bloque entero es una UNICA sentencia JDBC (splitStatements="false") y lo que se confirma
+            es DML del escenario, confirmado a proposito y borrado despues, nunca un commit implicito
+            provocado por un DDL colado.
+
+            QUE DEMUESTRA
+            =============
+            (1) El despachador consume la cola en orden FIFO por created_at (REQ-132), que es
+            exactamente el orden que sirve el indice ix_aviso_correo_fifo del changeset 14-03: el
+            primer despachador tiene que llevarse el aviso A, encolado dos minutos antes que el B.
+
+            (2) Dos despachadores CONCURRENTES con SELECT ... FOR UPDATE SKIP LOCKED obtienen filas
+            DISTINTAS. El segundo ni se queda ESPERANDO al primero (que es lo que haria un FOR UPDATE
+            sin SKIP LOCKED y lo que convertiria la cola en un cuello de botella, serializando a todos
+            los workers detras del mas lento) ni recibe la MISMA fila (que entregaria el correo dos
+            veces, en contra de AC-SMTP-02 y AC-G-03).
+
+            (3) Tomadas las dos, un TERCER despachador se encuentra la cola VACIA. Esa es la prueba
+            de que ninguna solicitud se entrega por duplicado: si la cola volviese a servir una fila
+            ya tomada, el tercer worker la recibiria y el correo saldria otra vez.
+
+            POR QUE UN CURSOR EXPLICITO Y NO UN FETCH FIRST
+            ===============================================
+            Oracle NO admite la clausula de limitacion de filas (FETCH FIRST n ROWS ONLY) junto a
+            FOR UPDATE. Por eso el despachador toma la primera fila de un CURSOR ORDENADO, con un
+            unico FETCH, y no con un FETCH FIRST ... FOR UPDATE que el motor rechazaria.
+
+            LA TOMA ES LA QUE DESCRIBE REQ-132
+            ==================================
+            El UPDATE a ENVIANDO con locked_by y locked_at es literalmente la toma del requisito: una
+            solicitud en ENVIANDO esta tomada por un UNICO worker, identificado en locked_by. La
+            CHECK ck_aviso_correo_locked del changeset 14-02 solo admite ese testigo en ese estado,
+            de modo que el motor impide dejar un locked_by colgado fuera de ENVIANDO.
+
+            EL ROLLBACK FINAL SIMULA LA CAIDA DEL WORKER
+            ============================================
+            El ROLLBACK de la comprobacion 4 suelta el bloqueo del primer despachador y revierte su
+            toma: la solicitud vuelve a quedar DISPONIBLE sin haber generado correo, que es
+            exactamente la recuperacion de una solicitud atascada en ENVIANDO de AC-AVI-06.
+
+            El aviso del escenario es de tipo CREDENTIAL_ISSUED, que segun ck_aviso_correo_vinculo no
+            lleva incidencia ni entrada de historico y si exige destinatario individual: por eso el
+            escenario se sostiene con un rol y un usuario, sin incidencia ni catalogos de sala. El
+            display_order de la semilla del rol (977) queda fuera del rango de las semillas reales y
+            del de los oraculos anteriores.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_usuario     NUMBER;
+    v_aviso_a     VARCHAR2(36 CHAR);
+    v_aviso_b     VARCHAR2(36 CHAR);
+    v_tomada_1    VARCHAR2(36 CHAR);
+    v_tomada_2    VARCHAR2(36 CHAR);
+    v_tomada_3    VARCHAR2(36 CHAR);
+    v_vacio       BOOLEAN;
+    v_rol_creado  BOOLEAN := FALSE;
+    v_n           NUMBER;
+
+    c_prefijo  CONSTANT VARCHAR2(30 CHAR)  := 'ORACULO-TSK057|FIFO|';
+    c_username CONSTANT VARCHAR2(100 CHAR) := 'oraculo.tsk057.fifo';
+    c_nombre   CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-057 Concurrencia';
+    c_correo   CONSTANT VARCHAR2(254 CHAR) := 'oraculo.tsk057.fifo@example.invalid';
+    c_asunto   CONSTANT VARCHAR2(255 CHAR) := 'Credencial emitida (oraculo TSK-057)';
+    c_cuerpo   CONSTANT VARCHAR2(200 CHAR) := 'Cuerpo congelado del oraculo TSK-057.';
+
+    -- La cola del PRIMER despachador, en la transaccion principal. Cursor EXPLICITO porque Oracle
+    -- no admite FETCH FIRST ... ROWS ONLY junto a FOR UPDATE: se ordena y se toma una sola fila.
+    CURSOR c_cola IS
+        SELECT notification_id
+          FROM aviso_correo
+         WHERE status = 'PENDIENTE'
+           AND notification_key LIKE c_prefijo || '%'
+         ORDER BY created_at, notification_key
+           FOR UPDATE SKIP LOCKED;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    -- Este oraculo CONFIRMA su escenario, de modo que un ROLLBACK ya no basta para dejar la base
+    -- como estaba: lo escrito se borra explicitamente. El rol solo se borra si lo creo el propio
+    -- oraculo, para no llevarse por delante una semilla preexistente.
+    PROCEDURE limpiar IS
+    BEGIN
+        DELETE FROM aviso_correo WHERE notification_key LIKE c_prefijo || '%';
+        DELETE FROM usuario WHERE username = c_username;
+        IF v_rol_creado THEN
+            DELETE FROM cat_rol WHERE role_code = 'EMPLEADO';
+        END IF;
+        COMMIT;
+    END limpiar;
+
+    -- SEGUNDA CONEXION: el otro despachador. La transaccion autonoma es independiente de la
+    -- principal (no ve sus cambios sin confirmar ni comparte sus bloqueos), que es justo lo que
+    -- hace de ella un worker concurrente creible. Devuelve el notification_id tomado, o NULL si
+    -- SKIP LOCKED no le dejo ninguna fila disponible. Cierra SIEMPRE su transaccion antes de
+    -- salir, porque una transaccion autonoma que termina sin confirmar ni deshacer provoca
+    -- ORA-06519.
+    FUNCTION tomar_en_otra_transaccion(p_worker VARCHAR2) RETURN VARCHAR2 IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        CURSOR c_otra IS
+            SELECT notification_id
+              FROM aviso_correo
+             WHERE status = 'PENDIENTE'
+               AND notification_key LIKE c_prefijo || '%'
+             ORDER BY created_at, notification_key
+               FOR UPDATE SKIP LOCKED;
+        l_id    VARCHAR2(36 CHAR);
+        l_vacio BOOLEAN;
+    BEGIN
+        OPEN c_otra;
+        FETCH c_otra INTO l_id;
+        l_vacio := c_otra%NOTFOUND;
+        CLOSE c_otra;
+
+        IF l_vacio THEN
+            ROLLBACK;
+            RETURN NULL;
+        END IF;
+
+        UPDATE aviso_correo
+           SET status    = 'ENVIANDO',
+               locked_by = p_worker,
+               locked_at = SYS_EXTRACT_UTC(SYSTIMESTAMP)
+         WHERE notification_id = l_id;
+
+        COMMIT;
+        RETURN l_id;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END tomar_en_otra_transaccion;
+BEGIN
+    -- El rol solo se marca para borrado si NO existia: la limpieza no debe tocar las semillas reales.
+    SELECT COUNT(*) INTO v_n FROM cat_rol WHERE role_code = 'EMPLEADO';
+    v_rol_creado := (v_n = 0);
+    sembrar_rol('EMPLEADO', 'Empleado', 977);
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_nombre, c_correo, c_username, 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk057-fifo', 'argon2id')
+      RETURNING user_id INTO v_usuario;
+
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_a FROM dual;
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_b FROM dual;
+
+    -- Dos solicitudes PENDIENTE (status SIN INFORMAR: lo pone el DEFAULT) con created_at EXPLICITO,
+    -- de modo que A es inequivocamente la PRIMERA en orden FIFO.
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, body_text, created_at)
+         VALUES (v_aviso_a, c_prefijo || 'A', 'CREDENTIAL_ISSUED',
+                 v_usuario, c_correo, c_asunto, c_cuerpo,
+                 SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '2' MINUTE);
+
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, body_text, created_at)
+         VALUES (v_aviso_b, c_prefijo || 'B', 'CREDENTIAL_ISSUED',
+                 v_usuario, c_correo, c_asunto, c_cuerpo,
+                 SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '1' MINUTE);
+
+    -- CONFIRMACION DELIBERADA: sin ella la transaccion autonoma de la comprobacion 2 no veria
+    -- ninguna fila. Todo lo confirmado aqui se borra en `limpiar`, tanto en el camino feliz como
+    -- en el manejador de excepciones.
+    COMMIT;
+
+    -- ---------------------------------------------------------------------------------------
+    -- Comprobacion 1 (REQ-132): el primer despachador toma la solicitud MAS ANTIGUA (FIFO)
+    -- ---------------------------------------------------------------------------------------
+    OPEN c_cola;
+    FETCH c_cola INTO v_tomada_1;
+    v_vacio := c_cola%NOTFOUND;
+    CLOSE c_cola;
+
+    IF v_vacio OR v_tomada_1 <> v_aviso_a THEN
+        RAISE_APPLICATION_ERROR(-20997, 'ORACULO TSK-057 / REQ-132: el primer despachador deberia tomar el aviso mas antiguo (orden FIFO por created_at) y ha tomado otro');
+    END IF;
+
+    -- La toma de REQ-132: ENVIANDO con el testigo del worker. NO se confirma, porque el bloqueo
+    -- tiene que seguir VIVO durante la comprobacion 2.
+    UPDATE aviso_correo
+       SET status    = 'ENVIANDO',
+           locked_by = 'oraculo-worker-1',
+           locked_at = SYS_EXTRACT_UTC(SYSTIMESTAMP)
+     WHERE notification_id = v_tomada_1;
+
+    -- -----------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-SMTP-02): el segundo despachador, en OTRA transaccion, se salta la fila
+    -- bloqueada y se lleva la SIGUIENTE, no la misma ni ninguna
+    -- -----------------------------------------------------------------------------------------
+    v_tomada_2 := tomar_en_otra_transaccion('oraculo-worker-2');
+
+    IF v_tomada_2 IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20998, 'ORACULO TSK-057 / REQ-132: el segundo despachador no obtuvo ninguna solicitud: SKIP LOCKED deberia saltarse la fila bloqueada por el primero y entregarle la siguiente, no dejarlo en vacio');
+    END IF;
+
+    IF v_tomada_2 = v_tomada_1 OR v_tomada_2 <> v_aviso_b THEN
+        RAISE_APPLICATION_ERROR(-20998, 'ORACULO TSK-057 / AC-SMTP-02: los dos despachadores concurrentes obtuvieron la MISMA solicitud: el aviso se entregaria dos veces');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3 (AC-SMTP-02): tomadas las dos, la cola esta VACIA para un tercer worker
+    -- -------------------------------------------------------------------------------------
+    v_tomada_3 := tomar_en_otra_transaccion('oraculo-worker-3');
+
+    IF v_tomada_3 IS NOT NULL THEN
+        RAISE_APPLICATION_ERROR(-20999, 'ORACULO TSK-057 / AC-SMTP-02: un tercer despachador obtuvo la solicitud ' || v_tomada_3 || ', ya tomada por otro: la cola entrega la misma fila dos veces');
+    END IF;
+
+    -- ------------------------------------------------------------------------------------------
+    -- Comprobacion 4 (AC-AVI-06): el ROLLBACK simula la caida del primer worker. Suelta su bloqueo
+    -- y revierte su toma, de modo que la solicitud vuelve a estar disponible sin generar correo.
+    -- A continuacion se borra TODO lo que este oraculo confirmo.
+    -- ------------------------------------------------------------------------------------------
+    ROLLBACK;
+
+    limpiar;
+
+    SELECT COUNT(*) INTO v_n
+      FROM aviso_correo
+     WHERE notification_key LIKE c_prefijo || '%';
+
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20999, 'ORACULO TSK-057: la limpieza del oraculo de concurrencia dejo ' || v_n || ' filas en aviso_correo');
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        -- La limpieza va envuelta para que un fallo suyo no enmascare el error original.
+        BEGIN
+            limpiar;
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: borra sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
