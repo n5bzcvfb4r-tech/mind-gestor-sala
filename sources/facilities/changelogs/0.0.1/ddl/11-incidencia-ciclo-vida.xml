@@ -1464,4 +1464,461 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-11-10" author="MIND">
+        <comment>Oraculo AC-ASG-06 / REQ-156: desactivar un tecnico libera sus incidencias no terminales con motivo TECNICO_DESACTIVADO y deja intactas las terminales</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO con la misma mecanica que los tres anteriores de este fichero:
+            siembra su escenario con codigos propios (sufijo ORA54D), ejecuta contra el motor Oracle
+            real la transaccion de desactivacion tal y como la emitiria el servicio, afirma el
+            resultado con RAISE_APPLICATION_ERROR y termina en ROLLBACK sin dejar ni una fila.
+
+            QUE DEMUESTRA Y POR QUE IMPORTA
+            ===============================
+            (1) EL RECUENTO DE IMPACTO ES EL MISMO CONJUNTO QUE SE LIBERA (AC-ASG-06). Antes de
+                desactivar, REQ-156 obliga a enseñar al administrador cuantas incidencias quedaran
+                sin responsable. Ese numero no es decorativo: tiene que salir de la MISMA condicion
+                que luego ejecuta la liberacion (tecnico asignado y estado no terminal). El oraculo
+                cuenta primero, libera despues y exige que los dos numeros coincidan, porque una
+                pantalla de impacto que anuncie un numero y libere otro es exactamente el fallo que
+                hace que un administrador tome la decision con informacion falsa.
+
+            (2) ATOMICIDAD (REQ-156 RN-04). La desactivacion de la cuenta y la liberacion de sus
+                incidencias son UNA sola transaccion: o pasan las dos cosas o no pasa ninguna. Por
+                eso el oraculo emite los dos UPDATE seguidos, SIN confirmar nada entre medias y sin
+                ningun punto de guardado intermedio, y por eso el bloque no confirma nada ni
+                contiene ninguna sentencia DDL (que provocaria una confirmacion implicita y partiria
+                la transaccion en dos). Un estado intermedio visible (tecnico ya inactivo con incidencias todavia
+                asignadas a el) seria una bandeja que apunta a una cuenta que ya no puede entrar.
+                Los dos UPDATE comparten ademas un UNICO instante v_ahora: la baja de la cuenta y la
+                liberacion de sus incidencias ocurrieron a la vez, y asi lo dice la traza.
+
+            (3) LA FRONTERA ES EXACTAMENTE EL CARACTER TERMINAL DEL ESTADO (REQ-156 RN-02,
+                AC-RESP-04). El escenario monta CINCO incidencias del mismo tecnico repartidas a
+                ambos lados de esa frontera: dos ABIERTA y una EN_CURSO (no terminales, se liberan)
+                frente a una RESUELTA y una CERRADA (terminales, NO se tocan). Las terminales
+                conservan assigned_technician_id apuntando al tecnico desactivado: la atribucion de
+                QUIEN atendio la incidencia es historico y SOBREVIVE a la baja de la cuenta, que es
+                justo lo que garantizan las FK sin ON DELETE de ddl-0.0.1-11-03. Liberar tambien las
+                terminales "por limpieza" destruiria ese historico sin ganar nada, porque una
+                incidencia ya resuelta o cerrada no necesita responsable que la atienda.
+
+            (4) EL ESTADO NO RETROCEDE AL LIBERAR (REQ-154 RN-05). Liberar quita el responsable, no
+                deshace el trabajo: la que estaba EN_CURSO sigue EN_CURSO despues de la liberacion,
+                con su in_progress_at intacto. El error tipico es "devolver la incidencia a la cola"
+                reponiendo el estado ABIERTA, lo que borraria la traza de que ya se habia empezado a
+                atender.
+
+            (5) EL MOTIVO DE LIBERACION ES UN VALOR FIJO, NO TEXTO LIBRE (REQ-156 RN-03). Cuando la
+                liberacion la provoca una desactivacion de cuenta, el motivo es siempre la constante
+                TECNICO_DESACTIVADO, puesta por el sistema; el administrador no escribe aqui ningun
+                texto, de modo que el dato es agregable y auditable sin depender de la redaccion de
+                cada persona. Ese valor tiene 19 caracteres y por tanto cumple por si solo la cota de
+                entre 10 y 500 que impone ck_incidencia_liberacion (REQ-154); el oraculo lo mide
+                sobre el valor PERSISTIDO y remata con un intento negativo (reescribir el motivo con
+                un texto de 5 caracteres) que el motor tiene que rechazar con ORA-02290.
+
+            (6) NINGUN BORRADO FISICO (REQ-156 RN-05, REQ-047). Despues de todo lo anterior siguen
+                existiendo las cinco incidencias y sigue existiendo la fila del tecnico, ahora con
+                status INACTIVO. Desactivar es cambiar un estado, nunca borrar: ni la cuenta ni su
+                rastro desaparecen de la base de datos.
+
+            DATOS Y LIMPIEZA
+            ================
+            Siembra por MERGE los catalogos que necesita porque los changelogs dml se aplican DESPUES
+            de los ddl y aqui todavia estan vacios, con sus propios codigos (sufijo ORA54D) y sus
+            propios display_order / sort_order 92x para no chocar ni con el catalogo real ni con los
+            demas oraculos del fichero. Entre ellos va cat_motivo_desactivacion con el codigo
+            CESE_TEMPORAL, porque usuario.deactivation_reason_code tiene clave ajena contra ese
+            catalogo y ck_usuario_coherencia_baja exige deactivated_at, deactivated_by y
+            deactivation_reason_code informados en cuanto la cuenta pasa a INACTIVO.
+
+            Las altas informan created_at explicitamente tres horas atras porque las incidencias que
+            avanzan en el ciclo de vida llevan marcas pasadas (asignacion, inicio de atencion,
+            resolucion y cierre) y ck_incidencia_cronologia exige que toda marca sea posterior al
+            alta; son marcas pasadas, de modo que el bloque (3) del trigger trg_incidencia_ciclo_vida
+            (ninguna marca futura) las acepta. Los usuarios informan username, password_hash y
+            password_algorithm porque 06-usuario-credenciales.xml los declara NOT NULL.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin          NUMBER;
+    v_empleado       NUMBER;
+    v_tecnico        NUMBER;
+    v_office         NUMBER;
+    v_room           NUMBER;
+    v_cat            NUMBER;
+    v_inc_ab1        NUMBER;
+    v_inc_ab2        NUMBER;
+    v_inc_curso      NUMBER;
+    v_inc_res        NUMBER;
+    v_inc_cer        NUMBER;
+    v_impacto        NUMBER;
+    v_liberadas      NUMBER;
+    v_conformes      NUMBER;
+    v_abiertas       NUMBER;
+    v_en_curso       NUMBER;
+    v_intactas       NUMBER;
+    v_supervivientes NUMBER;
+    v_cuenta         NUMBER;
+    v_util           NUMBER;
+    v_longitud       NUMBER;
+    v_codigo         NUMBER;
+    v_estado_usr     usuario.status%TYPE;
+    v_estado_inc     incidencia.status%TYPE;
+    v_closed_at      incidencia.closed_at%TYPE;
+    v_closed_by      incidencia.closed_by%TYPE;
+    v_prog_antes     incidencia.in_progress_at%TYPE;
+    v_prog_despues   incidencia.in_progress_at%TYPE;
+    v_res_antes      incidencia.resolved_at%TYPE;
+    v_res_despues    incidencia.resolved_at%TYPE;
+    v_motivo         incidencia.release_reason%TYPE;
+    v_ahora          TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    -- Variante del sembrador de estados con el flag is_terminal: este escenario necesita los cuatro
+    -- estados del catalogo y la frontera que comprueba es justamente la de CERRADA, el unico
+    -- terminal; RESUELTA se siembra con 'N' porque en este modelo todavia admite el cierre.
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER,
+                             p_terminal VARCHAR2 DEFAULT 'N') IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+
+        -- La categoria tiene que estar ACTIVA aunque la fila ya existiese: el trigger
+        -- trg_incidencia_clasificacion rechaza el alta sobre catalogo inactivo (REQ-100).
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_code = p_code;
+    END sembrar_categoria;
+
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 921);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 922);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 923);
+    sembrar_estado('ABIERTA', 'Abierta', 921, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 922, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 923, 'N');
+    sembrar_estado('CERRADA', 'Cerrada', 924, 'Y');
+    sembrar_categoria('AUDIOVISUAL', 'Audiovisual oraculo desactivacion', 921);
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'AUDIOVISUAL';
+
+    -- El motivo de baja es obligatorio en cuanto la cuenta pasa a INACTIVO: lo exige
+    -- ck_usuario_coherencia_baja y tiene clave ajena contra este catalogo.
+    MERGE INTO cat_motivo_desactivacion d
+    USING (SELECT 'CESE_TEMPORAL' AS reason_code FROM dual) s
+       ON (d.reason_code = s.reason_code)
+    WHEN NOT MATCHED THEN
+        INSERT (reason_code, reason_name, is_active)
+        VALUES ('CESE_TEMPORAL', 'Cese temporal de actividad', 'Y');
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA54D' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA54D', 'Oficina Oraculo Desactivacion', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA54D';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    -- username, password_hash y password_algorithm son NOT NULL desde 06-usuario-credenciales.xml.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES ('Oraculo Liberacion Admin', 'oraculo.tsk054.lib.admin@example.invalid',
+                 'oraculo.tsk054.lib.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk054-lib-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Liberacion Empleado', 'oraculo.tsk054.lib.empleado@example.invalid',
+                 'oraculo.tsk054.lib.empleado', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk054-lib-empleado', 'argon2id', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Liberacion Tecnico', 'oraculo.tsk054.lib.tecnico@example.invalid',
+                 'oraculo.tsk054.lib.tecnico', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk054-lib-tecnico', 'argon2id', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA54D' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA54D', 'Sala Oraculo Desactivacion', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA54D';
+
+    -- (1) CINCO incidencias del MISMO tecnico, repartidas a los dos lados de la frontera terminal.
+    --     Todas nacen con created_at tres horas atras porque sus marcas posteriores son pasadas y
+    --     ck_incidencia_cronologia exige que ninguna marca preceda al alta.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by,
+                            created_at, assigned_technician_id, assigned_at)
+         VALUES ('INC-9054D-000001', v_room, v_cat,
+                 'Primera incidencia ABIERTA asignada al tecnico que sera desactivado',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR, v_tecnico, v_ahora - INTERVAL '2' HOUR)
+      RETURNING incident_id INTO v_inc_ab1;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by,
+                            created_at, assigned_technician_id, assigned_at)
+         VALUES ('INC-9054D-000002', v_room, v_cat,
+                 'Segunda incidencia ABIERTA asignada al tecnico que sera desactivado',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR, v_tecnico, v_ahora - INTERVAL '2' HOUR)
+      RETURNING incident_id INTO v_inc_ab2;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054D-000003', v_room, v_cat,
+                 'Incidencia que el tecnico ya habia empezado a atender antes de la desactivacion',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR)
+      RETURNING incident_id INTO v_inc_curso;
+
+    UPDATE incidencia
+       SET status                 = 'EN_CURSO',
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '2' HOUR,
+           in_progress_at         = v_ahora - INTERVAL '2' HOUR,
+           status_changed_at      = v_ahora - INTERVAL '2' HOUR,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc_curso;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054D-000004', v_room, v_cat,
+                 'Incidencia ya RESUELTA por el tecnico antes de la desactivacion de su cuenta',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR)
+      RETURNING incident_id INTO v_inc_res;
+
+    UPDATE incidencia
+       SET status                 = 'RESUELTA',
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '2' HOUR,
+           in_progress_at         = v_ahora - INTERVAL '2' HOUR,
+           resolved_at            = v_ahora - INTERVAL '1' HOUR,
+           status_changed_at      = v_ahora - INTERVAL '1' HOUR,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc_res;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9054D-000005', v_room, v_cat,
+                 'Incidencia ya CERRADA por el tecnico antes de la desactivacion de su cuenta',
+                 v_empleado, v_ahora - INTERVAL '3' HOUR)
+      RETURNING incident_id INTO v_inc_cer;
+
+    UPDATE incidencia
+       SET status                 = 'CERRADA',
+           assigned_technician_id = v_tecnico,
+           assigned_at            = v_ahora - INTERVAL '2' HOUR,
+           in_progress_at         = v_ahora - INTERVAL '2' HOUR,
+           resolved_at            = v_ahora - INTERVAL '1' HOUR,
+           closed_at              = v_ahora - INTERVAL '30' MINUTE,
+           closed_by              = v_tecnico,
+           resolution_comment     = 'Se sustituyo el proyector averiado de la sala y se verifico la' ||
+                                    ' proyeccion con la persona que reporto la incidencia.',
+           status_changed_at      = v_ahora - INTERVAL '30' MINUTE,
+           status_changed_by      = v_tecnico
+     WHERE incident_id = v_inc_cer;
+
+    -- Las marcas selladas de la CERRADA se guardan ANTES de desactivar para poder compararlas
+    -- despues: el bloque (1) del trigger trg_incidencia_ciclo_vida las protege, pero lo que aqui se
+    -- comprueba es que la transaccion de desactivacion ni siquiera las toca.
+    SELECT in_progress_at, resolved_at
+      INTO v_prog_antes, v_res_antes
+      FROM incidencia
+     WHERE incident_id = v_inc_cer;
+
+    -- (2) AC-ASG-06: recuento PREVIO de impacto, el numero que la pantalla de REQ-156 enseña al
+    --     administrador antes de confirmar. Sale de la misma condicion que luego libera.
+    SELECT COUNT(*)
+      INTO v_impacto
+      FROM incidencia
+     WHERE assigned_technician_id = v_tecnico
+       AND status IN ('ABIERTA', 'EN_CURSO');
+
+    IF v_impacto <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20970, 'ORACULO AC-ASG-06: la pantalla de impacto tiene que anunciar' ||
+            ' el recuento exacto de incidencias que se liberaran, y la consulta por tecnico asignado' ||
+            ' y estado no terminal devolvio ' || v_impacto || ' en lugar de 3 (dos ABIERTA y una EN_CURSO)');
+    END IF;
+
+    -- (3) REQ-156 RN-04: la transaccion de desactivacion, con un UNICO instante para los dos UPDATE
+    --     y sin ninguna confirmacion entre medias. Primero la cuenta, despues sus incidencias.
+    UPDATE usuario
+       SET status                   = 'INACTIVO',
+           deactivated_at           = v_ahora,
+           deactivated_by           = v_admin,
+           deactivation_reason_code = 'CESE_TEMPORAL'
+     WHERE user_id = v_tecnico;
+
+    UPDATE incidencia
+       SET assigned_technician_id = NULL,
+           released_at            = v_ahora,
+           released_by            = v_admin,
+           release_reason         = 'TECNICO_DESACTIVADO'
+     WHERE assigned_technician_id = v_tecnico
+       AND status IN ('ABIERTA', 'EN_CURSO');
+
+    v_liberadas := SQL%ROWCOUNT;
+
+    IF v_liberadas <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20971, 'ORACULO AC-ASG-06 / REQ-156 RN-04: la liberacion en la misma' ||
+            ' transaccion que la baja de la cuenta afecto a ' || v_liberadas || ' filas y tenia que' ||
+            ' afectar exactamente a las ' || v_impacto || ' anunciadas en el recuento de impacto');
+    END IF;
+
+    -- (4) Las NO terminales quedan liberadas con los cuatro datos coherentes a la vez.
+    SELECT COUNT(*)
+      INTO v_conformes
+      FROM incidencia
+     WHERE incident_id IN (v_inc_ab1, v_inc_ab2, v_inc_curso)
+       AND assigned_technician_id IS NULL
+       AND released_at IS NOT NULL
+       AND released_by = v_admin
+       AND release_reason = 'TECNICO_DESACTIVADO';
+
+    IF v_conformes <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20972, 'ORACULO REQ-156 RN-03: solo ' || v_conformes || ' de las 3' ||
+            ' incidencias no terminales quedaron sin tecnico, con instante y autor de liberacion' ||
+            ' informados y con el motivo fijo TECNICO_DESACTIVADO');
+    END IF;
+
+    -- (5) REQ-154 RN-05: liberar quita el responsable, NO retrocede el estado ni deshace el trabajo.
+    SELECT COUNT(CASE WHEN status = 'ABIERTA'  THEN 1 END),
+           COUNT(CASE WHEN status = 'EN_CURSO' THEN 1 END)
+      INTO v_abiertas, v_en_curso
+      FROM incidencia
+     WHERE incident_id IN (v_inc_ab1, v_inc_ab2, v_inc_curso);
+
+    IF v_abiertas <> 2 OR v_en_curso <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20973, 'ORACULO REQ-154 RN-05: tras la liberacion quedan ' ||
+            v_abiertas || ' incidencias en ABIERTA y ' || v_en_curso || ' en EN_CURSO, cuando tenian' ||
+            ' que seguir siendo 2 y 1: la liberacion no devuelve a la cola lo que ya se estaba atendiendo');
+    END IF;
+
+    -- (6) REQ-156 RN-02 / AC-RESP-04: las TERMINALES no se tocan y conservan la atribucion.
+    SELECT COUNT(*)
+      INTO v_intactas
+      FROM incidencia
+     WHERE incident_id IN (v_inc_res, v_inc_cer)
+       AND assigned_technician_id = v_tecnico
+       AND released_at IS NULL
+       AND released_by IS NULL
+       AND release_reason IS NULL;
+
+    IF v_intactas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20974, 'ORACULO REQ-156 RN-02 / AC-RESP-04: solo ' || v_intactas ||
+            ' de las 2 incidencias terminales (RESUELTA y CERRADA) conservan al tecnico ' || v_tecnico ||
+            ' como responsable y sus tres datos de liberacion vacios; la atribucion de quien atendio' ||
+            ' la incidencia es historico y sobrevive a la desactivacion de su cuenta');
+    END IF;
+
+    SELECT status, closed_at, closed_by, in_progress_at, resolved_at,
+           NVL(REGEXP_INSTR(resolution_comment, '[^[:space:]]'), 0)
+      INTO v_estado_inc, v_closed_at, v_closed_by, v_prog_despues, v_res_despues, v_util
+      FROM incidencia
+     WHERE incident_id = v_inc_cer;
+
+    IF v_estado_inc <> 'CERRADA'
+       OR v_closed_at IS NULL
+       OR v_closed_by IS NULL
+       OR v_closed_by <> v_tecnico
+       OR v_util = 0
+       OR v_prog_despues IS NULL
+       OR v_res_despues IS NULL
+       OR v_prog_despues <> v_prog_antes
+       OR v_res_despues <> v_res_antes THEN
+        RAISE_APPLICATION_ERROR(-20975, 'ORACULO REQ-156 RN-02: la incidencia CERRADA perdio parte de' ||
+            ' su cierre o de sus marcas selladas tras desactivar al tecnico: status=' ||
+            NVL(v_estado_inc, 'NULL') ||
+            ', closed_at=' || NVL(TO_CHAR(v_closed_at), 'NULL') ||
+            ', closed_by=' || NVL(TO_CHAR(v_closed_by), 'NULL') ||
+            ' (tecnico esperado ' || v_tecnico || ')' ||
+            ', caracteres utiles del comentario=' || v_util ||
+            ', in_progress_at=' || NVL(TO_CHAR(v_prog_despues), 'NULL') ||
+            ' (sellado en ' || NVL(TO_CHAR(v_prog_antes), 'NULL') || ')' ||
+            ', resolved_at=' || NVL(TO_CHAR(v_res_despues), 'NULL') ||
+            ' (sellado en ' || NVL(TO_CHAR(v_res_antes), 'NULL') || ')');
+    END IF;
+
+    -- (7) REQ-156 RN-05 / REQ-047: desactivar no borra NADA. Las cinco incidencias siguen ahi,
+    --     incluidas las ya liberadas (se buscan por su identificador, no por el tecnico), y la
+    --     cuenta del tecnico sigue existiendo, ahora como INACTIVO.
+    SELECT COUNT(*)
+      INTO v_supervivientes
+      FROM incidencia
+     WHERE incident_id IN (v_inc_ab1, v_inc_ab2, v_inc_curso, v_inc_res, v_inc_cer);
+
+    SELECT COUNT(*), MAX(status)
+      INTO v_cuenta, v_estado_usr
+      FROM usuario
+     WHERE user_id = v_tecnico;
+
+    IF v_supervivientes <> 5 OR v_cuenta <> 1 OR v_estado_usr <> 'INACTIVO' THEN
+        RAISE_APPLICATION_ERROR(-20976, 'ORACULO REQ-156 RN-05 / REQ-047: la desactivacion no borra' ||
+            ' fisicamente nada, pero quedan ' || v_supervivientes || ' de las 5 incidencias del tecnico' ||
+            ' y su cuenta aparece ' || v_cuenta || ' veces con status ' || NVL(v_estado_usr, 'NULL') ||
+            ' (se esperaba 1 fila en INACTIVO)');
+    END IF;
+
+    -- (8) REQ-154 / ck_incidencia_liberacion: el motivo persistido mide entre 10 y 500 caracteres
+    --     utiles, y un motivo mas corto lo rechaza el motor con ORA-02290. El valor fijo
+    --     TECNICO_DESACTIVADO cumple la cota por si solo, sin que nadie escriba texto libre.
+    SELECT release_reason, LENGTH(TRIM(release_reason))
+      INTO v_motivo, v_longitud
+      FROM incidencia
+     WHERE incident_id = v_inc_ab1;
+
+    BEGIN
+        UPDATE incidencia
+           SET release_reason = 'corto'
+         WHERE incident_id = v_inc_ab1;
+        v_codigo := 0;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_codigo := SQLCODE;
+    END;
+
+    IF v_motivo <> 'TECNICO_DESACTIVADO'
+       OR v_longitud NOT BETWEEN 10 AND 500
+       OR v_codigo <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20977, 'ORACULO REQ-154 / REQ-156 RN-03: el motivo persistido es "' ||
+            NVL(v_motivo, 'NULL') || '" con ' || NVL(TO_CHAR(v_longitud), 'NULL') || ' caracteres utiles' ||
+            ' (tiene que ser el valor fijo TECNICO_DESACTIVADO, de longitud entre 10 y 500) y el intento' ||
+            ' de reescribirlo con un texto de 5 caracteres devolvio ' || v_codigo ||
+            ' en lugar de ORA-02290 (violacion de ck_incidencia_liberacion)');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
