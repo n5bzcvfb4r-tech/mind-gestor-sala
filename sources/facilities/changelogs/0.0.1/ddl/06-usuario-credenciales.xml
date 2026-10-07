@@ -93,4 +93,76 @@
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-06-04" author="MIND">
+        <comment>Historico de hashes de contrasenia (ARC-111; REQ-069)</comment>
+        <!--
+            Esta tabla guarda SOLO el hash de las contrasenias que dejaron de ser vigentes: nunca
+            la contrasenia en claro (REQ-076 / AC-G-08). La comprobacion de no reutilizacion se
+            hace recalculando el hash del candidato y comparandolo con los hashes archivados, de
+            modo que el historico no amplia en nada lo que un volcado de la base de datos revela.
+
+            created_at NO es la fecha de alta de la contrasenia, sino el instante en que esa
+            contrasenia dejo de ser vigente; lo sella el servidor en UTC con el mismo DEFAULT
+            SYS_EXTRACT_UTC(SYSTIMESTAMP) que el resto de marcas de auditoria del proyecto, nunca
+            el cliente.
+        -->
+        <sql>CREATE TABLE usuario_password_historico (
+    password_history_id NUMBER GENERATED ALWAYS AS IDENTITY,
+    user_id             NUMBER NOT NULL,
+    password_hash       VARCHAR2(255 CHAR) NOT NULL,
+    created_at          TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    CONSTRAINT pk_usuario_password_historico PRIMARY KEY (password_history_id),
+    CONSTRAINT fk_usuario_pwd_hist_user FOREIGN KEY (user_id) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="usuario_password_historico"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-05" author="MIND">
+        <comment>Indice de consulta del historico por usuario y recencia (REQ-069)</comment>
+        <!--
+            Es el indice que sirve a los dos accesos del historico: la comprobacion de no
+            reutilizacion de las 3 ultimas contrasenias de un usuario y la purga que recorta el
+            historico a ese mismo limite. Ambos leen por user_id y ordenan por created_at
+            descendente, que es exactamente la forma de esta clave.
+        -->
+        <sql>CREATE INDEX ix_usuario_pwd_hist_user_fecha ON usuario_password_historico (user_id, created_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_usuario_pwd_hist_user_fecha</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-06" author="MIND">
+        <comment>Purga que conserva como maximo las 3 ultimas contrasenias por usuario (REQ-069 / AC-PWD-04)</comment>
+        <!--
+            El trigger es de SENTENCIA (AFTER INSERT ON, sin FOR EACH ROW) y no de fila: un trigger
+            FOR EACH ROW no puede leer ni borrar la propia tabla que se esta modificando y Oracle
+            responderia ORA-04091 (tabla mutante). A nivel de sentencia el INSERT ya ha terminado,
+            asi que la tabla es consultable y la purga puede ejecutarse sin restricciones.
+
+            El limite de 3 lo fija REQ-069 ("se conservan como maximo las 3 ultimas por usuario").
+            Al vivir la purga en la base de datos, la invariante se cumple siempre y no depende de
+            que la aplicacion se acuerde de recortar el historico tras cada cambio de contrasenia.
+        -->
+        <sql splitStatements="false" stripComments="false">CREATE OR REPLACE TRIGGER trg_usuario_pwd_hist_purga
+AFTER INSERT ON usuario_password_historico
+BEGIN
+    DELETE FROM usuario_password_historico
+     WHERE password_history_id IN (
+         SELECT password_history_id
+           FROM (
+               SELECT password_history_id,
+                      ROW_NUMBER() OVER (PARTITION BY user_id
+                                         ORDER BY created_at DESC, password_history_id DESC) AS rn
+                 FROM usuario_password_historico
+           )
+          WHERE rn &gt; 3
+     );
+END;</sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_usuario_pwd_hist_purga</sql>
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
