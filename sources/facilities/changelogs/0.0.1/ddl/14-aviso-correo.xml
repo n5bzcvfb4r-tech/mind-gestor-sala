@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-14-01" author="MIND">
+        <comment>Outbox transaccional de avisos por correo (ARC-115): solicitud de aviso con contenido congelado, idempotencia por clave de negocio y estado de entrega</comment>
+        <!--
+            Esta es la tabla OUTBOX del patron ADR-006: la solicitud de aviso se INSERTA en la MISMA
+            transaccion que el alta de la incidencia o que su transicion de estado. De ese modo un
+            servidor SMTP caido nunca revierte la operacion de negocio (AC-AVI-05) y ningun aviso se
+            pierde al reiniciar el contenedor: la solicitud ya esta confirmada en la base y el
+            despachador la recoge cuando vuelve a levantarse.
+
+            DECISION 1 - notification_id es la PK FISICA y dispatch_id su columna VIRTUAL. El
+            inventario T.5 ARC-115 nombra la clave notification_id VARCHAR2(36) (uuid) y la tabla
+            hermana aviso_correo_intento (ARC-119) la referencia con ese mismo nombre; REQ-130, en
+            cambio, la llama dispatch_id. dispatch_id se publica como columna VIRTUAL de solo lectura
+            calculada sobre notification_id (misma tecnica que incidencia.status_code,
+            incidencia.reported_by_user_id y incidencia_historico.value_before), de modo que
+            ambos nombres existen a la vez, no ocupa almacenamiento y Oracle responde ORA-54013 a
+            quien intente escribirla. Es la UNICA forma de que la FK de ARC-119 y el nombre del
+            requisito convivan: una columna virtual no puede ser clave primaria ni destino de una
+            clave ajena, asi que la fisica tiene que ser notification_id.
+
+            DECISION 2 - status es la columna FISICA (con su DEFAULT 'PENDIENTE' y su CHECK) y
+            status_code la VIRTUAL, exactamente igual que en la tabla incidencia. El DoD de esta
+            tarea nombra `status` y T.5 ARC-115 nombra `status_code`; el desempate es tecnico, porque
+            un DEFAULT y una restriccion CHECK solo se pueden declarar sobre la columna fisica.
+
+            DECISION 3 - notification_key VARCHAR2(120 CHAR), que es la longitud del inventario T.5
+            ARC-115 (el DoD de la tarea cita 100). Se toma la de T.5 porque es un SUPERCONJUNTO:
+            acepta toda clave valida de 100 caracteres y es ademas la longitud que usaran las TSK de
+            API posteriores, de modo que no habra que alterar la columna mas adelante.
+            notification_key es la clave de negocio que hace IDEMPOTENTE tanto el reintento como el
+            doble submit del formulario: su UNIQUE devuelve ORA-00001 al segundo INSERT con la misma
+            clave, que es justo lo que pide REQ-137.
+
+            DECISION 4 - body_text, body_html y subject son NULABLES pese a que T.5 los marca
+            obligatorios: el DoD de esta tarea los declara opcionales y es ademas la unica lectura
+            coherente con el ciclo de vida de la fila. Una fila SUPRIMIDA (REQ-140) o DESCARTADA por
+            COMPOSICION_INCOMPLETA (REQ-138) se registra SIN contenido compuesto, porque la
+            composicion nunca llego a producirse; exigirlos NOT NULL impediria registrar la
+            supresion, que es exactamente lo que el DoD pide trazar.
+
+            body_text y body_html son el SNAPSHOT CONGELADO del mensaje (REQ-138 / REQ-142): un
+            reintento o un reenvio manual reutilizan este contenido tal cual y NO lo recomponen, de
+            modo que el correo que acaba saliendo es siempre el que se aprobo al encolar. Son CLOB y
+            por eso NINGUN indice de arbol B los toca, cosa que Oracle rechaza de plano.
+
+            recipient_email es el snapshot del destinatario en el instante del encolado (REQ-137). Es
+            NULABLE a proposito: el aviso NEW_INCIDENT_ALERT va dirigido al COLECTIVO de tecnicos de
+            mantenimiento, cuyos destinatarios se resuelven contra el directorio en el momento del
+            despacho (REQ-082 / REQ-131) y no en el encolado; exigirlo NOT NULL romperia el INSERT
+            del outbox dentro de la transaccion del alta de la incidencia.
+
+            created_at lleva DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) y no SYSTIMESTAMP a secas: toda
+            marca de tiempo del proyecto es naive en UTC, y esta columna es ademas el criterio de
+            ORDEN FIFO con el que el despachador toma las solicitudes pendientes (REQ-132).
+
+            max_attempts NUMBER DEFAULT 3 NOT NULL es el tope de reintentos de REQ-134 / REQ-142,
+            cuyo valor por defecto es el de configuracion_smtp.max_attempts (ARC-109, por defecto 3).
+            Vive en la propia fila para que ck_aviso_correo_intentos pueda compararlo con
+            attempt_count sin tener que consultar otra tabla, cosa que una CHECK no puede hacer.
+
+            NINGUNA FK declara ON DELETE, ni CASCADE ni SET NULL: la traza del aviso sobrevive al
+            ciclo de vida de cuentas y catalogos, que es de desactivacion y nunca de borrado.
+        -->
+        <sql>CREATE TABLE aviso_correo (
+    notification_id         VARCHAR2(36 CHAR) NOT NULL,
+    notification_key        VARCHAR2(120 CHAR) NOT NULL,
+    notification_type       VARCHAR2(40 CHAR) NOT NULL,
+    incident_id             NUMBER,
+    history_entry_id        NUMBER,
+    recipient_user_id       NUMBER,
+    recipient_email         VARCHAR2(254 CHAR),
+    subject                 VARCHAR2(255 CHAR),
+    body_text               CLOB,
+    body_html               CLOB,
+    status                  VARCHAR2(20 CHAR) DEFAULT 'PENDIENTE' NOT NULL,
+    previous_status_code    VARCHAR2(20 CHAR),
+    new_status_code         VARCHAR2(20 CHAR),
+    suppression_reason_code VARCHAR2(30 CHAR),
+    suppressed_at           TIMESTAMP(6),
+    attempt_count           NUMBER DEFAULT 0 NOT NULL,
+    max_attempts            NUMBER DEFAULT 3 NOT NULL,
+    next_attempt_at         TIMESTAMP(6),
+    locked_by               VARCHAR2(60 CHAR),
+    locked_at               TIMESTAMP(6),
+    last_error_code         VARCHAR2(50 CHAR),
+    last_error_message      VARCHAR2(500 CHAR),
+    message_id              VARCHAR2(255 CHAR),
+    sent_at                 TIMESTAMP(6),
+    resent_by_user_id       NUMBER,
+    resent_at               TIMESTAMP(6),
+    created_at              TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    dispatch_id             GENERATED ALWAYS AS (CAST(notification_id AS VARCHAR2(36 CHAR))) VIRTUAL,
+    status_code             GENERATED ALWAYS AS (CAST(status AS VARCHAR2(20 CHAR))) VIRTUAL,
+    CONSTRAINT pk_aviso_correo PRIMARY KEY (notification_id),
+    CONSTRAINT uk_aviso_correo_notif_key UNIQUE (notification_key),
+    CONSTRAINT fk_aviso_correo_incidencia FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id),
+    CONSTRAINT fk_aviso_correo_historico FOREIGN KEY (history_entry_id) REFERENCES incidencia_historico (history_id),
+    CONSTRAINT fk_aviso_correo_destinatario FOREIGN KEY (recipient_user_id) REFERENCES usuario (user_id),
+    CONSTRAINT fk_aviso_correo_prev_status FOREIGN KEY (previous_status_code) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_aviso_correo_new_status FOREIGN KEY (new_status_code) REFERENCES cat_estado_incidencia (status_code),
+    CONSTRAINT fk_aviso_correo_resent_by FOREIGN KEY (resent_by_user_id) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="aviso_correo"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-14-02" author="MIND">
+        <comment>Enumerados y reglas de coherencia del aviso: tipo, estado de entrega, vinculo con la incidencia y su historico, supresion motivada y tope de reintentos</comment>
+        <!--
+            ck_aviso_correo_tipo y ck_aviso_correo_status son los enumerados CERRADOS de T.5 ARC-115
+            y REQ-142, con los valores EN ESPAÑOL del catalogo cat_estados_envio:
+            PENDIENTE -&gt; ENVIANDO -&gt; ENVIADO | FALLIDO | DESCARTADO | SUPRIMIDO. Son los valores que
+            se PERSISTEN en la columna, no etiquetas de presentacion: la capa de interfaz puede
+            traducirlos, pero la base solo admite estos.
+
+            ck_aviso_correo_attempt_count y ck_aviso_correo_max_attempts acotan por abajo el contador
+            y el tope (ningun intento negativo, ningun tope por debajo de un unico envio), y
+            ck_aviso_correo_intentos materializa literalmente el "attempt_count &lt;= max_attempts" de
+            REQ-134 y REQ-142: agotado el tope, la solicitud no puede seguir sumando intentos y
+            termina en FALLIDO o DESCARTADO.
+
+            ck_aviso_correo_motivo_sup fija el enumerado cerrado de motivos de supresion y
+            ck_aviso_correo_supresion materializa el "si y solo si" del DoD y de REQ-140: el motivo y
+            la marca de supresion se informan EXACTAMENTE cuando el estado es SUPRIMIDO, y en ningun
+            otro caso. Las dos ramas son necesarias porque una CHECK solo RECHAZA la fila cuando su
+            predicado evalua a FALSE: sin la rama negativa, una fila PENDIENTE con un motivo de
+            supresion colado pasaria el filtro sin que nada la detuviese.
+
+            ck_aviso_correo_vinculo ata el tipo de aviso con sus referencias: el aviso de alta cuelga
+            de la incidencia y NO de una entrada de historico; el de cambio de estado cuelga de AMBOS,
+            que es precisamente lo que hace significativo el indice unico (incident_id,
+            history_entry_id) del changeset 14-03 (REQ-137: un unico aviso por entrada de historial);
+            y los avisos de credencial no son de incidencia, por lo que no llevan ni incidencia ni
+            asiento y en cambio exigen destinatario individual. Esta CHECK es ademas la PRECONDICION
+            de los dos indices unicos parciales: sin ella, una fila NEW_INCIDENT_ALERT con incident_id
+            nulo se escaparia de la unicidad, porque Oracle no indexa las claves integramente nulas.
+
+            ck_aviso_correo_transicion recoge REQ-137, que exige previous_status_code y
+            new_status_code obligatorios y tomados de cat_estado_incidencia (lo garantizan las FK del
+            changeset 14-01) en el aviso de cambio de estado, y que no tienen sentido en los demas
+            tipos. Se exige ademas que ambos difieran: un "cambio" al mismo estado no es una
+            transicion y no genera aviso.
+
+            ck_aviso_correo_enviado transcribe las notas de T.5 ARC-115 ("message_id obligatorio
+            cuando el estado es ENVIADO", "sent_at obligatorio cuando el estado es ENVIADO"). Es la
+            base de la idempotencia de AC-AVI-06: una solicitud reprocesada despues de caer el worker
+            se reconoce ya entregada por su message_id y no produce un segundo correo.
+
+            ck_aviso_correo_locked transcribe "locked_by informado solo mientras el estado es
+            ENVIANDO" (T.5 ARC-115 / REQ-132): al devolver a PENDIENTE una solicitud atascada, el
+            despachador DEBE soltar el testigo del worker que la tenia tomada, o nadie mas volveria a
+            recogerla. locked_at queda deliberadamente FUERA de la CHECK porque es la base del
+            calculo de la ventana de recuperacion y conserva valor como traza del ultimo bloqueo.
+
+            Nota explicita: la invariante "next_attempt_at siempre futura" (REQ-134) NO se puede
+            expresar como CHECK, porque Oracle prohibe SYSDATE / SYSTIMESTAMP y en general cualquier
+            funcion no determinista dentro de una restriccion de comprobacion. Esa invariante queda
+            en la capa de servicio del despachador, que es quien calcula la proxima ventana.
+        -->
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_tipo CHECK (
+    notification_type IN ('NEW_INCIDENT_ALERT','STATUS_CHANGE_ALERT','CREDENTIAL_ISSUED','PASSWORD_RESET')
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_status CHECK (
+    status IN ('PENDIENTE','ENVIANDO','ENVIADO','FALLIDO','DESCARTADO','SUPRIMIDO')
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_attempt_count CHECK (
+    attempt_count &gt;= 0
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_max_attempts CHECK (
+    max_attempts &gt;= 1
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_intentos CHECK (
+    attempt_count &lt;= max_attempts
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_motivo_sup CHECK (
+    suppression_reason_code IN ('USUARIO_DESACTIVADO','SIN_CORREO','DESTINATARIO_NO_RESOLUBLE','NO_RECIPIENTS','COMPOSICION_INCOMPLETA')
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_supresion CHECK (
+    (status = 'SUPRIMIDO' AND suppression_reason_code IS NOT NULL AND suppressed_at IS NOT NULL)
+ OR (status &lt;&gt; 'SUPRIMIDO' AND suppression_reason_code IS NULL AND suppressed_at IS NULL)
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_vinculo CHECK (
+    (notification_type = 'NEW_INCIDENT_ALERT'  AND incident_id IS NOT NULL AND history_entry_id IS NULL)
+ OR (notification_type = 'STATUS_CHANGE_ALERT' AND incident_id IS NOT NULL AND history_entry_id IS NOT NULL)
+ OR (notification_type IN ('CREDENTIAL_ISSUED','PASSWORD_RESET')
+        AND incident_id IS NULL AND history_entry_id IS NULL AND recipient_user_id IS NOT NULL)
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_transicion CHECK (
+    (notification_type = 'STATUS_CHANGE_ALERT'
+        AND previous_status_code IS NOT NULL AND new_status_code IS NOT NULL
+        AND previous_status_code &lt;&gt; new_status_code)
+ OR (notification_type &lt;&gt; 'STATUS_CHANGE_ALERT'
+        AND previous_status_code IS NULL AND new_status_code IS NULL)
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_enviado CHECK (
+    status &lt;&gt; 'ENVIADO' OR (message_id IS NOT NULL AND sent_at IS NOT NULL)
+)</sql>
+        <sql>ALTER TABLE aviso_correo ADD CONSTRAINT ck_aviso_correo_locked CHECK (
+    status = 'ENVIANDO' OR locked_by IS NULL
+)</sql>
+        <rollback>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_locked</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_enviado</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_transicion</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_vinculo</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_supresion</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_motivo_sup</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_intentos</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_max_attempts</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_attempt_count</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_status</sql>
+            <sql>ALTER TABLE aviso_correo DROP CONSTRAINT ck_aviso_correo_tipo</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
