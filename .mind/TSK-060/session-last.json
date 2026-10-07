@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-060",
+  "attempt": 1,
+  "at": "2026-10-07T15:19:19.619219+00:00",
+  "construction_id": "9a9f1830-a085-46ed-89a7-bf7c34360102",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-060 · Índices, vistas de filtro y agregación para bandeja, búsqueda acento-insensible y recuentos.\n\nENTREGA (un único fichero nuevo, dentro de la zona de la tarea): `sources/facilities/changelogs/0.0.1/ddl/17-indices-consulta.xml`, 11 changesets `ddl-0.0.1-17-01..11`, autor MIND, todos con `<rollback>`. Lo recoge automáticamente el maestro de release vía `<includeAll path=\"0.0.1/ddl\">` de `changelog-0.0.1.xml` → `sources/facilities/master.xml`; NO se ha creado un segundo maestro ni se ha toc",
+  "model": "claude-opus-5",
+  "input_tokens": 7025562,
+  "output_tokens": 82451,
+  "llm_calls": 145,
+  "cost_usd": 11.077171000000003,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "d3b4376",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}

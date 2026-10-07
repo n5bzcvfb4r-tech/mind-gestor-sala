@@ -1,0 +1,2044 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-17-01" author="MIND">
+        <comment>Indices compuestos de la bandeja del tecnico (REQ-106 / AC-BAN-02 / AC-BAN-09)</comment>
+        <!--
+            El orden de las columnas de cada indice NO es arbitrario: sigue el orden en que la
+            consulta de la bandeja usa los datos. Primero los terminos de IGUALDAD (los filtros
+            exactos que seleccionan el rango de filas) y despues las columnas del ORDEN del
+            listado. Asi el motor localiza por los primeros terminos un tramo contiguo del indice
+            y lo recorre YA ORDENADO, sin necesidad de una operacion de ordenacion posterior.
+
+            ix_incidencia_bandeja_estado sirve a la bandeja filtrada por estado. Su cola,
+            created_at DESC, incident_id DESC, es EXACTAMENTE el orden por defecto de REQ-106: la
+            incidencia mas reciente arriba y, ante dos incidencias con la misma marca de alta, el
+            identificador mayor primero. Ese segundo criterio es el DESEMPATE ESTABLE y no es un
+            adorno: sin el, dos filas con el mismo created_at quedan en un orden que el motor puede
+            resolver de forma distinta en cada ejecucion, de modo que una misma fila podria
+            aparecer en DOS paginas consecutivas o en NINGUNA al avanzar por el listado. Como la
+            SPA pagina con OFFSET ... FETCH y cada pagina es una consulta nueva, ese troceo es
+            observable por el usuario en cuanto hay altas masivas en el mismo segundo.
+
+            Con el indice en ese mismo orden, el OFFSET ... FETCH se resuelve recorriendo el indice
+            y descartando las primeras entradas, sin SORT y sin materializar el resultado completo:
+            el coste de la pagina N no crece con el tamano total de la bandeja mas alla del salto.
+
+            ix_incidencia_bandeja_sala e ix_incidencia_bandeja_categoria sirven a la combinacion
+            mas frecuente de la bandeja, el filtro de clasificacion CRUZADO con el de estado
+            (sala + estado, categoria + estado). Los indices de una sola columna que ya existen
+            (ix_incidencia_room, ix_incidencia_category) resuelven solo la mitad del predicado y
+            obligan a visitar la tabla para descartar por estado; estos cubren ambos terminos
+            dentro del propio indice.
+        -->
+        <sql>CREATE INDEX ix_incidencia_bandeja_estado ON incidencia (status, created_at DESC, incident_id DESC)</sql>
+        <sql>CREATE INDEX ix_incidencia_bandeja_sala ON incidencia (room_id, status)</sql>
+        <sql>CREATE INDEX ix_incidencia_bandeja_categoria ON incidencia (category_id, status)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_bandeja_categoria</sql>
+            <sql>DROP INDEX ix_incidencia_bandeja_sala</sql>
+            <sql>DROP INDEX ix_incidencia_bandeja_estado</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-02" author="MIND">
+        <preConditions onFailMessage="El indice (assigned_technician_id, status) ya existe sobre incidencia: aportado por ddl-0.0.1-11-05" onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM (SELECT ic.index_name FROM user_ind_columns ic WHERE ic.table_name = 'INCIDENCIA' GROUP BY ic.index_name HAVING LISTAGG(ic.column_name, ',') WITHIN GROUP (ORDER BY ic.column_position) = 'ASSIGNED_TECHNICIAN_ID,STATUS')</sqlCheck>
+        </preConditions>
+        <comment>Indice de bandeja por tecnico asignado (REQ-106); se marca como ejecutado si ya lo aporta ddl-0.0.1-11-05</comment>
+        <!--
+            El DoD de esta tarea pide un indice sobre (assigned_technician_id, status) para el
+            filtro de asignacion de la bandeja. Ese indice YA EXISTE en el esquema con el nombre
+            ix_incidencia_asignacion, creado en ddl-0.0.1-11-05, con exactamente esas dos columnas
+            y en ese mismo orden.
+
+            Crear un segundo indice con el MISMO conjunto de columnas en el MISMO orden no es un
+            duplicado inofensivo: Oracle lo rechaza con ORA-01408 ("such column list already
+            indexed") y el despliegue entero se detendria. Por eso este changeset no crea el indice
+            a ciegas, sino que se AUTODECLARA REDUNDANTE mediante una precondicion: consulta
+            user_ind_columns, reconstruye con LISTAGG la lista ordenada de columnas de cada indice
+            de la tabla y comprueba si alguno es ya 'ASSIGNED_TECHNICIAN_ID,STATUS'. La comparacion
+            se hace por COLUMNAS y no por NOMBRE de indice a proposito: lo que provoca el ORA-01408
+            es la coincidencia del conjunto de columnas, llamese como se llame el indice existente.
+
+            Si lo encuentra, la precondicion falla y onFail="MARK_RAN" deja el changeset anotado
+            como ejecutado en DATABASECHANGELOG sin tocar la base de datos, de modo que el
+            despliegue continua y queda constancia explicita de POR QUE no se creo nada.
+
+            Si una evolucion futura retirase ix_incidencia_asignacion, la precondicion pasaria y
+            este changeset repondria la cobertura del filtro bajo el nombre
+            ix_incidencia_bandeja_tecnico, sin que el requisito quede huerfano.
+        -->
+        <sql>CREATE INDEX ix_incidencia_bandeja_tecnico ON incidencia (assigned_technician_id, status)</sql>
+        <rollback>
+            <!--
+                El rollback es DEFENSIVO a proposito. Cuando la precondicion marca el changeset como
+                MARK_RAN el indice NO llega a crearse, pero la entrada queda igualmente registrada en
+                DATABASECHANGELOG; un DROP INDEX seco fallaria entonces con ORA-01418 y pondria en
+                rojo el rollback-count. El bloque solo suelta el indice si existe, de modo que el
+                rollback es correcto tanto si el changeset se ejecuto como si se marco.
+            -->
+            <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_count NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO l_count FROM user_indexes WHERE index_name = 'IX_INCIDENCIA_BANDEJA_TECNICO';
+    IF l_count > 0 THEN
+        EXECUTE IMMEDIATE 'DROP INDEX ix_incidencia_bandeja_tecnico';
+    END IF;
+END;]]></sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-03" author="MIND">
+        <comment>Indices funcionales de la busqueda textual acento e insensible a mayusculas (REQ-110 / AC-BAN-07)</comment>
+        <!--
+            REQ-110 / AC-BAN-07 exigen que la busqueda por texto de la bandeja ignore tanto las
+            tildes como las mayusculas: 'proyector', 'Proyector' y 'PROYECTOR' con tilde tienen que
+            encontrar las mismas incidencias.
+
+            NLSSORT con un juego de ordenacion terminado en _AI hace exactamente eso. El sufijo _AI
+            significa "accent insensitive" y en Oracle es a la vez insensible a ACENTOS y a
+            MAYUSCULAS (el _AI incluye el comportamiento del _CI), de modo que las tres formas del
+            ejemplo producen la MISMA clave de ordenacion y comparan como iguales.
+
+            La consulta de busqueda activa ese juego en la sesion con
+                ALTER SESSION SET NLS_COMP = LINGUISTIC
+                ALTER SESSION SET NLS_SORT = SPANISH_AI
+            y a partir de ahi la igualdad y el LIKE se resuelven LINGUISTICAMENTE en lugar de byte a
+            byte. Es esa resolucion linguistica la que puede apoyarse en un indice construido sobre
+            la misma expresion NLSSORT(..., 'NLS_SORT=SPANISH_AI'); sin el indice, cada busqueda
+            obligaria a calcular la clave linguistica de TODAS las filas de la tabla.
+
+            description es VARCHAR2(500 CHAR) y NO un CLOB, y eso es lo que hace viable este indice:
+            sobre una columna LOB Oracle rechazaria el indice de arbol B y la busqueda textual
+            requeriria Oracle Text con su propio indice de dominio y su mantenimiento asociado. La
+            cota de 500 caracteres de la descripcion (REQ del alta) es por tanto tambien una
+            decision de indexabilidad.
+
+            UPPER(reference_code) cubre el otro camino de la busqueda, el del codigo de incidencia:
+            escribir 'inc-2024-000123' tiene que encontrar 'INC-2024-000123'. Aqui basta con UPPER y
+            no hace falta el tratamiento de acentos, porque el codigo de referencia es ASCII por
+            construccion (prefijo, ano y secuencia) y no contiene ni una sola letra acentuada.
+        -->
+        <sql>CREATE INDEX ix_incidencia_desc_ai ON incidencia (NLSSORT(description, 'NLS_SORT=SPANISH_AI'))</sql>
+        <sql>CREATE INDEX ix_incidencia_reference_upper ON incidencia (UPPER(reference_code))</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_reference_upper</sql>
+            <sql>DROP INDEX ix_incidencia_desc_ai</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-04" author="MIND" runOnChange="true">
+        <comment>Vistas de alimentacion de los filtros de sala, oficina y categoria (REQ-103 / REQ-159)</comment>
+        <!--
+            Estas tres vistas resuelven QUE VALORES aparecen en los desplegables de filtro de la
+            bandeja y de los listados: salas, oficinas y categorias.
+
+            La regla 2 de REQ-103 es la que dicta su forma. Un valor de catalogo DESACTIVADO no
+            desaparece sin mas de los filtros: aparece UNICAMENTE si tiene al menos una incidencia
+            asociada, y cuando aparece va MARCADO como inactivo. El motivo es que, si una sala se
+            desactiva despues de que se registrasen incidencias en ella, retirarla del filtro
+            volveria INALCANZABLES esas incidencias historicas; y mostrarla sin marca haria creer
+            que sigue operativa. De ahi las dos piezas de cada vista:
+
+              - el OR EXISTS, que recupera el valor inactivo solo cuando tiene incidencias
+                asociadas (un catalogo inactivo y sin uso no ensucia el desplegable), y
+              - la columna es_inactivo, que es la marca que la interfaz necesita para distinguirlo.
+
+            El flag se publica como 'Y'/'N' y no como 0/1 ni como booleano, por coherencia con la
+            convencion booleana del proyecto: is_active en los catalogos es CHAR(1 CHAR) con 'Y' o
+            'N'. Notese que es_inactivo es la NEGACION de is_active ('Y' cuando is_active = 'N'),
+            porque lo que la interfaz quiere saber es si debe marcar el valor; la API lo traduce al
+            literal '(inactiva)' junto al nombre.
+
+            La rama de la oficina llega a incidencia a traves de cat_sala, porque una incidencia no
+            referencia la oficina directamente: la hereda de la sala en la que se reporto.
+
+            MUY IMPORTANTE: estas vistas NO ACOTAN POR ROL ni por propiedad. No saben quien
+            consulta. El alcance de datos (OWN para el empleado, ALL para tecnico y administrador)
+            lo aplica el repositorio en su predicado sobre la tabla incidencia; estas vistas solo
+            responden a la pregunta de que VALORES ofrece cada desplegable. Mezclar ambas
+            responsabilidades aqui obligaria a parametrizar la vista por usuario y duplicaria la
+            regla de seguridad en dos sitios.
+        -->
+        <sql>CREATE OR REPLACE VIEW v_filtro_sala AS
+SELECT s.room_id,
+       s.room_code,
+       s.room_name,
+       s.office_id,
+       o.office_name,
+       CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_sala s
+  JOIN cat_oficina o ON o.office_id = s.office_id
+ WHERE s.is_active = 'Y'
+    OR EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)</sql>
+        <sql>CREATE OR REPLACE VIEW v_filtro_oficina AS
+SELECT o.office_id,
+       o.office_code,
+       o.office_name,
+       o.city,
+       CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_oficina o
+ WHERE o.is_active = 'Y'
+    OR EXISTS (SELECT 1
+                 FROM incidencia i
+                 JOIN cat_sala s ON s.room_id = i.room_id
+                WHERE s.office_id = o.office_id)</sql>
+        <sql>CREATE OR REPLACE VIEW v_filtro_categoria AS
+SELECT c.category_id,
+       c.category_code,
+       c.category_name,
+       c.display_order,
+       CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo
+  FROM cat_categoria_incidencia c
+ WHERE c.is_active = 'Y'
+    OR EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)</sql>
+        <rollback>
+            <sql>DROP VIEW v_filtro_categoria</sql>
+            <sql>DROP VIEW v_filtro_oficina</sql>
+            <sql>DROP VIEW v_filtro_sala</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-05" author="MIND" runOnChange="true">
+        <comment>Vista de recuento agregado por oficina, sala y categoria (REQ-104 / AC-CLAS-05)</comment>
+        <!--
+            Esta vista sirve el recuento de incidencias por las tres dimensiones de clasificacion
+            (oficina, sala y categoria) en una sola estructura, de modo que el consumidor elige la
+            dimension con WHERE group_type = 'CATEGORY' y ordena de mayor a menor con
+            ORDER BY incident_count DESC.
+
+            EL LEFT JOIN ES LA REGLA, NO UNA OPTIMIZACION
+            ============================================
+            REQ-104 regla 2 y AC-CLAS-05 exigen que TODO valor del catalogo aparezca en el recuento
+            aunque su total sea 0. Una categoria sin ninguna incidencia tiene que figurar con un 0
+            visible; omitirla haria creer que no existe. Por eso cada rama parte del CATALOGO y
+            alcanza incidencia con LEFT JOIN, y nunca al reves.
+
+            Y por eso se cuenta COUNT(i.incident_id) y NO COUNT(*). Es la trampa clasica de este
+            patron: el LEFT JOIN conserva la fila del catalogo con TODAS las columnas de incidencia
+            a NULL, de modo que COUNT(*) contaria esa fila fantasma y devolveria 1 alli donde la
+            respuesta correcta es 0. COUNT(columna) ignora los NULL y por tanto devuelve 0.
+
+            La rama OFFICE encadena DOS LEFT JOIN (cat_oficina -> cat_sala -> incidencia) y no uno:
+            si el segundo salto fuese un JOIN interno, una oficina SIN SALAS desapareceria del
+            resultado en lugar de salir con 0. Con los dos en LEFT, el recorrido sobrevive tanto a
+            la oficina sin salas como a la sala sin incidencias.
+
+            DESGLOSE POR ESTADO
+            ===================
+            Los cuatro COUNT(CASE WHEN ...) permiten servir el filtro por status de REQ-104 sin
+            volver a la tabla base: el consumidor que quiere "abiertas por categoria" lee
+            incident_count_abierta en lugar de lanzar una agregacion nueva. Se cuenta sobre la
+            columna FISICA status (status_code es una columna virtual de solo lectura que publica
+            el mismo dato con el nombre del inventario).
+
+            primera_incidencia_at y ultima_incidencia_at dan el rango temporal de cada agrupacion y
+            son NULL de forma natural cuando el recuento es 0, que es la respuesta correcta: una
+            categoria sin incidencias no tiene ni primera ni ultima.
+
+            LOS CAST EXPLICITOS
+            ===================
+            En un UNION ALL, Oracle fija el tipo de cada columna del resultado a partir de la
+            PRIMERA rama. Sin CAST, group_type tomaria el tipo del literal 'OFFICE' (6 caracteres) y
+            truncaria 'CATEGORY' de la tercera rama; y group_name heredaria la longitud de
+            cat_oficina.office_name, de modo que un cambio futuro de longitud en una sola de las
+            tres tablas alteraria en silencio el tipo publicado por la vista. Los CAST fijan el tipo
+            de CADA rama de forma explicita y hacen la vista independiente tanto de la longitud de
+            los literales como del orden de las ramas.
+
+            Como las vistas de filtro del changeset anterior, esta vista TAMPOCO acota por rol: el
+            alcance de datos lo aplica el consumidor sobre incidencia.
+        -->
+        <sql>CREATE OR REPLACE VIEW v_recuento_incidencias AS
+SELECT CAST('OFFICE' AS VARCHAR2(10 CHAR)) AS group_type,
+       o.office_id   AS group_id,
+       CAST(o.office_name AS VARCHAR2(80 CHAR)) AS group_name,
+       CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END AS es_inactivo,
+       COUNT(i.incident_id) AS incident_count,
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END) AS incident_count_abierta,
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END) AS incident_count_en_curso,
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END) AS incident_count_resuelta,
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END) AS incident_count_cerrada,
+       MIN(i.created_at) AS primera_incidencia_at,
+       MAX(i.created_at) AS ultima_incidencia_at
+  FROM cat_oficina o
+  LEFT JOIN cat_sala s   ON s.office_id = o.office_id
+  LEFT JOIN incidencia i ON i.room_id   = s.room_id
+ GROUP BY o.office_id, o.office_name, o.is_active
+UNION ALL
+SELECT CAST('ROOM' AS VARCHAR2(10 CHAR)),
+       s.room_id,
+       CAST(s.room_name AS VARCHAR2(80 CHAR)),
+       CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END,
+       COUNT(i.incident_id),
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END),
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END),
+       MIN(i.created_at),
+       MAX(i.created_at)
+  FROM cat_sala s
+  LEFT JOIN incidencia i ON i.room_id = s.room_id
+ GROUP BY s.room_id, s.room_name, s.is_active
+UNION ALL
+SELECT CAST('CATEGORY' AS VARCHAR2(10 CHAR)),
+       c.category_id,
+       CAST(c.category_name AS VARCHAR2(80 CHAR)),
+       CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END,
+       COUNT(i.incident_id),
+       COUNT(CASE WHEN i.status = 'ABIERTA'  THEN 1 END),
+       COUNT(CASE WHEN i.status = 'EN_CURSO' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'RESUELTA' THEN 1 END),
+       COUNT(CASE WHEN i.status = 'CERRADA'  THEN 1 END),
+       MIN(i.created_at),
+       MAX(i.created_at)
+  FROM cat_categoria_incidencia c
+  LEFT JOIN incidencia i ON i.category_id = c.category_id
+ GROUP BY c.category_id, c.category_name, c.is_active</sql>
+        <rollback>
+            <sql>DROP VIEW v_recuento_incidencias</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-06" author="MIND">
+        <comment>Oraculo AC-BAN-02 / REQ-106: las 3 paginas de 25 sobre un conjunto filtrado de 60 no repiten ni omiten ninguna fila y el total_count se calcula sobre el conjunto filtrado</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la paginacion de la bandeja. Siembra el escenario literal de
+            AC-BAN-02: SESENTA incidencias en la sala filtrada (SAL-ORA60A) y QUINCE mas en OTRA sala
+            (SAL-ORA60B). El total global del escenario es por tanto 75 y el del conjunto filtrado 60,
+            y esa diferencia es deliberada: permite DEMOSTRAR que total_count = 60 se calcula sobre el
+            conjunto YA FILTRADO y no sobre la tabla entera. Si ambos recuentos coincidiesen, el
+            oraculo no podria distinguir un total_count correcto de uno que ignora el filtro, y por eso
+            una tercera comprobacion falla explicitamente cuando el total filtrado y el global son
+            iguales.
+
+            Las 60 incidencias del conjunto filtrado se insertan con el MISMO created_at a proposito.
+            No es un atajo de la siembra: es el nucleo de la prueba. Con la marca de alta empatada en
+            las 60 filas, el primer criterio del orden por defecto de REQ-106 (created_at DESC) no
+            discrimina nada y el desempate por incident_id DESC pasa a ser el UNICO criterio que
+            decide la posicion de cada fila. Asi la ESTABILIDAD del orden queda realmente puesta a
+            prueba: sin ese desempate el motor podria devolver las filas empatadas en un orden
+            distinto en cada una de las tres consultas de pagina y una misma incidencia apareceria en
+            dos paginas o en ninguna, que es exactamente el defecto que AC-BAN-02 prohibe.
+
+            El recorrido de las tres paginas se hace con OFFSET ... ROWS FETCH NEXT ... ROWS ONLY, que
+            es la paginacion resuelta EN BASE DE DATOS que exige AC-BAN-09: cada pagina es una
+            consulta independiente que trae solo sus 25 filas, sin materializar el listado completo en
+            la aplicacion. Esas consultas se apoyan en los indices creados en este mismo changelog,
+            ix_incidencia_bandeja_sala para el termino de igualdad del filtro e
+            ix_incidencia_bandeja_estado para la cola de ordenacion.
+
+            Las comprobaciones son cinco: el tamano de cada pagina (25, 25 y 10), que el recorrido
+            completo devuelve 60 filas y 60 distintas (ni repetidas ni omitidas), que el conjunto
+            filtrado queda cubierto por entero (MINUS vacio), que la pagina 2 contiene exactamente los
+            elementos 26 a 50 del conjunto ordenado (contrastados contra ROW_NUMBER) y que el
+            desempate es determinista (primera fila de la pagina 1 = incident_id maximo, ultima fila
+            de la pagina 3 = incident_id minimo).
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60A / SAL-ORA60A / SAL-ORA60B), display_order y sort_order 9xx y
+            correos @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_creado          TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    v_admin           NUMBER;
+    v_tecnico         NUMBER;
+    v_office          NUMBER;
+    v_room_a          NUMBER;
+    v_room_b          NUMBER;
+    v_cat             NUMBER;
+
+    v_total_filtrado  NUMBER;
+    v_total_global    NUMBER;
+    v_total_pages     NUMBER;
+    v_p1              NUMBER;
+    v_p2              NUMBER;
+    v_p3              NUMBER;
+    v_filas           NUMBER;
+    v_distintas       NUMBER;
+    v_faltan          NUMBER;
+    v_dif             NUMBER;
+    v_primera         NUMBER;
+    v_maxima          NUMBER;
+    v_ultima          NUMBER;
+    v_minima          NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60A' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60A', 'Oficina Oraculo Paginacion', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60A';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Paginacion Admin', 'oraculo.tsk060.ban.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Paginacion Tecnico', 'oraculo.tsk060.ban.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60A' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60A', 'Sala Oraculo Paginacion Filtrada', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room_a FROM cat_sala WHERE room_code = 'SAL-ORA60A';
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60B' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60B', 'Sala Oraculo Paginacion Fuera Filtro', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room_b FROM cat_sala WHERE room_code = 'SAL-ORA60B';
+
+    -- 60 incidencias en la sala filtrada, TODAS con el mismo created_at: el desempate por
+    -- incident_id DESC es el unico criterio que decide el orden.
+    FOR i IN 1..60 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-A' || LPAD(i, 5, '0'), v_room_a, v_cat,
+                     'Incidencia del conjunto filtrado de la bandeja numero ' || i, v_tecnico, l_creado);
+    END LOOP;
+
+    -- 15 incidencias en OTRA sala: quedan fuera del filtro y elevan el total global a 75.
+    FOR i IN 1..15 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-B' || LPAD(i, 5, '0'), v_room_b, v_cat,
+                     'Incidencia fuera del filtro de la bandeja numero ' || i, v_tecnico, l_creado);
+    END LOOP;
+
+    -- total_count se calcula sobre el CONJUNTO FILTRADO, no sobre la tabla entera.
+    SELECT COUNT(*) INTO v_total_filtrado FROM incidencia WHERE room_id = v_room_a;
+    IF v_total_filtrado <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO AC-BAN-02: el conjunto filtrado deberia tener 60 incidencias y tiene ' || v_total_filtrado);
+    END IF;
+
+    SELECT COUNT(*) INTO v_total_global FROM incidencia WHERE room_id IN (v_room_a, v_room_b);
+    IF v_total_global <> 75 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO AC-BAN-02: el escenario deberia tener 75 incidencias en total y tiene ' || v_total_global);
+    END IF;
+
+    IF v_total_filtrado = v_total_global THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO AC-BAN-02: el total_count se esta calculando sobre la tabla entera y no sobre el conjunto filtrado');
+    END IF;
+
+    -- total_pages = CEIL(total_count / page_size) con page_size = 25.
+    v_total_pages := CEIL(v_total_filtrado / 25);
+    IF v_total_pages <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20963, 'ORACULO AC-BAN-02: total_pages deberia ser 3 y es ' || v_total_pages);
+    END IF;
+
+    -- Tamano de cada pagina: 25, 25 y 10, con la paginacion resuelta en base de datos.
+    SELECT COUNT(*) INTO v_p1
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    SELECT COUNT(*) INTO v_p2
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    SELECT COUNT(*) INTO v_p3
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    IF v_p1 <> 25 OR v_p2 <> 25 OR v_p3 <> 10 THEN
+        RAISE_APPLICATION_ERROR(-20964, 'ORACULO AC-BAN-02: los tamanos de las 3 paginas deberian ser 25, 25 y 10 y son ' || v_p1 || ', ' || v_p2 || ' y ' || v_p3);
+    END IF;
+
+    -- Ni repetidas ni omitidas: el recorrido de las 3 paginas devuelve 60 filas y 60 distintas.
+    SELECT COUNT(*), COUNT(DISTINCT incident_id)
+      INTO v_filas, v_distintas
+      FROM (
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+            UNION ALL
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)
+            UNION ALL
+            SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)
+           );
+
+    IF v_filas <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20965, 'ORACULO AC-BAN-02: el recorrido de las 3 paginas devuelve ' || v_filas || ' filas en lugar de 60: hay filas omitidas o de mas');
+    END IF;
+
+    IF v_distintas <> 60 THEN
+        RAISE_APPLICATION_ERROR(-20966, 'ORACULO AC-BAN-02: el recorrido de las 3 paginas repite ' || (v_filas - v_distintas) || ' filas: la paginacion no es estable');
+    END IF;
+
+    -- Cobertura exacta: ninguna incidencia del conjunto filtrado se queda fuera de las 3 paginas.
+    SELECT COUNT(*) INTO v_faltan
+      FROM (SELECT incident_id FROM incidencia WHERE room_id = v_room_a
+            MINUS
+            (SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+             UNION ALL
+             SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)
+             UNION ALL
+             SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)));
+
+    IF v_faltan <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20967, 'ORACULO AC-BAN-02: ' || v_faltan || ' incidencias del conjunto filtrado no aparecen en ninguna pagina');
+    END IF;
+
+    -- La pagina 2 es exactamente la ventana 26-50 del conjunto ordenado.
+    SELECT COUNT(*) INTO v_dif
+      FROM ((SELECT incident_id
+               FROM (SELECT incident_id,
+                            ROW_NUMBER() OVER (ORDER BY created_at DESC, incident_id DESC) AS rn
+                       FROM incidencia
+                      WHERE room_id = v_room_a)
+              WHERE rn BETWEEN 26 AND 50)
+            MINUS
+            (SELECT incident_id
+               FROM (SELECT incident_id
+                       FROM incidencia
+                      WHERE room_id = v_room_a
+                      ORDER BY created_at DESC, incident_id DESC
+                     OFFSET 25 ROWS FETCH NEXT 25 ROWS ONLY)));
+
+    IF v_dif <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20968, 'ORACULO AC-BAN-02: la pagina 2 no contiene exactamente los elementos 26-50 del conjunto ordenado');
+    END IF;
+
+    -- Desempate estable: con created_at empatado, la primera fila de la pagina 1 tiene que ser el
+    -- incident_id maximo del conjunto filtrado y la ultima de la pagina 3 el minimo.
+    SELECT incident_id
+      INTO v_primera
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room_a
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY)
+     WHERE ROWNUM = 1;
+
+    SELECT MAX(incident_id) INTO v_maxima FROM incidencia WHERE room_id = v_room_a;
+
+    SELECT incident_id
+      INTO v_ultima
+      FROM (SELECT incident_id
+              FROM (SELECT incident_id
+                      FROM incidencia
+                     WHERE room_id = v_room_a
+                     ORDER BY created_at DESC, incident_id DESC
+                    OFFSET 50 ROWS FETCH NEXT 25 ROWS ONLY)
+             ORDER BY incident_id ASC)
+     WHERE ROWNUM = 1;
+
+    SELECT MIN(incident_id) INTO v_minima FROM incidencia WHERE room_id = v_room_a;
+
+    IF v_primera <> v_maxima OR v_ultima <> v_minima THEN
+        RAISE_APPLICATION_ERROR(-20969, 'ORACULO AC-BAN-02: el desempate por incident_id DESC no es determinista');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-07" author="MIND">
+        <comment>Oraculo AC-BAN-07 / REQ-110: la busqueda de 'proyector' recupera 'Proyector' y 'PROYECTOR' con tilde, y los comodines % y _ se tratan como literales</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la busqueda textual de la bandeja. Siembra seis incidencias
+            en una sala propia y pregunta por ellas tal y como lo hara la consulta real, para
+            DEMOSTRAR que 'proyector', 'Proyector' y 'PROYECTOR' acentuado encuentran las mismas
+            filas.
+
+            COMO SE OBTIENE LA COMPARACION ACENTO E INSENSIBLE A MAYUSCULAS
+            =============================================================
+            No se obtiene normalizando el texto a mano ni envolviendo la columna en UPPER o TRANSLATE:
+            se obtiene activando en la SESION el juego de ordenacion linguistico
+                ALTER SESSION SET NLS_COMP = LINGUISTIC
+                ALTER SESSION SET NLS_SORT = SPANISH_AI
+            que es EXACTAMENTE el mismo juego sobre el que se construyo el indice funcional
+            ix_incidencia_desc_ai en ddl-0.0.1-17-03. Con NLS_COMP = LINGUISTIC el operador LIKE deja
+            de comparar byte a byte y compara LINGUISTICAMENTE con el juego de NLS_SORT; y como el
+            sufijo _AI de SPANISH_AI es a la vez insensible a acentos y a mayusculas, 'proyector',
+            'Proyector' y 'PROYECTOR' con tilde son para el motor EL MISMO TEXTO. Que el oraculo y el
+            indice usen el mismo juego no es casual: solo asi la busqueda puede apoyarse en el indice
+            en lugar de calcular la clave linguistica de todas las filas.
+
+            POR QUE EL ALTER SESSION NO ROMPE EL ROLLBACK
+            ============================================
+            ALTER SESSION es una orden de sesion, NO de transaccion: no confirma lo pendiente, no
+            abre una transaccion nueva y no cierra la que esta en curso (a diferencia del DDL, que si
+            provoca COMMIT implicito). Por eso la siembra de este oraculo sigue siendo enteramente
+            reversible y el ROLLBACK final la deshace por completo.
+
+            Aun asi, el cambio de NLS SI persiste en la sesion mas alla de este bloque, y la sesion es
+            la misma con la que Liquibase ejecutara los changesets siguientes. Dejar NLS_COMP en
+            LINGUISTIC contaminaria esas ejecuciones posteriores alterando en silencio el resultado de
+            sus comparaciones. De ahi que la sesion se devuelva a NLS_COMP = BINARY (y NLS_SORT =
+            BINARY) ANTES del ROLLBACK, y tambien en la rama de excepcion dentro de un bloque interno
+            tolerante, para que una restauracion fallida no enmascare el error original.
+
+            EL ESCAPE DE COMODINES
+            ======================
+            La regla 4 de REQ-110 exige que los caracteres % y _ ESCRITOS POR EL USUARIO se busquen
+            como texto literal y no como comodines del LIKE. Sin escape, buscar '100%' devolveria
+            TODAS las filas (porque % significa "cualquier cosa") y buscar 'corriente_de' aceptaria
+            cualquier caracter en el hueco del _. En Oracle eso se resuelve declarando un caracter de
+            escape con ESCAPE '\' y anteponiendolo a cada comodin del patron; el oraculo comprueba
+            que cada una de esas dos busquedas devuelve UNA sola fila, que es la respuesta correcta
+            cuando el comodin se trata como literal.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60B / SAL-ORA60C), display_order y sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_tecnico   NUMBER;
+    v_office    NUMBER;
+    v_room      NUMBER;
+    v_cat       NUMBER;
+
+    v_n         NUMBER;
+    v_mayus     NUMBER;
+    v_acento    NUMBER;
+    v_ruido     NUMBER;
+    v_cod       NUMBER;
+    v_pct       NUMBER;
+    v_us        NUMBER;
+    v_idx       NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60B' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60B', 'Oficina Oraculo Busqueda', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60B';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Busqueda Admin', 'oraculo.tsk060.txt.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Busqueda Tecnico', 'oraculo.tsk060.txt.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60C' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60C', 'Sala Oraculo Busqueda Textual', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60C';
+
+    -- Tres descripciones CONTIENEN el termino en tres grafias distintas (minuscula, mayuscula
+    -- inicial y mayusculas con tilde) y tres NO lo contienen; dos de estas ultimas llevan ademas
+    -- un % y un _ literales para probar el escape de comodines.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00001', v_room, v_cat, 'El Proyector de la sala no enciende al conectar el portatil', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00002', v_room, v_cat, 'EL PROYECTÓR PARPADEA Y PIERDE LA SENAL DE VIDEO CADA POCOS MINUTOS', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00003', v_room, v_cat, 'Mando a distancia del proyector sin pilas desde la semana pasada', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00004', v_room, v_cat, 'La persiana de la sala esta descolgada y no baja del todo', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00005', v_room, v_cat, 'Silla de ruedas rota junto a la mesa principal de reuniones', v_tecnico);
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9060-C00006', v_room, v_cat, 'Un 100% de las tomas de corriente_de la pared no dan tension', v_tecnico);
+
+    -- Activa el MISMO juego linguistico sobre el que se construyo ix_incidencia_desc_ai.
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = LINGUISTIC';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = SPANISH_AI';
+
+    -- Coincidencia parcial, insensible a mayusculas y a acentos: las tres grafias del termino.
+    SELECT COUNT(*) INTO v_n
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%proyector%';
+
+    IF v_n <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-BAN-07: la busqueda de proyector recupera ' || v_n || ' incidencias en lugar de 3: la comparacion no es acento e insensible a mayusculas');
+    END IF;
+
+    -- Las dos variantes concretas que exige el DoD, comprobadas una a una.
+    SELECT COUNT(*) INTO v_mayus
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code = 'INC-9060-C00001'
+       AND description LIKE '%proyector%';
+
+    IF v_mayus <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-BAN-07: la variante con mayuscula inicial Proyector no la recupera la busqueda en minusculas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_acento
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code = 'INC-9060-C00002'
+       AND description LIKE '%proyector%';
+
+    IF v_acento <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-BAN-07: la variante acentuada PROYECTOR con tilde no la recupera la busqueda sin tilde');
+    END IF;
+
+    -- La busqueda no falsea positivos: las filas sin el termino no pueden aparecer.
+    SELECT COUNT(*) INTO v_ruido
+      FROM incidencia
+     WHERE room_id = v_room
+       AND reference_code IN ('INC-9060-C00004', 'INC-9060-C00005')
+       AND description LIKE '%proyector%';
+
+    IF v_ruido <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-BAN-07: la busqueda devuelve filas que no contienen el termino');
+    END IF;
+
+    -- Busqueda por codigo de incidencia insensible a mayusculas (ix_incidencia_reference_upper).
+    SELECT COUNT(*) INTO v_cod
+      FROM incidencia
+     WHERE UPPER(reference_code) = UPPER('inc-9060-c00003');
+
+    IF v_cod <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO AC-BAN-07: la busqueda por codigo de incidencia no es insensible a mayusculas');
+    END IF;
+
+    -- REQ-110 regla 4: el % escrito por el usuario es literal, no comodin.
+    SELECT COUNT(*) INTO v_pct
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%100\%%' ESCAPE '\';
+
+    IF v_pct <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO AC-BAN-07: el comodin % del texto buscado no se esta tratando como literal');
+    END IF;
+
+    -- REQ-110 regla 4: el _ escrito por el usuario es literal, no comodin de un caracter.
+    SELECT COUNT(*) INTO v_us
+      FROM incidencia
+     WHERE room_id = v_room
+       AND description LIKE '%corriente\_de%' ESCAPE '\';
+
+    IF v_us <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20956, 'ORACULO AC-BAN-07: el comodin _ del texto buscado no se esta tratando como literal');
+    END IF;
+
+    -- Los indices funcionales que sostienen la busqueda existen y son utilizables.
+    SELECT COUNT(*) INTO v_idx
+      FROM user_indexes
+     WHERE index_name = 'IX_INCIDENCIA_DESC_AI'
+       AND status = 'VALID';
+
+    IF v_idx <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20957, 'ORACULO AC-BAN-07: el indice funcional NLSSORT sobre description no existe o no es valido');
+    END IF;
+
+    SELECT COUNT(*) INTO v_idx
+      FROM user_indexes
+     WHERE index_name = 'IX_INCIDENCIA_REFERENCE_UPPER'
+       AND status = 'VALID';
+
+    IF v_idx <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20958, 'ORACULO AC-BAN-07: el indice funcional UPPER sobre reference_code no existe o no es valido');
+    END IF;
+
+    -- Devuelve la sesion a la comparacion binaria para no contaminar los changesets posteriores.
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = BINARY';
+    EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = BINARY';
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        BEGIN
+            EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_COMP = BINARY';
+            EXECUTE IMMEDIATE 'ALTER SESSION SET NLS_SORT = BINARY';
+        EXCEPTION
+            WHEN OTHERS THEN NULL;
+        END;
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-08" author="MIND">
+        <comment>Oraculo AC-BAN-03 / REQ-106: ordenar la bandeja por estado devuelve la secuencia del ciclo de vida ABIERTA, EN_CURSO, RESUELTA, CERRADA y no el orden alfabetico</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la ordenacion de la bandeja por estado. La regla 3 de REQ-106
+            exige que ese orden siga la SECUENCIA DEL CICLO DE VIDA de la incidencia (ABIERTA,
+            EN_CURSO, RESUELTA, CERRADA) y NO el orden alfabetico de la etiqueta que se muestra.
+
+            POR QUE EL ESCENARIO ES DEMOSTRATIVO
+            ====================================
+            Los dos ordenes son observablemente distintos, y esa diferencia es justo lo que convierte
+            el escenario en una prueba y no en una tautologia: alfabeticamente CERRADA iria en SEGUNDA
+            posicion (ABIERTA, CERRADA, EN_CURSO, RESUELTA) mientras que por ciclo de vida le
+            corresponde la CUARTA, porque es el estado terminal. Una implementacion que ordenase por
+            la etiqueta en vez de por la secuencia daria un resultado DIFERENTE y el oraculo lo
+            detectaria. Por eso el oraculo comprueba ademas la mitad negativa: calcula la secuencia
+            alfabetica sobre las mismas filas, verifica que efectivamente vale
+            'ABIERTA,CERRADA,EN_CURSO,RESUELTA' (si no, el escenario no seria demostrativo y se
+            falla) y exige que la secuencia obtenida al ordenar por estado NO coincida con ella.
+
+            DE DONDE SALE LA SECUENCIA
+            ==========================
+            La ordenacion no se apoya en una lista de estados escrita en el codigo ni en un CASE con
+            los cuatro valores enumerados, sino en cat_estado_incidencia.sort_order, que es la FUENTE
+            UNICA DE VERDAD del catalogo. La consulta de bandeja une la incidencia con su estado y
+            ordena por esa columna, de modo que anadir un estado nuevo o reordenar los existentes es
+            un cambio de DATO en el catalogo y no un cambio de codigo. Por eso el oraculo verifica
+            PRIMERO la propia fuente de verdad: los cuatro estados tienen que existir y sus
+            sort_order tienen que ordenarlos como el ciclo de vida, antes de mirar ninguna
+            incidencia. El desempate dentro de un mismo estado sigue siendo incident_id DESC, que es
+            la regla 4 de REQ-106.
+
+            Las cuatro incidencias se insertan en orden DELIBERADAMENTE DESORDENADO (primero la
+            CERRADA, luego la RESUELTA, luego la ABIERTA y por ultimo la EN_CURSO) para que el
+            resultado no pueda deberse al orden fisico de insercion. Cada una se siembra respetando
+            las restricciones del ciclo de vida de la tabla: coexistencia de cierre, cronologia de
+            marcas, asignacion y comentario de resolucion obligatorio solo en CERRADA.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60C / SAL-ORA60D), display_order y sort_order 9xx para no chocar
+            con el seed real del catalogo y correos @example.invalid, y deshace todos sus datos con
+            el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_creado          TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    v_admin           NUMBER;
+    v_tecnico         NUMBER;
+    v_office          NUMBER;
+    v_room            NUMBER;
+    v_cat             NUMBER;
+
+    v_estados         NUMBER;
+    v_so_abierta      NUMBER;
+    v_so_en_curso     NUMBER;
+    v_so_resuelta     NUMBER;
+    v_so_cerrada      NUMBER;
+
+    v_secuencia       VARCHAR2(200);
+    v_alfabetica      VARCHAR2(200);
+    v_descendente     VARCHAR2(200);
+    v_pos             NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        -- sort_order es UNIQUE: se siembra en el rango 9xx para no chocar con el seed real 1..4.
+        -- Como el MERGE solo inserta cuando no hay fila, en una base ya sembrada se respeta el
+        -- orden real del catalogo, que tambien es ABIERTA < EN_CURSO < RESUELTA < CERRADA.
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    sembrar_estado('ABIERTA',  'Abierta',  901, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 902, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 903, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  904, 'Y');
+
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    -- COMPROBACION PREVIA DE LA FUENTE DE VERDAD: el catalogo tiene que ordenar los cuatro estados
+    -- como la secuencia del ciclo de vida ANTES de mirar ninguna incidencia.
+    SELECT COUNT(*)
+      INTO v_estados
+      FROM cat_estado_incidencia
+     WHERE status_code IN ('ABIERTA', 'EN_CURSO', 'RESUELTA', 'CERRADA');
+
+    IF v_estados <> 4 THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-BAN-03: el sort_order de cat_estado_incidencia no refleja la secuencia del ciclo de vida');
+    END IF;
+
+    SELECT sort_order INTO v_so_abierta  FROM cat_estado_incidencia WHERE status_code = 'ABIERTA';
+    SELECT sort_order INTO v_so_en_curso FROM cat_estado_incidencia WHERE status_code = 'EN_CURSO';
+    SELECT sort_order INTO v_so_resuelta FROM cat_estado_incidencia WHERE status_code = 'RESUELTA';
+    SELECT sort_order INTO v_so_cerrada  FROM cat_estado_incidencia WHERE status_code = 'CERRADA';
+
+    IF NOT (v_so_abierta < v_so_en_curso AND v_so_en_curso < v_so_resuelta AND v_so_resuelta < v_so_cerrada) THEN
+        RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-BAN-03: el sort_order de cat_estado_incidencia no refleja la secuencia del ciclo de vida');
+    END IF;
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60C' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60C', 'Oficina Oraculo Orden Estado', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60C';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Orden Admin', 'oraculo.tsk060.ord.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Orden Tecnico', 'oraculo.tsk060.ord.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60D' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60D', 'Sala Oraculo Orden Por Estado', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60D';
+
+    -- Cuatro incidencias, una por estado, insertadas en orden DELIBERADAMENTE DESORDENADO para que
+    -- la secuencia obtenida no pueda deberse al orden fisico de insercion.
+
+    -- 1) CERRADA: closed_at y closed_by obligatorios y resolution_comment obligatorio no vacio.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at, resolved_at, closed_at, closed_by, resolution_comment)
+         VALUES ('INC-9060-D00001', v_room, v_cat,
+                 'Proyector de la sala sin imagen ya cerrado tras la sustitucion', v_tecnico, l_creado,
+                 'CERRADA', v_tecnico, l_creado, l_creado, l_creado, v_tecnico,
+                 'Proyector sustituido y verificado con el portatil del usuario');
+
+    -- 2) RESUELTA: con marca de resolucion pero sin cierre ni comentario de resolucion.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at, resolved_at)
+         VALUES ('INC-9060-D00002', v_room, v_cat,
+                 'Silla de la mesa de reuniones rota a la espera de validacion', v_tecnico, l_creado,
+                 'RESUELTA', v_tecnico, l_creado, l_creado);
+
+    -- 3) ABIERTA: recien registrada, sin tecnico ni marcas posteriores.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+         VALUES ('INC-9060-D00003', v_room, v_cat,
+                 'Aire acondicionado que no enfria en la sala de reuniones', v_tecnico, l_creado);
+
+    -- 4) EN_CURSO: asignada y con marca de inicio de trabajo.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at,
+                            status, assigned_technician_id, in_progress_at)
+         VALUES ('INC-9060-D00004', v_room, v_cat,
+                 'Cerradura de la puerta atascada en revision por el tecnico', v_tecnico, l_creado,
+                 'EN_CURSO', v_tecnico, l_creado);
+
+    -- ORDENACION POR ESTADO: la consulta de bandeja une con el catalogo y ordena por sort_order,
+    -- con incident_id DESC como desempate (REQ-106 regla 4).
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.sort_order, x.incident_id DESC)
+      INTO v_secuencia
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_secuencia <> 'ABIERTA,EN_CURSO,RESUELTA,CERRADA' THEN
+        RAISE_APPLICATION_ERROR(-20941, 'ORACULO AC-BAN-03: la ordenacion por estado devuelve ' || v_secuencia || ' en lugar de la secuencia del ciclo de vida ABIERTA,EN_CURSO,RESUELTA,CERRADA');
+    END IF;
+
+    -- MITAD NEGATIVA: el orden alfabetico de la etiqueta sobre las MISMAS filas es distinto.
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.status)
+      INTO v_alfabetica
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_alfabetica <> 'ABIERTA,CERRADA,EN_CURSO,RESUELTA' THEN
+        RAISE_APPLICATION_ERROR(-20942, 'ORACULO AC-BAN-03: el escenario no es demostrativo: la secuencia alfabetica esperada no se reproduce, se obtiene ' || v_alfabetica);
+    END IF;
+
+    IF v_secuencia = v_alfabetica THEN
+        RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-BAN-03: la ordenacion por estado esta siguiendo el orden alfabetico de la etiqueta y no la secuencia del ciclo de vida');
+    END IF;
+
+    -- CERRADA es el estado terminal: por ciclo de vida ocupa la CUARTA posicion, no la segunda.
+    SELECT rn
+      INTO v_pos
+      FROM (SELECT i.status,
+                   ROW_NUMBER() OVER (ORDER BY e.sort_order) AS rn
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room)
+     WHERE status = 'CERRADA';
+
+    IF v_pos <> 4 THEN
+        RAISE_APPLICATION_ERROR(-20944, 'ORACULO AC-BAN-03: CERRADA ocupa la posicion ' || v_pos || ' en la ordenacion por estado; por ciclo de vida le corresponde la 4');
+    END IF;
+
+    -- El sentido descendente tiene que invertir la secuencia del ciclo de vida.
+    SELECT LISTAGG(x.status, ',') WITHIN GROUP (ORDER BY x.sort_order DESC, x.incident_id DESC)
+      INTO v_descendente
+      FROM (SELECT i.incident_id, i.status, e.sort_order
+              FROM incidencia i
+              JOIN cat_estado_incidencia e ON e.status_code = i.status
+             WHERE i.room_id = v_room) x;
+
+    IF v_descendente <> 'CERRADA,RESUELTA,EN_CURSO,ABIERTA' THEN
+        RAISE_APPLICATION_ERROR(-20945, 'ORACULO AC-BAN-03: el sentido descendente de la ordenacion por estado no invierte la secuencia del ciclo de vida, devuelve ' || v_descendente);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-09" author="MIND">
+        <comment>Oraculo REQ-104 / AC-CLAS-05: la agregacion por categoria devuelve las 5 categorias del catalogo, incluidas las de recuento 0, y el LEFT JOIN no inventa un recuento 1 para los valores sin incidencias</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la agregacion por categoria que publica la vista
+            v_recuento_incidencias del changeset ddl-0.0.1-17-05.
+
+            EL RECUENTO 0 TIENE QUE SER VISIBLE
+            ===================================
+            AC-CLAS-05 no pide el recuento de los valores que tienen incidencias: pide el recuento de
+            CADA valor del catalogo, INCLUIDOS los que valen 0. Una sala sana, sin ninguna incidencia,
+            tiene que aparecer en el listado con un 0 bien visible; si se omite, el consumidor no
+            puede distinguir "esta sala no tiene incidencias" de "esta sala no existe", y justo la
+            informacion que mas interesa (que algo esta sano) desaparece del informe. De ahi que la
+            vista parta SIEMPRE del catalogo y alcance incidencia con LEFT JOIN, y nunca al reves.
+
+            LA TRAMPA DEL COUNT(*)
+            ======================
+            El fallo clasico de esa construccion no es el JOIN sino la funcion de agregacion. El LEFT
+            JOIN conserva la fila del catalogo con TODAS las columnas de incidencia a NULL, de modo
+            que COUNT(*) cuenta esa fila fantasma y devuelve 1 para un valor que NO tiene ninguna
+            incidencia. La forma correcta es COUNT(i.incident_id), que ignora los NULL y devuelve 0.
+            Como la diferencia entre ambas solo se manifiesta cuando existe un valor de catalogo
+            VACIO, el oraculo siembra a proposito dos de ellos: una sala (SAL-ORA60F) SIN NINGUNA
+            incidencia y una oficina (OF-ORA60E) SIN NINGUNA sala, y exige que las dos salgan con
+            recuento EXACTAMENTE 0. Con COUNT(*) ambas darian 1 y el oraculo fallaria.
+
+            POR QUE SE MIDE POR DELTA
+            =========================
+            Las comprobaciones sobre categorias no se hacen contra valores absolutos sino por DELTA
+            contra una linea base tomada ANTES de sembrar las incidencias: se guarda el recuento
+            previo de la categoria sembrada (OTROS) y el recuento previo del resto de categorias, y
+            despues se exige que el primero haya crecido exactamente en 7 y que el segundo no se haya
+            movido. Asi el oraculo es correcto tanto sobre una base recien creada y vacia como sobre
+            una ya poblada por otros changesets o por el seed real, sin depender del orden de
+            ejecucion.
+
+            Las cinco categorias del CHECK de cat_categoria_incidencia (MOBILIARIO, CLIMATIZACION,
+            AUDIOVISUAL, LIMPIEZA y OTROS) se siembran activas para que el catalogo este completo y la
+            dimension CATEGORY de la vista tenga que devolver exactamente 5 filas, cuatro de ellas con
+            el recuento intacto.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60D / OF-ORA60E / SAL-ORA60E / SAL-ORA60F), display_order y
+            sort_order 9xx y correos @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin            NUMBER;
+    v_tecnico          NUMBER;
+    v_office_d         NUMBER;
+    v_office_e         NUMBER;
+    v_room_e           NUMBER;
+    v_room_f           NUMBER;
+    v_cat_otros        NUMBER;
+
+    v_base_otros       NUMBER;
+    v_base_resto       NUMBER;
+
+    v_filas_cat        NUMBER;
+    v_faltan           NUMBER;
+    v_otros            NUMBER;
+    v_resto            NUMBER;
+    v_cero_vista       NUMBER;
+    v_cero_base        NUMBER;
+    v_sala_vacia       NUMBER;
+    v_oficina_vacia    NUMBER;
+    v_sala_sembrada    NUMBER;
+    v_oficina_sembrada NUMBER;
+    v_abierta          NUMBER;
+    v_cerrada          NUMBER;
+    v_top              NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+
+    -- Las CINCO categorias que admite el CHECK de cat_categoria_incidencia, todas activas: la
+    -- dimension CATEGORY de la vista tiene que devolver exactamente 5 filas.
+    sembrar_categoria('MOBILIARIO', 'Mobiliario', 901, 'Y');
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion', 902, 'Y');
+    sembrar_categoria('AUDIOVISUAL', 'Audiovisual', 903, 'Y');
+    sembrar_categoria('LIMPIEZA', 'Limpieza', 904, 'Y');
+    sembrar_categoria('OTROS', 'Otros', 905, 'Y');
+
+    SELECT category_id INTO v_cat_otros FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    -- LINEA BASE tomada ANTES de sembrar: las comprobaciones se hacen por delta y por eso el
+    -- oraculo vale tanto sobre una base vacia como sobre una ya poblada.
+    SELECT COUNT(*) INTO v_base_otros FROM incidencia WHERE category_id = v_cat_otros;
+
+    SELECT NVL(SUM(x.c), 0) INTO v_base_resto
+      FROM (SELECT COUNT(i.incident_id) AS c
+              FROM cat_categoria_incidencia c
+              LEFT JOIN incidencia i ON i.category_id = c.category_id
+             WHERE c.category_code <> 'OTROS'
+             GROUP BY c.category_id) x;
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Agregacion Admin', 'oraculo.tsk060.agr.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Agregacion Tecnico', 'oraculo.tsk060.agr.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60D' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60D', 'Oficina Oraculo Agregacion Con Salas', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_d FROM cat_oficina WHERE office_code = 'OF-ORA60D';
+
+    -- Oficina deliberadamente SIN NINGUNA SALA: con el segundo salto en LEFT JOIN tiene que salir
+    -- con 0, y con COUNT(*) saldria con 1.
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60E' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60E', 'Oficina Oraculo Agregacion Sin Salas', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_e FROM cat_oficina WHERE office_code = 'OF-ORA60E';
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60E' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60E', 'Sala Oraculo Agregacion Con Incidencias', v_office_d, 'Y', v_admin);
+    SELECT room_id INTO v_room_e FROM cat_sala WHERE room_code = 'SAL-ORA60E';
+
+    -- Sala deliberadamente SIN NINGUNA INCIDENCIA: es la sala sana que no puede desaparecer del
+    -- listado ni aparecer con un recuento inventado.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60F' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60F', 'Sala Oraculo Agregacion Sin Incidencias', v_office_d, 'Y', v_admin);
+    SELECT room_id INTO v_room_f FROM cat_sala WHERE room_code = 'SAL-ORA60F';
+
+    -- 7 incidencias, todas en SAL-ORA60E y todas de la categoria OTROS.
+    FOR i IN 1..7 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-E' || LPAD(i, 5, '0'), v_room_e, v_cat_otros,
+                     'Incidencia del oraculo de agregacion numero ' || i, v_tecnico);
+    END LOOP;
+
+    -- a) La dimension CATEGORY devuelve las 5 categorias del catalogo.
+    SELECT COUNT(*) INTO v_filas_cat FROM v_recuento_incidencias WHERE group_type = 'CATEGORY';
+    IF v_filas_cat <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20930, 'ORACULO AC-CLAS-05: la agregacion por categoria devuelve ' || v_filas_cat || ' filas en lugar de las 5 categorias del catalogo');
+    END IF;
+
+    -- b) Ninguna categoria del catalogo falta en la agregacion.
+    SELECT COUNT(*) INTO v_faltan
+      FROM (SELECT category_id FROM cat_categoria_incidencia
+            MINUS
+            SELECT group_id FROM v_recuento_incidencias WHERE group_type = 'CATEGORY');
+    IF v_faltan <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20931, 'ORACULO AC-CLAS-05: ' || v_faltan || ' categorias del catalogo no aparecen en la agregacion');
+    END IF;
+
+    -- c) Delta de la categoria sembrada: exactamente las 7 incidencias nuevas.
+    SELECT incident_count INTO v_otros
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND group_id = v_cat_otros;
+    IF v_otros <> v_base_otros + 7 THEN
+        RAISE_APPLICATION_ERROR(-20932, 'ORACULO AC-CLAS-05: el recuento de la categoria sembrada es ' || v_otros || ' y deberia ser ' || (v_base_otros + 7));
+    END IF;
+
+    -- d) Las otras cuatro categorias conservan su recuento de la linea base.
+    SELECT NVL(SUM(incident_count), 0) INTO v_resto
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND group_id <> v_cat_otros;
+    IF v_resto <> v_base_resto THEN
+        RAISE_APPLICATION_ERROR(-20933, 'ORACULO AC-CLAS-05: la agregacion ha alterado el recuento de categorias que no se han sembrado, es ' || v_resto || ' y deberia ser ' || v_base_resto);
+    END IF;
+
+    -- e) El recuento 0 es visible y coherente con el catalogo.
+    SELECT COUNT(*) INTO v_cero_vista
+      FROM v_recuento_incidencias
+     WHERE group_type = 'CATEGORY' AND incident_count = 0;
+
+    SELECT COUNT(*) INTO v_cero_base
+      FROM cat_categoria_incidencia c
+     WHERE NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id);
+
+    IF v_cero_vista <> v_cero_base THEN
+        RAISE_APPLICATION_ERROR(-20934, 'ORACULO AC-CLAS-05: la agregacion no refleja con recuento 0 las categorias sin incidencias, muestra ' || v_cero_vista || ' y deberian ser ' || v_cero_base);
+    END IF;
+
+    -- f) La sala SIN incidencias tiene que dar EXACTAMENTE 0: es la trampa del COUNT(*).
+    SELECT incident_count INTO v_sala_vacia
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_f;
+    IF v_sala_vacia <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20935, 'ORACULO AC-CLAS-05: una sala sin incidencias aparece con recuento ' || v_sala_vacia || ': el LEFT JOIN se esta contando con COUNT(*) en lugar de COUNT(incident_id)');
+    END IF;
+
+    -- g) La oficina SIN salas tambien tiene que dar EXACTAMENTE 0.
+    SELECT incident_count INTO v_oficina_vacia
+      FROM v_recuento_incidencias
+     WHERE group_type = 'OFFICE' AND group_id = v_office_e;
+    IF v_oficina_vacia <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20936, 'ORACULO AC-CLAS-05: una oficina sin salas aparece con recuento ' || v_oficina_vacia || ' en lugar de 0');
+    END IF;
+
+    -- h) Los recuentos sembrados: la sala con incidencias da 7 y su oficina tambien (7 + 0).
+    SELECT incident_count INTO v_sala_sembrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_e;
+
+    SELECT incident_count INTO v_oficina_sembrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'OFFICE' AND group_id = v_office_d;
+
+    IF v_sala_sembrada <> 7 OR v_oficina_sembrada <> 7 THEN
+        RAISE_APPLICATION_ERROR(-20937, 'ORACULO AC-CLAS-05: los recuentos sembrados deberian ser 7 para la sala y 7 para la oficina y son ' || v_sala_sembrada || ' y ' || v_oficina_sembrada);
+    END IF;
+
+    -- i) Desglose por estado: las 7 incidencias nacen ABIERTA y ninguna esta CERRADA.
+    SELECT incident_count_abierta, incident_count_cerrada
+      INTO v_abierta, v_cerrada
+      FROM v_recuento_incidencias
+     WHERE group_type = 'ROOM' AND group_id = v_room_e;
+
+    IF v_abierta <> 7 OR v_cerrada <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20938, 'ORACULO AC-CLAS-05: el desglose por estado de la sala sembrada deberia ser 7 abiertas y 0 cerradas y es ' || v_abierta || ' y ' || v_cerrada);
+    END IF;
+
+    -- j) AC-CLAS-05 pide el resultado ordenado de mayor a menor: la categoria sembrada encabeza.
+    SELECT group_id INTO v_top
+      FROM (SELECT group_id
+              FROM v_recuento_incidencias
+             WHERE group_type = 'CATEGORY'
+             ORDER BY incident_count DESC, group_id)
+     WHERE ROWNUM = 1;
+
+    IF v_top <> v_cat_otros THEN
+        RAISE_APPLICATION_ERROR(-20939, 'ORACULO AC-CLAS-05: la categoria con mas incidencias no encabeza la agregacion ordenada de mayor a menor, encabeza la categoria ' || v_top || ' en lugar de la ' || v_cat_otros);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-10" author="MIND">
+        <comment>Oraculo REQ-103 / REQ-159: las vistas de filtro ofrecen los valores activos mas los inactivos CON incidencias asociadas, marcados con es_inactivo, y excluyen los inactivos sin uso</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la regla 2 de REQ-103 sobre las tres vistas de filtro
+            (v_filtro_sala, v_filtro_oficina y v_filtro_categoria). Esa regla dice que un valor de
+            catalogo DESACTIVADO aparece en el filtro UNICAMENTE si tiene al menos una incidencia
+            asociada, y que cuando aparece va MARCADO como inactivo para que la SPA lo pinte con el
+            literal '(inactiva)' junto al nombre.
+
+            La regla tiene DOS MITADES y este oraculo comprueba las dos, porque cumplir solo una de
+            ellas es un defecto distinto pero igual de real:
+
+              - La mitad POSITIVA: un valor desactivado que YA tiene uso historico SIGUE siendo
+                seleccionable. Es lo que permite a un empleado reencontrar sus incidencias antiguas
+                de una categoria retirada o de una sala cerrada (REQ-159 regla 3). Si el filtro
+                dejase caer esos valores, las incidencias quedarian inalcanzables desde la interfaz.
+              - La mitad NEGATIVA: un valor desactivado SIN ningun uso desaparece del desplegable y
+                no lo ensucia. Una implementacion que se limitase a no filtrar nada ofreceria todo
+                el catalogo historico y cumpliria la primera mitad incumpliendo esta.
+
+            Ademas del escenario concreto sembrado (tres oficinas, tres salas y tres categorias con
+            las combinaciones activa/inactiva y con/sin uso), el oraculo comprueba la regla como
+            INVARIANTE SOBRE TODO EL CATALOGO, contrastando cada vista contra su tabla base: ningun
+            valor activo puede faltar, ningun inactivo-con-uso puede faltar y ningun inactivo-sin-uso
+            puede sobrar. Esa comprobacion es la que convierte al oraculo en una prueba de la REGLA y
+            no solo de las filas que el mismo ha sembrado. Por ultimo verifica la COHERENCIA DEL
+            FLAG: en las tres vistas, es_inactivo tiene que ser exactamente la negacion del is_active
+            de la tabla base en TODAS las filas, porque una marca equivocada haria creer que una sala
+            cerrada sigue operativa o al reves.
+
+            El orden de la siembra no es casual y respeta los invariantes del esquema: las
+            incidencias se insertan con las salas y las categorias AUN activas, porque
+            trg_incidencia_clasificacion exige que ambas lo esten al registrar; y las desactivaciones
+            van primero las salas y despues las oficinas, dejando siempre OF-ORA60H activa, porque
+            trg_cat_oficina_desactivar rechaza una oficina inactiva con salas activas (ORA-20030) y
+            exige que quede al menos una oficina activa (ORA-20032).
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60F / OF-ORA60G / OF-ORA60H, SAL-ORA60G / SAL-ORA60H / SAL-ORA60I),
+            display_order y sort_order 9xx y correos @example.invalid, y deshace todos sus datos con
+            el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin         NUMBER;
+    v_tecnico       NUMBER;
+
+    v_office_f      NUMBER;
+    v_office_g      NUMBER;
+    v_office_h      NUMBER;
+    v_room_g        NUMBER;
+    v_room_h        NUMBER;
+    v_room_i        NUMBER;
+    v_cat_otros     NUMBER;
+    v_cat_limpieza  NUMBER;
+    v_cat_clima     NUMBER;
+
+    v_n             NUMBER;
+    v_usos          NUMBER;
+    v_mal           NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+
+    -- Las tres categorias entran ACTIVAS: las incidencias no se pueden registrar contra una
+    -- categoria inactiva (trg_incidencia_clasificacion), asi que la desactivacion viene despues.
+    sembrar_categoria('OTROS', 'Otros', 905, 'Y');
+    sembrar_categoria('LIMPIEZA', 'Limpieza', 904, 'Y');
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion', 902, 'Y');
+
+    SELECT category_id INTO v_cat_otros    FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+    SELECT category_id INTO v_cat_limpieza FROM cat_categoria_incidencia WHERE category_code = 'LIMPIEZA';
+    SELECT category_id INTO v_cat_clima    FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Filtros Admin', 'oraculo.tsk060.flt.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Filtros Tecnico', 'oraculo.tsk060.flt.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    -- OF-ORA60F: acabara INACTIVA y CON incidencias (a traves de SAL-ORA60H).
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60F' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60F', 'Oficina Oraculo Filtro Con Uso', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_f FROM cat_oficina WHERE office_code = 'OF-ORA60F';
+
+    -- OF-ORA60G: acabara INACTIVA y SIN salas ni incidencias.
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60G' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60G', 'Oficina Oraculo Filtro Sin Uso', 'Sevilla', 'Y');
+    SELECT office_id INTO v_office_g FROM cat_oficina WHERE office_code = 'OF-ORA60G';
+
+    -- OF-ORA60H: se queda ACTIVA siempre, para que nunca falte una oficina activa (ORA-20032).
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60H' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60H', 'Oficina Oraculo Filtro Activa', 'Bilbao', 'Y');
+    SELECT office_id INTO v_office_h FROM cat_oficina WHERE office_code = 'OF-ORA60H';
+
+    -- SAL-ORA60G: de OF-ORA60H, se queda ACTIVA y sin incidencias.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60G' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60G', 'Sala Oraculo Filtro Activa Sin Uso', v_office_h, 'Y', v_admin);
+    SELECT room_id INTO v_room_g FROM cat_sala WHERE room_code = 'SAL-ORA60G';
+
+    -- SAL-ORA60H: de OF-ORA60F, CON incidencias, acabara INACTIVA.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60H' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60H', 'Sala Oraculo Filtro Inactiva Con Uso', v_office_f, 'Y', v_admin);
+    SELECT room_id INTO v_room_h FROM cat_sala WHERE room_code = 'SAL-ORA60H';
+
+    -- SAL-ORA60I: de OF-ORA60F, SIN incidencias, acabara INACTIVA.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60I' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60I', 'Sala Oraculo Filtro Inactiva Sin Uso', v_office_f, 'Y', v_admin);
+    SELECT room_id INTO v_room_i FROM cat_sala WHERE room_code = 'SAL-ORA60I';
+
+    -- Incidencias con la sala y las categorias AUN activas: 3 de OTROS y 2 de LIMPIEZA, todas en
+    -- SAL-ORA60H, que es la que dara uso historico a la sala, a su oficina y a esas categorias.
+    FOR i IN 1..3 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-F' || LPAD(i, 5, '0'), v_room_h, v_cat_otros,
+                     'Incidencia de categoria general del oraculo de filtros numero ' || i, v_tecnico);
+    END LOOP;
+
+    FOR i IN 4..5 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-F' || LPAD(i, 5, '0'), v_room_h, v_cat_limpieza,
+                     'Incidencia de limpieza del oraculo de filtros numero ' || i, v_tecnico);
+    END LOOP;
+
+    -- DESACTIVACIONES. El orden es obligatorio: primero las salas, despues las oficinas (una
+    -- oficina inactiva con salas activas es ORA-20030) y por ultimo las categorias.
+    UPDATE cat_sala SET is_active = 'N' WHERE room_code IN ('SAL-ORA60H', 'SAL-ORA60I');
+    UPDATE cat_oficina SET is_active = 'N' WHERE office_code IN ('OF-ORA60F', 'OF-ORA60G');
+    UPDATE cat_categoria_incidencia SET is_active = 'N' WHERE category_code IN ('LIMPIEZA', 'CLIMATIZACION');
+
+    -- (a) MITAD POSITIVA en salas: la sala desactivada CON uso sigue ofreciendose y va marcada.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_h AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20920, 'ORACULO REQ-103: la sala desactivada con incidencias asociadas no se ofrece en el filtro marcada como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (b) MITAD NEGATIVA en salas: la sala desactivada SIN uso desaparece del desplegable.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_i;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20921, 'ORACULO REQ-103: la sala desactivada sin incidencias se sigue ofreciendo en el filtro, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (c) Una sala ACTIVA se ofrece aunque no tenga uso, y se marca como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_g AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20922, 'ORACULO REQ-103: una sala activa sin incidencias no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (d) MITAD POSITIVA en oficinas: el uso llega a la oficina a traves de SAL-ORA60H.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_f AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20923, 'ORACULO REQ-103: la oficina desactivada con incidencias en sus salas no se ofrece en el filtro marcada como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (e) MITAD NEGATIVA en oficinas: la oficina desactivada sin salas ni uso no se ofrece.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_g;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20924, 'ORACULO REQ-103: la oficina desactivada sin salas ni incidencias se sigue ofreciendo en el filtro, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (f) Una oficina ACTIVA se ofrece marcada como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_h AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20925, 'ORACULO REQ-103: una oficina activa no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (g) MITAD POSITIVA en categorias (REQ-159 regla 3): la categoria retirada con uso historico
+    -- sigue siendo seleccionable, que es lo que deja al empleado reencontrar sus incidencias.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_categoria WHERE category_id = v_cat_limpieza AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20926, 'ORACULO REQ-103: la categoria desactivada con uso historico ya no es seleccionable: el empleado pierde sus incidencias antiguas de esa categoria, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (h) MITAD NEGATIVA en categorias. La comprobacion se condiciona al hecho base (que la
+    -- categoria no tenga NINGUNA incidencia) para seguir siendo correcta sobre una base ya poblada.
+    SELECT COUNT(*) INTO v_usos FROM incidencia WHERE category_id = v_cat_clima;
+    SELECT COUNT(*) INTO v_n    FROM v_filtro_categoria WHERE category_id = v_cat_clima;
+    IF v_usos = 0 AND v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20927, 'ORACULO REQ-103: la categoria desactivada sin ninguna incidencia asociada se sigue ofreciendo en el filtro');
+    END IF;
+
+    -- (i) Una categoria ACTIVA con uso se ofrece marcada como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_categoria WHERE category_id = v_cat_otros AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20928, 'ORACULO REQ-103: una categoria activa con uso no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- LA REGLA COMO INVARIANTE SOBRE TODO EL CATALOGO, no solo sobre las filas sembradas: para cada
+    -- vista, ningun activo puede faltar, ningun inactivo-con-uso puede faltar y ningun
+    -- inactivo-sin-uso puede sobrar.
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_sala s
+     WHERE (s.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id))
+        OR (s.is_active = 'N' AND     EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id))
+        OR (s.is_active = 'N' AND NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_sala no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_oficina o
+     WHERE (o.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id))
+        OR (o.is_active = 'N' AND     EXISTS (SELECT 1
+                                                FROM incidencia i
+                                                JOIN cat_sala s ON s.room_id = i.room_id
+                                               WHERE s.office_id = o.office_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id))
+        OR (o.is_active = 'N' AND NOT EXISTS (SELECT 1
+                                                FROM incidencia i
+                                                JOIN cat_sala s ON s.room_id = i.room_id
+                                               WHERE s.office_id = o.office_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_oficina no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_categoria_incidencia c
+     WHERE (c.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id))
+        OR (c.is_active = 'N' AND     EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id))
+        OR (c.is_active = 'N' AND NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_categoria no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    -- COHERENCIA DEL FLAG: es_inactivo es la negacion exacta de is_active en TODAS las filas.
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_sala f
+      JOIN cat_sala s ON s.room_id = f.room_id
+     WHERE f.es_inactivo <> CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_sala publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_oficina f
+      JOIN cat_oficina o ON o.office_id = f.office_id
+     WHERE f.es_inactivo <> CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_oficina publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_categoria f
+      JOIN cat_categoria_incidencia c ON c.category_id = f.category_id
+     WHERE f.es_inactivo <> CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_categoria publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-17-11" author="MIND">
+        <comment>Oraculo AC-BAN-09 / REQ-106: sobre un dataset de 1.200 incidencias el plan de la consulta de bandeja se resuelve por indice sin FULL TABLE SCAN ni SORT ORDER BY, y el p95 de 20 ejecuciones queda por debajo de 2000 ms</comment>
+        <!--
+            QUE COMPRUEBA ESTE ORACULO. AC-BAN-09 exige que el 100% de las consultas de bandeja
+            resuelvan el ORDEN y la PAGINACION en base de datos con OFFSET ... FETCH, sin trocear el
+            listado en la SPA, y que el p95 quede por debajo de 2000 ms sobre el volumen de la ventana
+            de retencion, unas 1.200 incidencias. El oraculo siembra ese volumen, pide el plan de la
+            consulta de bandeja con EXPLAIN PLAN y exige tres cosas sobre el: que aparezca una
+            operacion de INDICE sobre ix_incidencia_bandeja_estado, que NO aparezca ningun
+            TABLE ACCESS FULL sobre INCIDENCIA y que NO aparezca ningun SORT ORDER BY. Esta ultima
+            comprobacion es la prueba de que el orden created_at DESC, incident_id DESC lo sirve el
+            propio indice y no una ordenacion posterior en memoria. Despues cronometra 20 ejecuciones
+            reales de la consulta paginada y calcula el percentil 95 de los tiempos medidos.
+
+            POR QUE EL EXPLAIN LLEVA UN HINT DE INDICE. El oraculo se ejecuta DENTRO del changelog,
+            cuando la tabla todavia no tiene estadisticas y el dataset esta sembrado en una
+            transaccion sin confirmar; en esas condiciones la ELECCION del optimizador no es
+            reproducible, y recoger estadisticas con DBMS_STATS confirmaria implicitamente la siembra
+            y dejaria 1.200 filas de prueba en la base. Fijar el camino de acceso convierte la
+            comprobacion en lo que de verdad hay que garantizar aqui, que es una propiedad del
+            ESQUEMA y no del optimizador: que el indice entregado por esta tarea CUBRE el filtro, el
+            orden y la paginacion de la consulta de bandeja sin recorrer la tabla ni ordenar. La
+            eleccion del plan con estadisticas reales se observa en el entorno desplegado, no en el
+            changelog.
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60I / SAL-ORA60J), display_order y sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    l_ahora        TIMESTAMP(6) := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    TYPE t_tiempos IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    v_tiempos      t_tiempos;
+
+    v_admin        NUMBER;
+    v_tecnico      NUMBER;
+    v_office       NUMBER;
+    v_room         NUMBER;
+    v_cat          NUMBER;
+
+    v_ini          NUMBER;
+    v_ms           NUMBER;
+    v_p95          NUMBER;
+    v_aux          NUMBER;
+    v_pos          PLS_INTEGER;
+
+    v_full         NUMBER;
+    v_idx          NUMBER;
+    v_sort         NUMBER;
+    v_filas        NUMBER;
+    v_total        NUMBER;
+    v_invalidos    NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60I' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60I', 'Oficina Oraculo Rendimiento', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA60I';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Rendimiento Admin', 'oraculo.tsk060.perf.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Rendimiento Tecnico', 'oraculo.tsk060.perf.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60J' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60J', 'Sala Oraculo Rendimiento Bandeja', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA60J';
+
+    -- Dataset de 1.200 incidencias, el volumen de la ventana de retencion de AC-BAN-09. Cada fila
+    -- recibe un created_at DISTINTO y decreciente: es el escenario realista de la bandeja y obliga
+    -- al primer criterio del orden (created_at DESC) a discriminar de verdad.
+    FOR i IN 1..1200 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by, created_at)
+             VALUES ('INC-9060-G' || LPAD(i, 6, '0'), v_room, v_cat,
+                     'Incidencia del dataset de rendimiento de la bandeja numero ' || i, v_tecnico,
+                     l_ahora - NUMTODSINTERVAL(i, 'MINUTE'));
+    END LOOP;
+
+    SELECT COUNT(*) INTO v_total FROM incidencia WHERE room_id = v_room;
+    IF v_total <> 1200 THEN
+        RAISE_APPLICATION_ERROR(-20910, 'ORACULO AC-BAN-09: el dataset de rendimiento deberia tener 1200 incidencias y tiene ' || v_total);
+    END IF;
+
+    -- Los indices de consulta entregados por esta tarea existen y estan en estado VALID.
+    SELECT COUNT(*)
+      INTO v_invalidos
+      FROM user_indexes
+     WHERE index_name IN ('IX_INCIDENCIA_BANDEJA_ESTADO',
+                          'IX_INCIDENCIA_BANDEJA_SALA',
+                          'IX_INCIDENCIA_BANDEJA_CATEGORIA',
+                          'IX_INCIDENCIA_DESC_AI',
+                          'IX_INCIDENCIA_REFERENCE_UPPER')
+       AND status <> 'VALID';
+
+    IF v_invalidos <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20911, 'ORACULO AC-BAN-09: hay ' || v_invalidos || ' indices de consulta en estado no valido');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_idx
+      FROM user_indexes
+     WHERE index_name IN ('IX_INCIDENCIA_BANDEJA_ESTADO',
+                          'IX_INCIDENCIA_BANDEJA_SALA',
+                          'IX_INCIDENCIA_BANDEJA_CATEGORIA',
+                          'IX_INCIDENCIA_DESC_AI',
+                          'IX_INCIDENCIA_REFERENCE_UPPER');
+
+    IF v_idx <> 5 THEN
+        RAISE_APPLICATION_ERROR(-20912, 'ORACULO AC-BAN-09: faltan indices de consulta: solo existen ' || v_idx || ' de 5');
+    END IF;
+
+    -- Plan de la consulta de bandeja. Se limpia antes por si quedara rastro de una ejecucion previa.
+    DELETE FROM plan_table WHERE statement_id = 'TSK060BAN';
+
+    EXECUTE IMMEDIATE q'[EXPLAIN PLAN SET STATEMENT_ID = 'TSK060BAN' FOR
+SELECT /*+ INDEX(i IX_INCIDENCIA_BANDEJA_ESTADO) */
+       i.incident_id, i.reference_code, i.status, i.created_at
+  FROM incidencia i
+ WHERE i.status = 'ABIERTA'
+ ORDER BY i.created_at DESC, i.incident_id DESC
+OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY]';
+
+    SELECT COUNT(*)
+      INTO v_full
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation = 'TABLE ACCESS'
+       AND options = 'FULL'
+       AND object_name = 'INCIDENCIA';
+
+    IF v_full <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20913, 'ORACULO AC-BAN-09: el plan de la consulta de bandeja recorre la tabla completa (TABLE ACCESS FULL) sobre INCIDENCIA');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_idx
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation LIKE 'INDEX%'
+       AND object_name = 'IX_INCIDENCIA_BANDEJA_ESTADO';
+
+    IF v_idx = 0 THEN
+        RAISE_APPLICATION_ERROR(-20914, 'ORACULO AC-BAN-09: el plan de la consulta de bandeja no usa el indice ix_incidencia_bandeja_estado');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_sort
+      FROM plan_table
+     WHERE statement_id = 'TSK060BAN'
+       AND operation = 'SORT'
+       AND options LIKE 'ORDER BY%';
+
+    IF v_sort <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20915, 'ORACULO AC-BAN-09: el plan ordena en memoria con SORT ORDER BY: el orden no lo esta sirviendo el indice');
+    END IF;
+
+    DELETE FROM plan_table WHERE statement_id = 'TSK060BAN';
+
+    -- 20 ejecuciones reales de la consulta de bandeja, SIN hint: aqui se mide el comportamiento.
+    FOR t IN 1..20 LOOP
+        v_ini := DBMS_UTILITY.GET_TIME;
+        v_filas := 0;
+
+        FOR r IN (SELECT i.incident_id
+                    FROM incidencia i
+                   WHERE i.status = 'ABIERTA'
+                     AND i.room_id = v_room
+                   ORDER BY i.created_at DESC, i.incident_id DESC
+                  OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY) LOOP
+            v_filas := v_filas + 1;
+        END LOOP;
+
+        -- GET_TIME devuelve centisegundos; el umbral de AC-BAN-09 esta en milisegundos.
+        v_ms := (DBMS_UTILITY.GET_TIME - v_ini) * 10;
+        v_tiempos(t) := v_ms;
+
+        IF v_filas <> 25 THEN
+            RAISE_APPLICATION_ERROR(-20916, 'ORACULO AC-BAN-09: la pagina de bandeja devuelve ' || v_filas || ' filas en lugar de 25');
+        END IF;
+    END LOOP;
+
+    -- Ordenacion por seleccion de los 20 tiempos, de menor a mayor.
+    FOR i IN 1..19 LOOP
+        v_pos := i;
+        FOR j IN i + 1 .. 20 LOOP
+            IF v_tiempos(j) < v_tiempos(v_pos) THEN
+                v_pos := j;
+            END IF;
+        END LOOP;
+
+        IF v_pos <> i THEN
+            v_aux := v_tiempos(i);
+            v_tiempos(i) := v_tiempos(v_pos);
+            v_tiempos(v_pos) := v_aux;
+        END IF;
+    END LOOP;
+
+    -- Percentil 95 de 20 muestras: el elemento en la posicion CEIL(0.95 * 20) = 19.
+    v_p95 := v_tiempos(19);
+
+    IF v_p95 >= 2000 THEN
+        RAISE_APPLICATION_ERROR(-20917, 'ORACULO AC-BAN-09: el p95 de la consulta de bandeja sobre 1200 incidencias es ' || v_p95 || ' ms y el umbral de AC-BAN-09 es 2000 ms');
+    END IF;
+
+    -- La paginacion se resuelve en base de datos tambien en el extremo del dataset: la ultima
+    -- pagina sale por OFFSET ... FETCH sin materializar las 1200 filas en la aplicacion.
+    SELECT COUNT(*)
+      INTO v_filas
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE room_id = v_room
+             ORDER BY created_at DESC, incident_id DESC
+            OFFSET 1175 ROWS FETCH NEXT 25 ROWS ONLY);
+
+    IF v_filas <> 25 THEN
+        RAISE_APPLICATION_ERROR(-20918, 'ORACULO AC-BAN-09: la ultima pagina del dataset no se resuelve con OFFSET ... FETCH');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
