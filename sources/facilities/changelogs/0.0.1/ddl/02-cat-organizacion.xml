@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-07" author="MIND">
+        <comment>Catalogo de oficinas</comment>
+        <sql>CREATE TABLE cat_oficina (
+    office_id   NUMBER GENERATED ALWAYS AS IDENTITY,
+    office_code VARCHAR2(10 CHAR) NOT NULL,
+    office_name VARCHAR2(80 CHAR) NOT NULL,
+    city        VARCHAR2(60 CHAR),
+    is_active   CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
+    CONSTRAINT pk_cat_oficina PRIMARY KEY (office_id),
+    CONSTRAINT uk_cat_oficina_office_code UNIQUE (office_code),
+    CONSTRAINT ck_cat_oficina_is_active CHECK (is_active IN ('Y','N'))
+)</sql>
+        <rollback>
+            <dropTable tableName="cat_oficina"/>
+        </rollback>
+    </changeSet>
+
+    <!--
+        Las columnas de auditoria created_by/updated_by NO llevan todavia clave ajena: la tabla
+        `usuario` aun no existe en ningun changelog de este repositorio y una FK contra una tabla
+        inexistente haria fallar el `update`. Las restricciones `fk_cat_sala_created_by` y
+        `fk_cat_sala_updated_by` hacia `usuario` las anadira la tarea que cree dicha tabla.
+    -->
+    <changeSet id="ddl-0.0.1-08" author="MIND">
+        <comment>Catalogo de salas con auditoria y clave ajena a la oficina</comment>
+        <sql>CREATE TABLE cat_sala (
+    room_id    NUMBER GENERATED ALWAYS AS IDENTITY,
+    room_code  VARCHAR2(20 CHAR) NOT NULL,
+    room_name  VARCHAR2(80 CHAR) NOT NULL,
+    office_id  NUMBER NOT NULL,
+    is_active  CHAR(1 CHAR) DEFAULT 'Y' NOT NULL,
+    created_at TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    created_by NUMBER NOT NULL,
+    updated_at TIMESTAMP(6),
+    updated_by NUMBER,
+    CONSTRAINT pk_cat_sala PRIMARY KEY (room_id),
+    CONSTRAINT uk_cat_sala_room_code UNIQUE (room_code),
+    CONSTRAINT ck_cat_sala_room_name_len CHECK (LENGTH(TRIM(room_name)) BETWEEN 2 AND 80),
+    CONSTRAINT ck_cat_sala_is_active CHECK (is_active IN ('Y','N')),
+    CONSTRAINT fk_cat_sala_office_id FOREIGN KEY (office_id) REFERENCES cat_oficina (office_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="cat_sala"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-09" author="MIND">
+        <comment>REQ-099: el nombre de sala es unico por oficina sin distinguir mayusculas</comment>
+        <sql>CREATE UNIQUE INDEX uk_cat_sala_office_upper_name ON cat_sala (office_id, UPPER(room_name))</sql>
+        <rollback>
+            <sql>DROP INDEX uk_cat_sala_office_upper_name</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10" author="MIND">
+        <comment>El codigo de sala es inmutable una vez dada de alta</comment>
+        <sql splitStatements="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_cat_sala_room_code_ro
+BEFORE UPDATE OF room_code ON cat_sala
+FOR EACH ROW
+BEGIN
+    IF NVL(:NEW.room_code, '@@NULL@@') <> NVL(:OLD.room_code, '@@NULL@@') THEN
+        RAISE_APPLICATION_ERROR(-20031, 'El codigo de la sala no puede modificarse tras el alta');
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_cat_sala_room_code_ro</sql>
+        </rollback>
+    </changeSet>
+
+    <!--
+        Trigger de NIVEL SENTENCIA (sin FOR EACH ROW): es la unica forma de consultar cat_oficina
+        y cat_sala desde el propio trigger sin provocar ORA-04091 (mutating table).
+    -->
+    <changeSet id="ddl-0.0.1-11" author="MIND">
+        <comment>AC-SAL-04 / REQ-099: no se puede desactivar una oficina con salas activas ni dejar el catalogo sin oficinas activas</comment>
+        <sql splitStatements="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_cat_oficina_desactivar
+AFTER UPDATE ON cat_oficina
+DECLARE
+    l_count NUMBER;
+BEGIN
+    SELECT COUNT(*)
+      INTO l_count
+      FROM cat_oficina o
+     WHERE o.is_active = 'N'
+       AND EXISTS (SELECT 1
+                     FROM cat_sala s
+                    WHERE s.office_id = o.office_id
+                      AND s.is_active = 'Y');
+
+    IF l_count > 0 THEN
+        RAISE_APPLICATION_ERROR(-20030, 'No se puede desactivar una oficina con salas activas');
+    END IF;
+
+    SELECT COUNT(*)
+      INTO l_count
+      FROM cat_oficina o
+     WHERE o.is_active = 'Y';
+
+    IF l_count = 0 THEN
+        RAISE_APPLICATION_ERROR(-20032, 'Debe permanecer al menos una oficina activa');
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_cat_oficina_desactivar</sql>
+        </rollback>
+    </changeSet>
+
+    <!--
+        El trigger consulta cat_oficina, tabla DISTINTA de cat_sala, por lo que no hay
+        problema de tabla mutante (ORA-04091) y puede ser de nivel fila.
+    -->
+    <changeSet id="ddl-0.0.1-12" author="MIND">
+        <comment>REQ-098: una sala activa solo puede colgar de una oficina activa</comment>
+        <sql splitStatements="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_cat_sala_oficina_activa
+BEFORE INSERT OR UPDATE OF office_id, is_active ON cat_sala
+FOR EACH ROW
+DECLARE
+    l_is_active CHAR(1);
+BEGIN
+    IF :NEW.is_active = 'Y' THEN
+        SELECT o.is_active
+          INTO l_is_active
+          FROM cat_oficina o
+         WHERE o.office_id = :NEW.office_id;
+
+        IF l_is_active = 'N' THEN
+            RAISE_APPLICATION_ERROR(-20033, 'La oficina seleccionada no existe o esta inactiva');
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20033, 'La oficina seleccionada no existe o esta inactiva');
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_cat_sala_oficina_activa</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
