@@ -559,4 +559,553 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-10-07" author="MIND">
+        <comment>Oraculo AC-RET-10 / REQ-150: UPDATE sobre room_name_snapshot devuelve ORA-20010 y ningun dato cambia</comment>
+        <!--
+            Tercer ORACULO DE COMPORTAMIENTO: ejecuta contra el Oracle real del despliegue las dos
+            mitades de AC-RET-10. La primera es que los TRES *_snapshot son inmutables: un UPDATE
+            sobre room_name_snapshot, sobre office_name_snapshot o sobre category_name_snapshot debe
+            devolver exactamente ORA-20010, que es el codigo que el DoD exige y el que la API
+            traduce a 409. Un codigo distinto (por ejemplo un ORA-01407 o un ORA-02290) significaria
+            que la denominacion historica esta protegida por accidente y no por la regla de negocio.
+
+            La segunda mitad es que la proteccion es QUIRURGICA y no un candado sobre la fila: un
+            UPDATE legitimo de otras columnas (status, updated_at, version) tiene que pasar sin
+            error, porque trg_incidencia_snapshot_ro se declara BEFORE UPDATE OF solo sobre las tres
+            columnas de denominacion. Por eso el oraculo comprueba ademas que version pasa de 0 a 1:
+            es la prueba observable de que la escritura legitima SI se aplico.
+
+            Tras los tres intentos rechazados y el UPDATE legitimo se releen las tres denominaciones
+            y se comparan con las originales. La instantanea textual completa de la fila (antes y
+            despues) NO se compara por igualdad, porque el UPDATE legitimo cambia de forma esperada
+            updated_at y version; se conserva unicamente para que el mensaje de error muestre la
+            fila entera si alguna denominacion llegase a cambiar.
+
+            Como los oraculos anteriores, el bloque es una UNICA sentencia JDBC, no contiene ni una
+            sola sentencia DDL (un DDL provocaria un commit implicito y dejaria grabados sus datos),
+            siembra por MERGE los catalogos que los changelogs dml aun no han poblado y lo deshace
+            todo con el ROLLBACK final. Usa codigos de oficina y de sala propios (OF-ORA53C /
+            SAL-ORA53C), display_order / sort_order 9xx y correos @example.invalid, de modo que es
+            independiente del resto de oraculos y no colisiona con el catalogo real.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_office       NUMBER;
+    v_room         NUMBER;
+    v_cat          NUMBER;
+    v_inc          NUMBER;
+    v_sqlcode      NUMBER;
+    v_version      NUMBER;
+    v_antes        VARCHAR2(4000);
+    v_despues      VARCHAR2(4000);
+    v_room_snap    incidencia.room_name_snapshot%TYPE;
+    v_office_snap  incidencia.office_name_snapshot%TYPE;
+    v_cat_snap     incidencia.category_name_snapshot%TYPE;
+    v_room_ahora   incidencia.room_name_snapshot%TYPE;
+    v_office_ahora incidencia.office_name_snapshot%TYPE;
+    v_cat_ahora    incidencia.category_name_snapshot%TYPE;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+
+    FUNCTION instantanea(p_id NUMBER) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT incident_id || '|' || reference_code || '|' || room_id || '|' || category_id || '|' ||
+               room_name_snapshot || '|' || office_name_snapshot || '|' || category_name_snapshot || '|' ||
+               description || '|' || status || '|' || reported_by || '|' ||
+               TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS.FF6'), '~') || '|' ||
+               version
+          INTO v_txt
+          FROM incidencia
+         WHERE incident_id = p_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('AUDIOVISUAL', 'Audiovisual oraculo', 903, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'AUDIOVISUAL';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA53C' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA53C', 'Oficina Oraculo Inmutable', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA53C';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Snapshot Admin', 'oraculo.tsk053.snap.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Snapshot Empleado', 'oraculo.tsk053.snap.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA53C' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA53C', 'Sala Oraculo Inmutable', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA53C';
+
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9053-000070', v_room, v_cat,
+                 'La pantalla de la sala parpadea durante las reuniones', v_empleado)
+      RETURNING incident_id INTO v_inc;
+
+    SELECT room_name_snapshot, office_name_snapshot, category_name_snapshot
+      INTO v_room_snap, v_office_snap, v_cat_snap
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    v_antes := instantanea(v_inc);
+
+    -- Intento A: manipular la denominacion historica de la sala.
+    BEGIN
+        UPDATE incidencia SET room_name_snapshot = 'Sala Manipulada' WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20010 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-RET-10: el UPDATE de room_name_snapshot devolvio ' || v_sqlcode || ' en lugar de ORA-20010');
+    END IF;
+
+    -- Intento B: manipular la denominacion historica de la oficina.
+    BEGIN
+        UPDATE incidencia SET office_name_snapshot = 'Oficina Manipulada' WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20010 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-RET-10: el UPDATE de office_name_snapshot devolvio ' || v_sqlcode || ' en lugar de ORA-20010');
+    END IF;
+
+    -- Intento C: manipular la denominacion historica de la categoria.
+    BEGIN
+        UPDATE incidencia SET category_name_snapshot = 'Categoria Manipulada' WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20010 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-RET-10: el UPDATE de category_name_snapshot devolvio ' || v_sqlcode || ' en lugar de ORA-20010');
+    END IF;
+
+    -- La proteccion es quirurgica: un UPDATE de OTRAS columnas tiene que pasar sin error.
+    BEGIN
+        UPDATE incidencia
+           SET status = 'ABIERTA',
+               updated_at = SYS_EXTRACT_UTC(SYSTIMESTAMP),
+               version = version + 1
+         WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-RET-10: el trigger de snapshots ha bloqueado un UPDATE legitimo de otras columnas');
+    END IF;
+
+    SELECT room_name_snapshot, office_name_snapshot, category_name_snapshot, version
+      INTO v_room_ahora, v_office_ahora, v_cat_ahora, v_version
+      FROM incidencia
+     WHERE incident_id = v_inc;
+
+    v_despues := instantanea(v_inc);
+
+    IF v_room_ahora <> v_room_snap
+       OR v_office_ahora <> v_office_snap
+       OR v_cat_ahora <> v_cat_snap THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO AC-RET-10: alguna denominacion historica ha cambiado pese a los UPDATE rechazados' || SUBSTR(' [antes=' || v_antes || '] [despues=' || v_despues || ']', 1, 1800));
+    END IF;
+
+    IF v_version <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20955, 'ORACULO AC-RET-10: el UPDATE legitimo de version no se ha aplicado');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10-08" author="MIND">
+        <comment>Oraculo AC-RET-09 / REQ-150: renombrar la sala en cat_sala no reescribe el snapshot de la incidencia ya registrada</comment>
+        <!--
+            Cuarto ORACULO DE COMPORTAMIENTO. AC-RET-10 ya demuestra que nadie puede reescribir la
+            denominacion historica DESDE la incidencia; este demuestra la otra via de fuga, la que de
+            verdad ocurre en produccion: que el catalogo cambie POR DEBAJO de una incidencia ya
+            registrada.
+
+            Monta el escenario de AC-RET-09 al pie de la letra: una sala llamada 'Sala 2' sobre la
+            que se registra una incidencia, y despues un renombrado legitimo de esa sala a
+            'Sala Norte'. El renombrado es legitimo porque en cat_sala solo room_code es inmutable
+            (trg_cat_sala_room_code_ro, ORA-20031); room_name SI se puede corregir.
+
+            El alta se hace SIN informar los *_snapshot, de modo que es el motor quien sella la
+            denominacion vigente (REQ-150). Tras el renombrado, el oraculo hace el MISMO JOIN que
+            hace la pantalla de detalle y comprueba las tres cosas que exige el criterio: que el
+            snapshot sigue diciendo 'Sala 2', que el catalogo ya dice 'Sala Norte', y que con ambos
+            valores el detalle puede componer el literal exacto
+            'Sala Norte (en el momento del alta: Sala 2)'. Si el snapshot se hubiese reescrito, el
+            historico de la incidencia estaria falseado.
+
+            La ultima comprobacion cubre REQ-102 por el lado de la categoria: se desactiva la
+            categoria DESPUES del alta y se verifica que category_name_snapshot sigue siendo legible
+            y no nulo. Una desactivacion de catalogo nunca puede dejar sin clasificacion legible a
+            una incidencia ya registrada.
+
+            Como los oraculos anteriores, no contiene DDL alguno, siembra por MERGE con codigos
+            propios (OF-ORA53D / SAL-ORA53D), display_order / sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_empleado  NUMBER;
+    v_office    NUMBER;
+    v_room      NUMBER;
+    v_cat       NUMBER;
+    v_inc       NUMBER;
+    v_snapshot  incidencia.room_name_snapshot%TYPE;
+    v_vigente   cat_sala.room_name%TYPE;
+    v_detalle   VARCHAR2(400);
+    v_cat_snap  incidencia.category_name_snapshot%TYPE;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion oraculo', 904, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA53D' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA53D', 'Oficina Oraculo Retencion', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA53D';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Renombrado Admin', 'oraculo.tsk053.ren.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Renombrado Empleado', 'oraculo.tsk053.ren.empleado@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA53D' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA53D', 'Sala 2', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA53D';
+
+    -- Alta SIN informar los *_snapshot: los sella el motor con la denominacion vigente.
+    INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+         VALUES ('INC-9053-000080', v_room, v_cat,
+                 'El aire acondicionado de la sala no deja de gotear', v_empleado)
+      RETURNING incident_id INTO v_inc;
+
+    SELECT room_name_snapshot INTO v_snapshot FROM incidencia WHERE incident_id = v_inc;
+    IF v_snapshot <> 'Sala 2' THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO AC-RET-09: el alta no ha sellado la denominacion vigente de la sala');
+    END IF;
+
+    -- Renombrado LEGITIMO del catalogo: en cat_sala solo room_code es inmutable.
+    UPDATE cat_sala
+       SET room_name = 'Sala Norte',
+           updated_at = SYS_EXTRACT_UTC(SYSTIMESTAMP),
+           updated_by = v_admin
+     WHERE room_id = v_room;
+
+    -- El mismo JOIN que hace la pantalla de detalle: historico de la incidencia + vigente del catalogo.
+    SELECT i.room_name_snapshot, s.room_name
+      INTO v_snapshot, v_vigente
+      FROM incidencia i
+      JOIN cat_sala s ON s.room_id = i.room_id
+     WHERE i.incident_id = v_inc;
+
+    IF v_snapshot <> 'Sala 2' THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO AC-RET-09: el renombrado de la sala ha reescrito el snapshot historico de la incidencia');
+    END IF;
+
+    IF v_vigente <> 'Sala Norte' THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO AC-RET-09: el renombrado de la sala no se ha aplicado al catalogo');
+    END IF;
+
+    v_detalle := v_vigente || ' (en el momento del alta: ' || v_snapshot || ')';
+    IF v_detalle <> 'Sala Norte (en el momento del alta: Sala 2)' THEN
+        RAISE_APPLICATION_ERROR(-20963, 'ORACULO AC-RET-09: el detalle no puede componer la denominacion vigente mas la historica, resultado: ' || v_detalle);
+    END IF;
+
+    -- REQ-102: desactivar la categoria DESPUES del alta no deja la incidencia sin clasificacion legible.
+    UPDATE cat_categoria_incidencia SET is_active = 'N' WHERE category_id = v_cat;
+
+    SELECT category_name_snapshot INTO v_cat_snap FROM incidencia WHERE incident_id = v_inc;
+    IF v_cat_snap IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20964, 'ORACULO AC-RET-09: la clasificacion deja de ser legible tras desactivar la categoria');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10-09" author="MIND">
+        <comment>Oraculo AC-SEG-01 / REQ-024: el listado acotado por reported_by sobre 13 incidencias devuelve exactamente las 3 propias</comment>
+        <!--
+            Quinto ORACULO DE COMPORTAMIENTO, el del alcance de datos. Siembra el escenario literal de
+            AC-SEG-01: TRECE incidencias en la tabla, de las cuales solo TRES pertenecen al usuario de
+            la sesion y las otras diez a un reportante ajeno.
+
+            Despues ejecuta la consulta ACOTADA tal y como la construye el repositorio cuando el
+            alcance es OWN (filtro reported_by = :session_user, servido por el indice
+            ix_incidencia_mis_incidencias) y comprueba que devuelve exactamente 3. Un resultado de 13
+            significaria que el filtro de propiedad no se esta aplicando y que un empleado ve
+            incidencias que no son suyas.
+
+            La segunda comprobacion es de DISYUNCION: ninguna de las diez filas del reportante ajeno
+            puede aparecer dentro del conjunto acotado. Es la mitad negativa del criterio, la que
+            demuestra que no hay fuga de filas ajenas aunque el recuento cuadre.
+
+            La tercera cubre REQ-158, el orden por defecto created_at DESC, incident_id DESC: como
+            las tres incidencias propias se insertan en el mismo instante, el desempate por
+            incident_id DESC es el unico que decide, y la primera fila del listado tiene que ser
+            justo la de incident_id mas alto. Sin ese desempate la paginacion no seria estable y una
+            misma fila podria aparecer en dos paginas o en ninguna.
+
+            Como los oraculos anteriores, no contiene DDL alguno, siembra por MERGE con codigos
+            propios (OF-ORA53E / SAL-ORA53E), display_order / sort_order 9xx y correos
+            @example.invalid, y deshace todos sus datos con el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin    NUMBER;
+    v_sesion   NUMBER;
+    v_ajeno    NUMBER;
+    v_office   NUMBER;
+    v_room     NUMBER;
+    v_cat      NUMBER;
+    v_total    NUMBER;
+    v_propias  NUMBER;
+    v_ajenas   NUMBER;
+    v_primera  NUMBER;
+    v_maxima   NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('OTROS', 'Otros oraculo', 905, 'Y');
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA53E' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA53E', 'Oficina Oraculo Alcance', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA53E';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Alcance Admin', 'oraculo.tsk053.seg.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Alcance Sesion', 'oraculo.tsk053.seg.sesion@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_sesion;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Alcance Ajeno', 'oraculo.tsk053.seg.ajeno@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_ajeno;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA53E' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA53E', 'Sala Oraculo Alcance', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA53E';
+
+    -- Tres incidencias del usuario de la sesion.
+    FOR i IN 1..3 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9053-1' || LPAD(i, 5, '0'), v_room, v_cat,
+                     'Incidencia propia del usuario de la sesion numero ' || i, v_sesion);
+    END LOOP;
+
+    -- Diez incidencias de un reportante ajeno.
+    FOR i IN 1..10 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9053-2' || LPAD(i, 5, '0'), v_room, v_cat,
+                     'Incidencia ajena de otro reportante numero ' || i, v_ajeno);
+    END LOOP;
+
+    SELECT COUNT(*) INTO v_total FROM incidencia WHERE reported_by IN (v_sesion, v_ajeno);
+    IF v_total <> 13 THEN
+        RAISE_APPLICATION_ERROR(-20970, 'ORACULO AC-SEG-01: el escenario deberia tener 13 incidencias y tiene ' || v_total);
+    END IF;
+
+    -- Consulta ACOTADA con data_scope = OWN, servida por ix_incidencia_mis_incidencias.
+    SELECT COUNT(*) INTO v_propias FROM incidencia WHERE reported_by = v_sesion;
+    IF v_propias <> 3 THEN
+        RAISE_APPLICATION_ERROR(-20971, 'ORACULO AC-SEG-01: el listado acotado por reported_by devuelve ' || v_propias || ' incidencias en lugar de 3');
+    END IF;
+
+    -- El conjunto acotado y el conjunto ajeno tienen que ser disjuntos: ni una sola fila en comun.
+    SELECT COUNT(*)
+      INTO v_ajenas
+      FROM incidencia
+     WHERE reported_by = v_ajeno
+       AND incident_id IN (SELECT incident_id FROM incidencia WHERE reported_by = v_sesion);
+    IF v_ajenas <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20972, 'ORACULO AC-SEG-01: el listado propio incluye ' || v_ajenas || ' incidencias ajenas');
+    END IF;
+
+    -- REQ-158: orden por defecto created_at DESC, incident_id DESC.
+    SELECT incident_id
+      INTO v_primera
+      FROM (SELECT incident_id
+              FROM incidencia
+             WHERE reported_by = v_sesion
+             ORDER BY created_at DESC, incident_id DESC)
+     WHERE ROWNUM = 1;
+
+    SELECT MAX(incident_id) INTO v_maxima FROM incidencia WHERE reported_by = v_sesion;
+
+    IF v_primera <> v_maxima THEN
+        RAISE_APPLICATION_ERROR(-20973, 'ORACULO REQ-158: el orden created_at DESC, incident_id DESC no es determinista');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
