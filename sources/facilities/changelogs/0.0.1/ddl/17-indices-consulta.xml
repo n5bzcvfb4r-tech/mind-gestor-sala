@@ -1430,4 +1430,335 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-17-10" author="MIND">
+        <comment>Oraculo REQ-103 / REQ-159: las vistas de filtro ofrecen los valores activos mas los inactivos CON incidencias asociadas, marcados con es_inactivo, y excluyen los inactivos sin uso</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO de la regla 2 de REQ-103 sobre las tres vistas de filtro
+            (v_filtro_sala, v_filtro_oficina y v_filtro_categoria). Esa regla dice que un valor de
+            catalogo DESACTIVADO aparece en el filtro UNICAMENTE si tiene al menos una incidencia
+            asociada, y que cuando aparece va MARCADO como inactivo para que la SPA lo pinte con el
+            literal '(inactiva)' junto al nombre.
+
+            La regla tiene DOS MITADES y este oraculo comprueba las dos, porque cumplir solo una de
+            ellas es un defecto distinto pero igual de real:
+
+              - La mitad POSITIVA: un valor desactivado que YA tiene uso historico SIGUE siendo
+                seleccionable. Es lo que permite a un empleado reencontrar sus incidencias antiguas
+                de una categoria retirada o de una sala cerrada (REQ-159 regla 3). Si el filtro
+                dejase caer esos valores, las incidencias quedarian inalcanzables desde la interfaz.
+              - La mitad NEGATIVA: un valor desactivado SIN ningun uso desaparece del desplegable y
+                no lo ensucia. Una implementacion que se limitase a no filtrar nada ofreceria todo
+                el catalogo historico y cumpliria la primera mitad incumpliendo esta.
+
+            Ademas del escenario concreto sembrado (tres oficinas, tres salas y tres categorias con
+            las combinaciones activa/inactiva y con/sin uso), el oraculo comprueba la regla como
+            INVARIANTE SOBRE TODO EL CATALOGO, contrastando cada vista contra su tabla base: ningun
+            valor activo puede faltar, ningun inactivo-con-uso puede faltar y ningun inactivo-sin-uso
+            puede sobrar. Esa comprobacion es la que convierte al oraculo en una prueba de la REGLA y
+            no solo de las filas que el mismo ha sembrado. Por ultimo verifica la COHERENCIA DEL
+            FLAG: en las tres vistas, es_inactivo tiene que ser exactamente la negacion del is_active
+            de la tabla base en TODAS las filas, porque una marca equivocada haria creer que una sala
+            cerrada sigue operativa o al reves.
+
+            El orden de la siembra no es casual y respeta los invariantes del esquema: las
+            incidencias se insertan con las salas y las categorias AUN activas, porque
+            trg_incidencia_clasificacion exige que ambas lo esten al registrar; y las desactivaciones
+            van primero las salas y despues las oficinas, dejando siempre OF-ORA60H activa, porque
+            trg_cat_oficina_desactivar rechaza una oficina inactiva con salas activas (ORA-20030) y
+            exige que quede al menos una oficina activa (ORA-20032).
+
+            Como el resto de oraculos del proyecto, NO contiene DDL alguno, siembra por MERGE con
+            codigos propios (OF-ORA60F / OF-ORA60G / OF-ORA60H, SAL-ORA60G / SAL-ORA60H / SAL-ORA60I),
+            display_order y sort_order 9xx y correos @example.invalid, y deshace todos sus datos con
+            el ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin         NUMBER;
+    v_tecnico       NUMBER;
+
+    v_office_f      NUMBER;
+    v_office_g      NUMBER;
+    v_office_h      NUMBER;
+    v_room_g        NUMBER;
+    v_room_h        NUMBER;
+    v_room_i        NUMBER;
+    v_cat_otros     NUMBER;
+    v_cat_limpieza  NUMBER;
+    v_cat_clima     NUMBER;
+
+    v_n             NUMBER;
+    v_usos          NUMBER;
+    v_mal           NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_active VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, p_active);
+
+        -- Garantiza el estado de actividad que el oraculo necesita aunque la fila ya existiese.
+        UPDATE cat_categoria_incidencia SET is_active = p_active WHERE category_code = p_code;
+    END sembrar_categoria;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+
+    -- Las tres categorias entran ACTIVAS: las incidencias no se pueden registrar contra una
+    -- categoria inactiva (trg_incidencia_clasificacion), asi que la desactivacion viene despues.
+    sembrar_categoria('OTROS', 'Otros', 905, 'Y');
+    sembrar_categoria('LIMPIEZA', 'Limpieza', 904, 'Y');
+    sembrar_categoria('CLIMATIZACION', 'Climatizacion', 902, 'Y');
+
+    SELECT category_id INTO v_cat_otros    FROM cat_categoria_incidencia WHERE category_code = 'OTROS';
+    SELECT category_id INTO v_cat_limpieza FROM cat_categoria_incidencia WHERE category_code = 'LIMPIEZA';
+    SELECT category_id INTO v_cat_clima    FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+
+    -- Los usuarios se crean ANTES que las salas porque cat_sala.created_by es NOT NULL.
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Filtros Admin', 'oraculo.tsk060.flt.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Filtros Tecnico', 'oraculo.tsk060.flt.tecnico@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    -- OF-ORA60F: acabara INACTIVA y CON incidencias (a traves de SAL-ORA60H).
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60F' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60F', 'Oficina Oraculo Filtro Con Uso', 'Madrid', 'Y');
+    SELECT office_id INTO v_office_f FROM cat_oficina WHERE office_code = 'OF-ORA60F';
+
+    -- OF-ORA60G: acabara INACTIVA y SIN salas ni incidencias.
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60G' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60G', 'Oficina Oraculo Filtro Sin Uso', 'Sevilla', 'Y');
+    SELECT office_id INTO v_office_g FROM cat_oficina WHERE office_code = 'OF-ORA60G';
+
+    -- OF-ORA60H: se queda ACTIVA siempre, para que nunca falte una oficina activa (ORA-20032).
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA60H' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA60H', 'Oficina Oraculo Filtro Activa', 'Bilbao', 'Y');
+    SELECT office_id INTO v_office_h FROM cat_oficina WHERE office_code = 'OF-ORA60H';
+
+    -- SAL-ORA60G: de OF-ORA60H, se queda ACTIVA y sin incidencias.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60G' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60G', 'Sala Oraculo Filtro Activa Sin Uso', v_office_h, 'Y', v_admin);
+    SELECT room_id INTO v_room_g FROM cat_sala WHERE room_code = 'SAL-ORA60G';
+
+    -- SAL-ORA60H: de OF-ORA60F, CON incidencias, acabara INACTIVA.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60H' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60H', 'Sala Oraculo Filtro Inactiva Con Uso', v_office_f, 'Y', v_admin);
+    SELECT room_id INTO v_room_h FROM cat_sala WHERE room_code = 'SAL-ORA60H';
+
+    -- SAL-ORA60I: de OF-ORA60F, SIN incidencias, acabara INACTIVA.
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA60I' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA60I', 'Sala Oraculo Filtro Inactiva Sin Uso', v_office_f, 'Y', v_admin);
+    SELECT room_id INTO v_room_i FROM cat_sala WHERE room_code = 'SAL-ORA60I';
+
+    -- Incidencias con la sala y las categorias AUN activas: 3 de OTROS y 2 de LIMPIEZA, todas en
+    -- SAL-ORA60H, que es la que dara uso historico a la sala, a su oficina y a esas categorias.
+    FOR i IN 1..3 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-F' || LPAD(i, 5, '0'), v_room_h, v_cat_otros,
+                     'Incidencia de categoria general del oraculo de filtros numero ' || i, v_tecnico);
+    END LOOP;
+
+    FOR i IN 4..5 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9060-F' || LPAD(i, 5, '0'), v_room_h, v_cat_limpieza,
+                     'Incidencia de limpieza del oraculo de filtros numero ' || i, v_tecnico);
+    END LOOP;
+
+    -- DESACTIVACIONES. El orden es obligatorio: primero las salas, despues las oficinas (una
+    -- oficina inactiva con salas activas es ORA-20030) y por ultimo las categorias.
+    UPDATE cat_sala SET is_active = 'N' WHERE room_code IN ('SAL-ORA60H', 'SAL-ORA60I');
+    UPDATE cat_oficina SET is_active = 'N' WHERE office_code IN ('OF-ORA60F', 'OF-ORA60G');
+    UPDATE cat_categoria_incidencia SET is_active = 'N' WHERE category_code IN ('LIMPIEZA', 'CLIMATIZACION');
+
+    -- (a) MITAD POSITIVA en salas: la sala desactivada CON uso sigue ofreciendose y va marcada.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_h AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20920, 'ORACULO REQ-103: la sala desactivada con incidencias asociadas no se ofrece en el filtro marcada como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (b) MITAD NEGATIVA en salas: la sala desactivada SIN uso desaparece del desplegable.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_i;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20921, 'ORACULO REQ-103: la sala desactivada sin incidencias se sigue ofreciendo en el filtro, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (c) Una sala ACTIVA se ofrece aunque no tenga uso, y se marca como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_sala WHERE room_id = v_room_g AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20922, 'ORACULO REQ-103: una sala activa sin incidencias no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (d) MITAD POSITIVA en oficinas: el uso llega a la oficina a traves de SAL-ORA60H.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_f AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20923, 'ORACULO REQ-103: la oficina desactivada con incidencias en sus salas no se ofrece en el filtro marcada como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (e) MITAD NEGATIVA en oficinas: la oficina desactivada sin salas ni uso no se ofrece.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_g;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20924, 'ORACULO REQ-103: la oficina desactivada sin salas ni incidencias se sigue ofreciendo en el filtro, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (f) Una oficina ACTIVA se ofrece marcada como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_oficina WHERE office_id = v_office_h AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20925, 'ORACULO REQ-103: una oficina activa no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (g) MITAD POSITIVA en categorias (REQ-159 regla 3): la categoria retirada con uso historico
+    -- sigue siendo seleccionable, que es lo que deja al empleado reencontrar sus incidencias.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_categoria WHERE category_id = v_cat_limpieza AND es_inactivo = 'Y';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20926, 'ORACULO REQ-103: la categoria desactivada con uso historico ya no es seleccionable: el empleado pierde sus incidencias antiguas de esa categoria, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- (h) MITAD NEGATIVA en categorias. La comprobacion se condiciona al hecho base (que la
+    -- categoria no tenga NINGUNA incidencia) para seguir siendo correcta sobre una base ya poblada.
+    SELECT COUNT(*) INTO v_usos FROM incidencia WHERE category_id = v_cat_clima;
+    SELECT COUNT(*) INTO v_n    FROM v_filtro_categoria WHERE category_id = v_cat_clima;
+    IF v_usos = 0 AND v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20927, 'ORACULO REQ-103: la categoria desactivada sin ninguna incidencia asociada se sigue ofreciendo en el filtro');
+    END IF;
+
+    -- (i) Una categoria ACTIVA con uso se ofrece marcada como activa.
+    SELECT COUNT(*) INTO v_n FROM v_filtro_categoria WHERE category_id = v_cat_otros AND es_inactivo = 'N';
+    IF v_n <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20928, 'ORACULO REQ-103: una categoria activa con uso no se ofrece en el filtro o se marca como inactiva, filas obtenidas: ' || v_n);
+    END IF;
+
+    -- LA REGLA COMO INVARIANTE SOBRE TODO EL CATALOGO, no solo sobre las filas sembradas: para cada
+    -- vista, ningun activo puede faltar, ningun inactivo-con-uso puede faltar y ningun
+    -- inactivo-sin-uso puede sobrar.
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_sala s
+     WHERE (s.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id))
+        OR (s.is_active = 'N' AND     EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id))
+        OR (s.is_active = 'N' AND NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.room_id = s.room_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_sala f WHERE f.room_id = s.room_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_sala no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_oficina o
+     WHERE (o.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id))
+        OR (o.is_active = 'N' AND     EXISTS (SELECT 1
+                                                FROM incidencia i
+                                                JOIN cat_sala s ON s.room_id = i.room_id
+                                               WHERE s.office_id = o.office_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id))
+        OR (o.is_active = 'N' AND NOT EXISTS (SELECT 1
+                                                FROM incidencia i
+                                                JOIN cat_sala s ON s.room_id = i.room_id
+                                               WHERE s.office_id = o.office_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_oficina f WHERE f.office_id = o.office_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_oficina no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM cat_categoria_incidencia c
+     WHERE (c.is_active = 'Y' AND NOT EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id))
+        OR (c.is_active = 'N' AND     EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)
+                                AND NOT EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id))
+        OR (c.is_active = 'N' AND NOT EXISTS (SELECT 1 FROM incidencia i WHERE i.category_id = c.category_id)
+                                AND     EXISTS (SELECT 1 FROM v_filtro_categoria f WHERE f.category_id = c.category_id));
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20929, 'ORACULO REQ-103: la vista v_filtro_categoria no cumple la regla de activos mas inactivos con uso en ' || v_mal || ' filas del catalogo');
+    END IF;
+
+    -- COHERENCIA DEL FLAG: es_inactivo es la negacion exacta de is_active en TODAS las filas.
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_sala f
+      JOIN cat_sala s ON s.room_id = f.room_id
+     WHERE f.es_inactivo <> CASE WHEN s.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_sala publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_oficina f
+      JOIN cat_oficina o ON o.office_id = f.office_id
+     WHERE f.es_inactivo <> CASE WHEN o.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_oficina publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    SELECT COUNT(*) INTO v_mal
+      FROM v_filtro_categoria f
+      JOIN cat_categoria_incidencia c ON c.category_id = f.category_id
+     WHERE f.es_inactivo <> CASE WHEN c.is_active = 'N' THEN 'Y' ELSE 'N' END;
+
+    IF v_mal <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20919, 'ORACULO REQ-103: la vista v_filtro_categoria publica un es_inactivo incoherente con is_active en ' || v_mal || ' filas');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
