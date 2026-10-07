@@ -598,4 +598,436 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-14-07" author="MIND">
+        <comment>Oraculo AC-AVI-01 / AC-AVI-02 / AC-AVI-05: exactamente un aviso de alta por incidencia, un aviso por entrada de historico, y el rollback del alta no deja ninguna fila en el outbox</comment>
+        <!--
+            Este es el ORACULO DE COMPORTAMIENTO del patron OUTBOX (ADR-006) que pide el DoD, y como
+            los de los changesets 14-05 y 14-06 se ejecuta contra el motor Oracle real durante el
+            propio despliegue: monta el escenario completo del alta de una incidencia (catalogos,
+            cuentas, sala, categoria, incidencia y asientos de historico), comprueba las invariantes
+            del outbox sobre esos datos reales y DESHACE sus propios datos, de modo que no deja ni una
+            fila en la base.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL: un DDL provocaria un commit implicito, los datos del oraculo
+            quedarian grabados y ademas haria imposible la propia reversion que aqui se verifica.
+            Siembra los catalogos igual que los oraculos de 13-incidencia-historico.xml (MERGE para
+            los de clave fija, "buscar o insertar" para los de clave IDENTITY), porque los changelogs
+            dml se aplican DESPUES de los ddl y aqui todavia estan vacios, y usa identificadores
+            propios (sufijo "outbox", reference_code 'INC-ORA57-000001', display_order en el rango
+            973..976) para no chocar con los de ningun oraculo anterior.
+
+            POR QUE LA COMPROBACION 5 ES LA CLAVE DE AC-AVI-05
+            ==================================================
+            La solicitud de aviso se INSERTA en la MISMA transaccion que el alta de la incidencia, que
+            es literalmente lo que significa "outbox transaccional". De ahi se siguen las dos mitades
+            del requisito. Si el alta se revierte, NO queda ninguna solicitud huerfana: el despachador
+            no acabara entregando un correo por una incidencia que nunca llego a existir, que es lo
+            que ocurriria si el aviso se encolase fuera de la transaccion o contra un servicio
+            externo. Y simetricamente, una vez hecho commit el aviso esta PERSISTIDO en la base y
+            sobrevive al reinicio del contenedor, que es lo que exige REQ-132 y lo que una cola en
+            memoria del proceso no puede dar: al reiniciar, el despachador vuelve a encontrar la fila
+            PENDIENTE y la entrega.
+
+            La comprobacion lee los COUNT DESPUES del ROLLBACK, no antes, y exige cero en
+            aviso_correo, cero en incidencia y cero en el conjunto de claves del oraculo.
+
+            POR QUE LAS COMPROBACIONES 2 Y 4 USAN UNA notification_key DISTINTA
+            ===================================================================
+            Para AISLAR el mecanismo que se esta verificando. Si el segundo INSERT repitiera la clave
+            de negocio, quien lo rechazaria seria uk_aviso_correo_notif_key (eso ya lo cubre el
+            oraculo 14-05) y los indices unicos parciales ux_aviso_correo_alta y
+            ux_aviso_correo_cambio_estado podrian estar mal definidos, o directamente no existir, y el
+            oraculo pasaria igualmente. Con la clave de negocio DISTINTA, el unico mecanismo que puede
+            devolver ORA-00001 es el indice unico parcial, que es justo lo que se quiere demostrar.
+
+            POR QUE EXISTE LA COMPROBACION 3
+            ================================
+            Un indice unico demasiado AMPLIO (por ejemplo sobre incident_id a secas, sin acotar al
+            subconjunto NEW_INCIDENT_ALERT) pasaria sin despeinarse las comprobaciones 1, 2 y 4, y
+            dejaria el sistema SIN ningun aviso de cambio de estado, que es la otra mitad de REQ-137.
+            La comprobacion 3 encola un STATUS_CHANGE_ALERT de la MISMA incidencia y exige que PASE.
+            Es la misma precaucion que la comprobacion 3 del oraculo 14-06, donde se exige que el
+            trigger de estado terminal deje pasar el UPDATE que no cambia de estado.
+
+            POR QUE EL AVISO DE ALTA VA SIN DESTINATARIO
+            ============================================
+            El NEW_INCIDENT_ALERT se encola con recipient_user_id y recipient_email NULOS A PROPOSITO:
+            es un aviso al COLECTIVO de tecnicos de mantenimiento, cuyos destinatarios se resuelven
+            contra el directorio en el MOMENTO DEL DESPACHO (REQ-082 / REQ-089 / REQ-131) y no en el
+            encolado. Que ese INSERT pase es por si mismo una comprobacion del oraculo: una NOT NULL
+            sobre el destinatario romperia el encolado dentro de la transaccion del alta y, con el,
+            el alta entera.
+
+            NOTA SOBRE entry_hash
+            =====================
+            Los asientos de historico del escenario calculan su entry_hash de forma SIMPLIFICADA
+            (STANDARD_HASH sobre una semilla propia del oraculo, que ya devuelve los 64 hexadecimales
+            en mayusculas que admite ck_inc_hist_entry_hash). No se reproduce aqui la forma canonica
+            de la cadena de huellas porque este oraculo verifica el OUTBOX, no la integridad del
+            encadenado, que ya cubren los oraculos 13-05 y 13-06 de TSK-056.
+
+            TODAS las marcas temporales del escenario son PASADAS porque trg_incidencia_ciclo_vida
+            rechaza con ORA-20053 cualquier marca futura.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin          NUMBER;
+    v_empleado       NUMBER;
+    v_tecnico        NUMBER;
+    v_oficina        NUMBER;
+    v_sala           NUMBER;
+    v_categoria      NUMBER;
+    v_inc            NUMBER;
+    v_hist           NUMBER;
+    v_now            TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0             TIMESTAMP;
+    v_t1             TIMESTAMP;
+    v_hash_alta      VARCHAR2(64 CHAR);
+    v_hash_cambio    VARCHAR2(64 CHAR);
+    v_aviso_alta     VARCHAR2(36 CHAR);
+    v_aviso_alta_bis VARCHAR2(36 CHAR);
+    v_aviso_cambio   VARCHAR2(36 CHAR);
+    v_aviso_cam_bis  VARCHAR2(36 CHAR);
+    v_status         VARCHAR2(20 CHAR);
+    v_filas          NUMBER;
+    v_avisos         NUMBER;
+    v_incidencias    NUMBER;
+    v_claves         NUMBER;
+    v_sqlcode        NUMBER := 0;
+
+    c_prefijo       CONSTANT VARCHAR2(20 CHAR)  := 'ORACULO-TSK057|';
+    c_admin_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-057 Outbox Administrador';
+    c_empleado_nom  CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-057 Outbox Reportante';
+    c_tecnico_nom   CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-057 Outbox Tecnico';
+    c_empleado_mail CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk057.outbox.reportante@example.invalid';
+    c_referencia    CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA57-000001';
+    c_descripcion   CONSTANT VARCHAR2(500 CHAR) := 'El climatizador de la sala de reuniones no enfria y la sala se queda inutilizable toda la manana';
+    c_sala_nom      CONSTANT VARCHAR2(80 CHAR)  := 'Sala del oraculo TSK-057';
+    c_oficina_nom   CONSTANT VARCHAR2(80 CHAR)  := 'Oficina del oraculo TSK-057';
+    c_categoria_nm  CONSTANT VARCHAR2(60 CHAR)  := 'Climatizacion oraculo TSK-057';
+    c_alta_nota     CONSTANT VARCHAR2(500 CHAR) := 'Alta de la incidencia desde el oraculo de outbox TSK-057';
+    c_cambio_nota   CONSTANT VARCHAR2(500 CHAR) := 'Cambio de estado desde el oraculo de outbox TSK-057';
+    c_asunto_alta   CONSTANT VARCHAR2(255 CHAR) := 'Nueva incidencia registrada (oraculo TSK-057)';
+    c_cuerpo_alta   CONSTANT VARCHAR2(500 CHAR) := 'Cuerpo congelado del aviso de alta del oraculo TSK-057.';
+    c_asunto_cam    CONSTANT VARCHAR2(255 CHAR) := 'Cambio de estado de su incidencia (oraculo TSK-057)';
+    c_cuerpo_cam    CONSTANT VARCHAR2(500 CHAR) := 'Cuerpo congelado del aviso de cambio de estado del oraculo TSK-057.';
+
+    -- Semillas idempotentes de los catalogos de clave fija. Los display_order quedan fuera del
+    -- rango de las semillas reales y fuera del de los oraculos anteriores (971 y 972), porque
+    -- uk_cat_rol_display_order y uk_cat_categoria_display_order son UNIQUE.
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven
+    -- con el equivalente "buscar o insertar": si la semilla real ya existe se reutiliza, y si no
+    -- se crea una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA57';
+        -- Si la oficina YA existia se REACTIVA antes de devolverla: trg_cat_sala_oficina_activa
+        -- rechaza colgar una sala de una oficina inactiva. Es un UPDATE de DATOS (no DDL) que vive
+        -- dentro de la transaccion del oraculo y que el ROLLBACK final revierte.
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA57', c_oficina_nom, 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA57-SALA-01';
+        -- Si la sala YA existia se REACTIVA antes de devolverla: trg_incidencia_clasificacion
+        -- rechaza con ORA-20011 el alta sobre una sala inactiva.
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA57-SALA-01', c_sala_nom, p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        -- El oraculo NO puede usar un category_code propio porque ck_cat_categoria_code cierra el
+        -- enumerado, de modo que reutiliza CLIMATIZACION. Si la fila YA existia se REACTIVA antes de
+        -- devolverla: trg_incidencia_clasificacion rechaza con ORA-20012 el alta sobre una categoria
+        -- inactiva. Mismo criterio que en oficina_oraculo: UPDATE de DATOS que el ROLLBACK deshace.
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', c_categoria_nm, 976, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    -- Huella SIMPLIFICADA: este oraculo verifica el OUTBOX, no la cadena de huellas de TSK-056, de
+    -- modo que no reproduce la forma canonica del asiento. STANDARD_HASH es funcion de SQL y se
+    -- invoca con SELECT ... FROM dual; RAWTOHEX devuelve hexadecimal en MAYUSCULAS, que es
+    -- exactamente lo que admite ck_inc_hist_entry_hash ('^[0-9A-F]{64}$').
+    FUNCTION huella(p_semilla VARCHAR2) RETURN VARCHAR2 IS
+        l_hash VARCHAR2(64 CHAR);
+    BEGIN
+        SELECT RAWTOHEX(STANDARD_HASH('oraculo-tsk057-' || p_semilla, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+BEGIN
+    v_t0 := v_now - INTERVAL '4' HOUR;
+    v_t1 := v_now - INTERVAL '3' HOUR;
+
+    -- ==================================================================================
+    -- MONTAJE: catalogos, cuentas y clasificacion del escenario
+    -- ==================================================================================
+    sembrar_rol('EMPLEADO',              'Empleado',               973);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 974);
+    sembrar_rol('ADMINISTRADOR',         'Administrador',          975);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    -- username, password_hash y password_algorithm son NOT NULL sin default desde
+    -- 06-usuario-credenciales.xml, y ux_usuario_username_ci exige un username distinto por cuenta.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk057.outbox.admin@example.invalid',
+                 'oraculo.tsk057.outbox.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk057-outbox-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_empleado_nom, c_empleado_mail,
+                 'oraculo.tsk057.outbox.reportante', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk057-outbox-reportante', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_tecnico_nom, 'oraculo.tsk057.outbox.tecnico@example.invalid',
+                 'oraculo.tsk057.outbox.tecnico', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk057-outbox-tecnico', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    -- ==================================================================================
+    -- LA UNIDAD DE TRABAJO DEL ALTA: incidencia y solicitud de aviso en la MISMA
+    -- transaccion, que es literalmente lo que significa el patron outbox de ADR-006
+    -- ==================================================================================
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t0, v_t0, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    -- El identificador del aviso lo genera el emisor (VARCHAR2(36)): SYS_GUID en hexadecimal
+    -- minuscula ocupa 32 caracteres y cabe de sobra.
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_alta FROM dual;
+
+    -- Encolado del aviso de alta, SIN COMMIT por medio. recipient_user_id y recipient_email van
+    -- NULOS A PROPOSITO: el aviso de alta se dirige al COLECTIVO de tecnicos de mantenimiento y sus
+    -- destinatarios se resuelven contra el directorio en el momento del despacho (REQ-082 /
+    -- REQ-131). Que este INSERT pase es ya una comprobacion: una NOT NULL sobre el destinatario
+    -- romperia el encolado dentro de la transaccion del alta. status se deja SIN INFORMAR para que
+    -- lo ponga el DEFAULT de la columna.
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              incident_id, history_entry_id,
+                              recipient_user_id, recipient_email, subject, body_text)
+         VALUES (v_aviso_alta, c_prefijo || 'NEW_INCIDENT_ALERT|' || v_inc, 'NEW_INCIDENT_ALERT',
+                 v_inc, NULL,
+                 NULL, NULL, c_asunto_alta, c_cuerpo_alta);
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-AVI-01): el alta deja EXACTAMENTE una solicitud de aviso de alta y
+    -- nace PENDIENTE. Se lee DE LA TABLA, no de las variables del escenario. El COUNT va por
+    -- separado del estado (con MAX) para que un recuento distinto de 1 no reviente con
+    -- NO_DATA_FOUND o TOO_MANY_ROWS antes de poder contarlo en el mensaje de error.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_filas
+      FROM aviso_correo
+     WHERE incident_id = v_inc AND notification_type = 'NEW_INCIDENT_ALERT';
+
+    SELECT MAX(status) INTO v_status
+      FROM aviso_correo
+     WHERE incident_id = v_inc AND notification_type = 'NEW_INCIDENT_ALERT';
+
+    IF v_filas <> 1 OR NVL(v_status, '~') <> 'PENDIENTE' THEN
+        RAISE_APPLICATION_ERROR(-20994, 'ORACULO TSK-057 / AC-AVI-01: el alta deberia dejar exactamente una solicitud NEW_INCIDENT_ALERT en PENDIENTE para la incidencia, y hay ' || v_filas || ' en estado ' || NVL(v_status, '(ninguno)'));
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-AVI-02): ningun SEGUNDO aviso de alta para la misma incidencia.
+    -- La notification_key es DISTINTA a proposito: asi lo que rechaza este INSERT es el indice
+    -- unico parcial ux_aviso_correo_alta y NO uk_aviso_correo_notif_key (que ya verifica el
+    -- oraculo 14-05). Si se reutilizase la clave de negocio, el indice parcial podria estar mal
+    -- definido o no existir y la comprobacion pasaria igualmente, sin demostrar nada.
+    -- -------------------------------------------------------------------------------------
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_alta_bis FROM dual;
+
+    v_sqlcode := 0;
+    BEGIN
+        INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                                  incident_id, history_entry_id,
+                                  recipient_user_id, recipient_email, subject, body_text)
+             VALUES (v_aviso_alta_bis, c_prefijo || 'NEW_INCIDENT_ALERT|BIS|' || v_inc, 'NEW_INCIDENT_ALERT',
+                     v_inc, NULL,
+                     NULL, NULL, c_asunto_alta, c_cuerpo_alta);
+    EXCEPTION
+        WHEN DUP_VAL_ON_INDEX THEN
+            v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode <> -1 THEN
+        RAISE_APPLICATION_ERROR(-20994, 'ORACULO TSK-057 / AC-AVI-02: el segundo aviso de alta para la misma incidencia NO fue rechazado con ORA-00001 (SQLCODE=' || v_sqlcode || '): el equipo de mantenimiento recibiria un segundo correo de alta');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3 (REQ-137): el indice parcial NO es un candado por incidencia. Se escriben
+    -- los dos asientos de historico del escenario (el de alta y un cambio de estado) y se encola
+    -- el aviso de cambio de estado de la MISMA incidencia, que TIENE que pasar. Sin esta
+    -- comprobacion, un indice unico sobre incident_id a secas pasaria las comprobaciones 1, 2 y 4
+    -- y dejaria el sistema sin ningun aviso de cambio de estado.
+    -- -------------------------------------------------------------------------------------
+    v_hash_alta := huella('creacion|' || v_inc);
+
+    INSERT INTO incidencia_historico (
+        incident_id, entry_type, from_status, to_status,
+        actor_user_id, actor_display_name, changed_at,
+        entry_comment, previous_entry_hash, entry_hash)
+    VALUES (
+        v_inc, 'CREACION', NULL, 'ABIERTA',
+        v_empleado, c_empleado_nom, v_t0,
+        c_alta_nota, NULL, v_hash_alta);
+
+    v_hash_cambio := huella('cambio|' || v_inc || '|' || v_hash_alta);
+
+    INSERT INTO incidencia_historico (
+        incident_id, entry_type, from_status, to_status,
+        actor_user_id, actor_display_name, changed_at,
+        entry_comment, previous_entry_hash, entry_hash)
+    VALUES (
+        v_inc, 'CAMBIO_ESTADO', 'ABIERTA', 'EN_CURSO',
+        v_tecnico, c_tecnico_nom, v_t1,
+        c_cambio_nota, v_hash_alta, v_hash_cambio)
+    RETURNING history_id INTO v_hist;
+
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_cambio FROM dual;
+
+    v_sqlcode := 0;
+    BEGIN
+        INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                                  incident_id, history_entry_id,
+                                  recipient_user_id, recipient_email, subject, body_text,
+                                  previous_status_code, new_status_code)
+             VALUES (v_aviso_cambio, c_prefijo || 'STATUS_CHANGE_ALERT|' || v_inc || '|' || v_hist, 'STATUS_CHANGE_ALERT',
+                     v_inc, v_hist,
+                     v_empleado, c_empleado_mail, c_asunto_cam, c_cuerpo_cam,
+                     'ABIERTA', 'EN_CURSO');
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20995, 'ORACULO TSK-057 / REQ-137: el aviso de cambio de estado de la misma incidencia fue rechazado (SQLCODE=' || v_sqlcode || '): el indice de unicidad del aviso de alta es demasiado amplio');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 4 (REQ-137): un unico aviso por ENTRADA de historico. Igual que en la
+    -- comprobacion 2, la notification_key es DISTINTA para que el unico mecanismo capaz de
+    -- rechazar el INSERT sea el indice unico parcial ux_aviso_correo_cambio_estado.
+    -- -------------------------------------------------------------------------------------
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso_cam_bis FROM dual;
+
+    v_sqlcode := 0;
+    BEGIN
+        INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                                  incident_id, history_entry_id,
+                                  recipient_user_id, recipient_email, subject, body_text,
+                                  previous_status_code, new_status_code)
+             VALUES (v_aviso_cam_bis, c_prefijo || 'STATUS_CHANGE_ALERT|BIS|' || v_inc || '|' || v_hist, 'STATUS_CHANGE_ALERT',
+                     v_inc, v_hist,
+                     v_empleado, c_empleado_mail, c_asunto_cam, c_cuerpo_cam,
+                     'ABIERTA', 'EN_CURSO');
+    EXCEPTION
+        WHEN DUP_VAL_ON_INDEX THEN
+            v_sqlcode := SQLCODE;
+    END;
+
+    IF v_sqlcode <> -1 THEN
+        RAISE_APPLICATION_ERROR(-20995, 'ORACULO TSK-057 / REQ-137: una segunda solicitud para la misma entrada de historico NO fue rechazada con ORA-00001: el reportante recibiria dos correos del mismo cambio de estado');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 5 (AC-AVI-05, patron outbox): el ROLLBACK del alta que fracasa se lleva por
+    -- delante TAMBIEN la solicitud de aviso, porque vive dentro de la misma transaccion. Si
+    -- quedase una sola fila, el despachador acabaria entregando un correo por una incidencia que
+    -- nunca existio. Los recuentos se leen DESPUES del ROLLBACK.
+    -- -------------------------------------------------------------------------------------
+    ROLLBACK;
+
+    SELECT COUNT(*) INTO v_avisos      FROM aviso_correo WHERE incident_id = v_inc;
+    SELECT COUNT(*) INTO v_incidencias FROM incidencia   WHERE incident_id = v_inc;
+
+    IF v_avisos <> 0 OR v_incidencias <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20996, 'ORACULO TSK-057 / AC-AVI-05: tras revertir el alta quedan ' || v_avisos || ' filas en aviso_correo y ' || v_incidencias || ' en incidencia: la solicitud de aviso no vive dentro de la transaccion del alta');
+    END IF;
+
+    -- Ninguna clave del oraculo puede sobrevivir. El patron no necesita ESCAPE: el separador es
+    -- la barra vertical y no el guion bajo, de modo que no hay comodin de un solo caracter.
+    SELECT COUNT(*) INTO v_claves
+      FROM aviso_correo
+     WHERE notification_key LIKE 'ORACULO-TSK057|%';
+
+    IF v_claves <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20996, 'ORACULO TSK-057 / AC-AVI-05: tras revertir el alta quedan ' || v_claves || ' solicitudes del oraculo en el outbox: la solicitud de aviso no vive dentro de la transaccion del alta');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
