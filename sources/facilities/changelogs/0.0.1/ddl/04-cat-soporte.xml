@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-04-01" author="MIND">
+        <comment>Catalogo de motivos de desactivacion de cuenta de usuario</comment>
+        <createTable tableName="cat_motivo_desactivacion">
+            <column name="reason_code" type="VARCHAR2(30 CHAR)">
+                <constraints primaryKey="true" primaryKeyName="pk_cat_motivo_desactivacion" nullable="false"/>
+            </column>
+            <column name="reason_name" type="VARCHAR2(120 CHAR)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="is_active" type="CHAR(1 CHAR)" defaultValue="Y">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="cat_motivo_desactivacion"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-04-02" author="MIND">
+        <comment>Restricciones CHECK del catalogo de motivos de desactivacion</comment>
+        <sql>ALTER TABLE cat_motivo_desactivacion ADD CONSTRAINT ck_cat_motivo_is_active CHECK (is_active IN ('Y','N'))</sql>
+        <rollback>
+            <sql>ALTER TABLE cat_motivo_desactivacion DROP CONSTRAINT ck_cat_motivo_is_active</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-04-03" author="MIND">
+        <comment>Parametros del servidor de correo y del remitente usados para los avisos</comment>
+        <!-- secreto_ref guarda solo una REFERENCIA EXTERNA al secreto (identificador en el gestor de secretos): la tabla nunca almacena la credencial SMTP -->
+        <!-- FK a usuario(user_id) pendiente: la tabla usuario la crea una TSK posterior -->
+        <sql>CREATE TABLE configuracion_smtp (
+    config_id                 NUMBER GENERATED ALWAYS AS IDENTITY,
+    smtp_host                 VARCHAR2(255 CHAR) NOT NULL,
+    smtp_port                 NUMBER NOT NULL,
+    use_tls                   CHAR(1 CHAR) DEFAULT 'N' NOT NULL,
+    smtp_username             VARCHAR2(255 CHAR),
+    secreto_ref               VARCHAR2(512 CHAR),
+    sender_address            VARCHAR2(254 CHAR) NOT NULL,
+    sender_display_name       VARCHAR2(100 CHAR) NOT NULL,
+    facilities_fallback_email VARCHAR2(254 CHAR),
+    max_attempts              NUMBER DEFAULT 3 NOT NULL,
+    is_active                 CHAR(1 CHAR) DEFAULT 'N' NOT NULL,
+    updated_at                TIMESTAMP NOT NULL,
+    updated_by                NUMBER NOT NULL,
+    CONSTRAINT pk_configuracion_smtp PRIMARY KEY (config_id),
+    CONSTRAINT ck_configuracion_smtp_port CHECK (smtp_port BETWEEN 1 AND 65535),
+    CONSTRAINT ck_configuracion_smtp_tls CHECK (use_tls IN ('Y','N')),
+    CONSTRAINT ck_configuracion_smtp_activa CHECK (is_active IN ('Y','N')),
+    CONSTRAINT ck_configuracion_smtp_intentos CHECK (max_attempts &gt;= 1)
+)</sql>
+        <rollback>
+            <dropTable tableName="configuracion_smtp"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-04-04" author="MIND">
+        <comment>Como maximo una configuracion SMTP activa</comment>
+        <sql>CREATE UNIQUE INDEX ux_configuracion_smtp_una_activa ON configuracion_smtp (CASE WHEN is_active = 'Y' THEN 1 END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_configuracion_smtp_una_activa</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-04-05" author="MIND">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'CONFIGURACION_SMTP' AND (column_name LIKE '%PASSWORD%' OR column_name LIKE '%PASSWD%' OR column_name LIKE '%CLAVE%' OR column_name LIKE '%CONTRASE%' OR (column_name LIKE '%SECRET%' AND column_name &lt;&gt; 'SECRETO_REF'))</sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-076/AC-SMTP-11: configuracion_smtp no expone ninguna columna de contrasena en claro</comment>
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
