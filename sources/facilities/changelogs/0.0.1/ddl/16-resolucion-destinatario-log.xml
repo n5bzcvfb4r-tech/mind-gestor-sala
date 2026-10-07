@@ -345,4 +345,232 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-16-07" author="MIND">
+        <comment>Oraculo AC-DIR-05 / REQ-081 RN-02: UPDATE y DELETE sobre un registro devuelven ORA-20005 y lo dejan identico</comment>
+        <!--
+            Comprueba contra el motor Oracle real las DOS mitades de la inmutabilidad del registro de
+            resoluciones: que el UPDATE y que el DELETE sobre una fila ya escrita son rechazados con
+            ORA-20005, el error que lanza trg_resolucion_dest_inmutable.
+
+            Ademas de constatar el rechazo, verifica que la fila SIGUE EXISTIENDO y que es identica
+            byte a byte: toma una instantanea textual de todas sus columnas fisicas y su huella
+            SHA-256 antes de los intentos y las vuelve a calcular despues, de modo que ni un solo
+            caracter puede haber cambiado.
+
+            Oracle hace rollback a nivel de SENTENCIA cuando el trigger lanza el error, por lo que
+            los intentos fallidos no tumban los datos ya insertados por el propio oraculo y el bloque
+            puede seguir comprobando sobre ellos.
+
+            La ultima comprobacion cubre la vertiente de trigger de SENTENCIA: un UPDATE que no
+            afecta a ninguna fila tambien se rechaza con ORA-20005.
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl. El
+            bloque deshace sus propios datos con un ROLLBACK final y no deja ni una fila.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_emp       NUMBER;
+    v_res       NUMBER;
+    v_antes     VARCHAR2(4000);
+    v_despues   VARCHAR2(4000);
+    v_sqlcode   NUMBER;
+    v_filas     NUMBER;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    FUNCTION instantanea(p_resolution_id NUMBER) RETURN VARCHAR2 IS
+        v_txt VARCHAR2(4000);
+    BEGIN
+        SELECT resolution_id || '|' || request_type || '|' || requested_by_module || '|' ||
+               NVL(TO_CHAR(subject_user_id), '~') || '|' ||
+               TO_CHAR(resolved_user_ids) || '|' ||
+               recipient_count || '|' || is_fallback_used || '|' || outcome || '|' ||
+               TO_CHAR(resolved_at, 'YYYY-MM-DD HH24:MI:SS.FF6') || '|' ||
+               NVL(TO_CHAR(resolved_by_user_id), '~')
+          INTO v_txt
+          FROM resolucion_destinatario_log
+         WHERE resolution_id = p_resolution_id;
+        RETURN v_txt;
+    END instantanea;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Resolucion Inmutable Admin', 'oraculo.tsk059.inmutable.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Resolucion Inmutable', 'oraculo.tsk059.inmutable@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp;
+
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_admin)
+      RETURNING resolution_id INTO v_res;
+
+    v_antes := instantanea(v_res);
+
+    -- MITAD 1: el UPDATE sobre una fila existente es rechazado por el trigger.
+    BEGIN
+        UPDATE resolucion_destinatario_log SET outcome = 'ERROR_TECNICO' WHERE resolution_id = v_res;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20950, 'ORACULO AC-DIR-05: el UPDATE sobre resolucion_destinatario_log devolvio ' || v_sqlcode || ' en lugar de ORA-20005');
+    END IF;
+
+    -- MITAD 2: el DELETE sobre esa misma fila es rechazado por el trigger.
+    BEGIN
+        DELETE FROM resolucion_destinatario_log WHERE resolution_id = v_res;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20951, 'ORACULO AC-DIR-05: el DELETE sobre resolucion_destinatario_log devolvio ' || v_sqlcode || ' en lugar de ORA-20005');
+    END IF;
+
+    SELECT COUNT(*) INTO v_filas FROM resolucion_destinatario_log WHERE resolution_id = v_res;
+    IF v_filas <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20952, 'ORACULO AC-DIR-05: el registro ha desaparecido tras el intento de borrado');
+    END IF;
+
+    v_despues := instantanea(v_res);
+    IF v_antes <> v_despues
+       OR RAWTOHEX(STANDARD_HASH(v_antes, 'SHA256')) <> RAWTOHEX(STANDARD_HASH(v_despues, 'SHA256')) THEN
+        RAISE_APPLICATION_ERROR(-20953, 'ORACULO AC-DIR-05: el registro no es identico byte a byte tras el UPDATE y el DELETE rechazados');
+    END IF;
+
+    -- Trigger de SENTENCIA: una sentencia que no afecta a ninguna fila tambien se rechaza.
+    BEGIN
+        UPDATE resolucion_destinatario_log SET recipient_count = 99 WHERE resolution_id = -1;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20005 THEN
+        RAISE_APPLICATION_ERROR(-20954, 'ORACULO REQ-081 RN-02: un UPDATE que no afecta a ninguna fila no fue rechazado con ORA-20005');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-16-08" author="MIND">
+        <comment>Oraculo REQ-081 RN-03 / REQ-015: los registros de resolucion se conservan 2 anios</comment>
+        <!--
+            Demuestra de forma observable la conservacion a 2 anios del registro de resoluciones: un
+            registro fechado hace 23 MESES sigue disponible y consultable integro dentro de la
+            ventana de 24 meses, mientras que otro fechado hace 2 ANIOS Y UN DIA queda FUERA de esa
+            ventana (AC-DIR-05 / REQ-015). Las dos mitades juntas fijan el borde de la ventana, no
+            solo que "haya filas".
+
+            La fila de 23 meses se relee para comprobar que conserva integro su contenido (tipo de
+            peticion, recuento, resultado y lista de identificadores resueltos).
+
+            No hay ningun proceso de purga sobre resolucion_destinatario_log y el trigger de
+            inmutabilidad impide el borrado, de modo que la disponibilidad durante la ventana esta
+            garantizada por construccion.
+
+            [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+            implementa purga alguna al cumplirse los 2 anios]
+
+            Siembra cat_rol por MERGE porque los changelogs dml se aplican DESPUES de los ddl. El
+            bloque deshace sus propios datos con un ROLLBACK final.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_emp         NUMBER;
+    v_res         NUMBER;
+    v_t23         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '23' MONTH;
+    v_t24         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH - INTERVAL '1' DAY;
+    v_en_ventana  NUMBER;
+    v_fuera       NUMBER;
+    v_tipo        VARCHAR2(20);
+    v_count       NUMBER;
+    v_outcome     VARCHAR2(30);
+    v_ids         VARCHAR2(4000);
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status)
+         VALUES ('Oraculo Resolucion Retencion Admin', 'oraculo.tsk059.retencion.admin@example.invalid', 'ADMINISTRADOR', 'ACTIVO')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, role_code, status, created_by)
+         VALUES ('Oraculo Resolucion Retencion', 'oraculo.tsk059.retencion@example.invalid', 'EMPLEADO', 'ACTIVO', v_admin)
+      RETURNING user_id INTO v_emp;
+
+    -- Dentro de la ventana de retencion: hace 23 meses.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_at, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_t23, v_admin)
+      RETURNING resolution_id INTO v_res;
+
+    -- Fuera de la ventana de retencion: hace 2 anios y un dia.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id, resolved_user_ids, recipient_count, is_fallback_used, outcome, resolved_at, resolved_by_user_id)
+         VALUES ('INDIVIDUAL', 'MOD-002-AVISOS', v_emp, '[' || v_emp || ']', 1, 'N', 'OK', v_t24, v_admin);
+
+    SELECT COUNT(*) INTO v_en_ventana
+      FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_emp
+       AND resolved_at >= SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_en_ventana <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20960, 'ORACULO REQ-081 RN-03: se esperaba 1 registro dentro de la ventana de retencion de 2 anios y hay ' || v_en_ventana);
+    END IF;
+
+    SELECT COUNT(*) INTO v_fuera
+      FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_emp
+       AND resolved_at < SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    IF v_fuera <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20961, 'ORACULO REQ-015: se esperaba 1 registro fuera de la ventana de retencion y hay ' || v_fuera);
+    END IF;
+
+    SELECT request_type, recipient_count, outcome, TO_CHAR(resolved_user_ids)
+      INTO v_tipo, v_count, v_outcome, v_ids
+      FROM resolucion_destinatario_log
+     WHERE resolution_id = v_res;
+    IF v_tipo <> 'INDIVIDUAL' OR v_count <> 1 OR v_outcome <> 'OK' OR v_ids <> '[' || v_emp || ']' THEN
+        RAISE_APPLICATION_ERROR(-20962, 'ORACULO REQ-081 RN-03: el registro de hace 23 meses no conserva integro su contenido');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
