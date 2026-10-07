@@ -66,4 +66,128 @@
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-10-02" author="MIND">
+        <comment>Indices de acceso de la bandeja del tecnico y de "Mis incidencias"</comment>
+        <!--
+            ix_incidencia_mis_incidencias sirve a REQ-024 / REQ-158 / AC-SEG-01 ("Mis incidencias"),
+            porque cubre a la vez el filtro de propiedad reported_by = :session_user y el orden por
+            defecto created_at DESC, incident_id DESC, de modo que la paginacion es estable y no
+            necesita ordenacion adicional.
+
+            Los otros tres sirven a los filtros de la bandeja del tecnico (REQ-025 / REQ-105) por
+            sala, categoria y estado, y ademas evitan el bloqueo de tabla padre en los DELETE sobre
+            los catalogos al tener indice la columna hija de cada FK.
+        -->
+        <sql>CREATE INDEX ix_incidencia_mis_incidencias ON incidencia (reported_by, created_at DESC, incident_id DESC)</sql>
+        <sql>CREATE INDEX ix_incidencia_room ON incidencia (room_id)</sql>
+        <sql>CREATE INDEX ix_incidencia_category ON incidencia (category_id)</sql>
+        <sql>CREATE INDEX ix_incidencia_status ON incidencia (status)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_incidencia_status</sql>
+            <sql>DROP INDEX ix_incidencia_category</sql>
+            <sql>DROP INDEX ix_incidencia_room</sql>
+            <sql>DROP INDEX ix_incidencia_mis_incidencias</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10-03" author="MIND" runOnChange="true">
+        <comment>AC-RET-10 / REQ-150: cualquier UPDATE sobre las columnas *_snapshot se rechaza con ORA-20010</comment>
+        <!--
+            El trigger se declara BEFORE UPDATE OF sobre las tres columnas de denominacion, de modo
+            que solo se evalua cuando la sentencia las menciona.
+
+            La comparacion con NVL impide que un UPDATE que las "reescriba con el mismo valor" se
+            considere una modificacion, y como el trigger no se dispara siquiera cuando la sentencia
+            no toca esas columnas, un UPDATE legitimo de otras columnas (status, updated_at,
+            version) no se ve afectado.
+
+            ORA-20010 es el codigo que exige el DoD y el que la API traduce a 409.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_snapshot_ro
+BEFORE UPDATE OF room_name_snapshot, office_name_snapshot, category_name_snapshot ON incidencia
+FOR EACH ROW
+BEGIN
+    IF NVL(:NEW.room_name_snapshot, '@@NULL@@')     <> NVL(:OLD.room_name_snapshot, '@@NULL@@')
+    OR NVL(:NEW.office_name_snapshot, '@@NULL@@')   <> NVL(:OLD.office_name_snapshot, '@@NULL@@')
+    OR NVL(:NEW.category_name_snapshot, '@@NULL@@') <> NVL(:OLD.category_name_snapshot, '@@NULL@@') THEN
+        RAISE_APPLICATION_ERROR(-20010, 'El registro histórico no admite modificaciones');
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_snapshot_ro</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-10-04" author="MIND" runOnChange="true">
+        <comment>REQ-100 / REQ-102 / AC-CLAS-01: el alta y la reclasificacion exigen sala y categoria EXISTENTES y ACTIVAS, y sellan la denominacion vigente (REQ-150)</comment>
+        <!--
+            (a) La FK sola no basta porque NO distingue un catalogo INACTIVO de uno inexistente: la
+            FK acepta sin rechistar una sala o una categoria desactivada, y REQ-100 exige rechazar
+            AMBOS casos en el alta. Por eso el trigger consulta el catalogo y comprueba is_active.
+
+            (b) is_active se evalua SOLO en la ruta de escritura (INSERT y reclasificacion, es decir
+            UPDATE OF room_id, category_id), nunca en lectura (REQ-102): una sala o categoria
+            desactivada DESPUES del alta no invalida las incidencias ya registradas, que siguen
+            mostrando su literal.
+
+            (c) El relleno de los tres *_snapshot con NVL es una RED DE SEGURIDAD de REQ-150: si el
+            backend ya envia la denominacion, su valor manda; si no la envia, la sella el motor
+            desde el catalogo en el instante del alta, de modo que ninguna fila puede nacer con una
+            denominacion distinta de la vigente. Solo ocurre en INSERTING: en un UPDATE los
+            snapshots los protege trg_incidencia_snapshot_ro.
+
+            (d) El trigger consulta tablas DISTINTAS de incidencia (cat_sala, cat_oficina y
+            cat_categoria_incidencia), por lo que puede ser de nivel fila sin provocar ORA-04091
+            (tabla mutante), igual que trg_cat_sala_oficina_activa.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_incidencia_clasificacion
+BEFORE INSERT OR UPDATE OF room_id, category_id ON incidencia
+FOR EACH ROW
+DECLARE
+    l_room_name     cat_sala.room_name%TYPE;
+    l_room_active   cat_sala.is_active%TYPE;
+    l_office_name   cat_oficina.office_name%TYPE;
+    l_cat_name      cat_categoria_incidencia.category_name%TYPE;
+    l_cat_active    cat_categoria_incidencia.is_active%TYPE;
+BEGIN
+    BEGIN
+        SELECT s.room_name, s.is_active, o.office_name
+          INTO l_room_name, l_room_active, l_office_name
+          FROM cat_sala s
+          JOIN cat_oficina o ON o.office_id = s.office_id
+         WHERE s.room_id = :NEW.room_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20011, 'La sala seleccionada no existe o ya no esta disponible');
+    END;
+
+    BEGIN
+        SELECT c.category_name, c.is_active
+          INTO l_cat_name, l_cat_active
+          FROM cat_categoria_incidencia c
+         WHERE c.category_id = :NEW.category_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20012, 'La categoría seleccionada no es válida');
+    END;
+
+    IF l_room_active = 'N' THEN
+        RAISE_APPLICATION_ERROR(-20011, 'La sala seleccionada no existe o ya no esta disponible');
+    END IF;
+
+    IF l_cat_active = 'N' THEN
+        RAISE_APPLICATION_ERROR(-20012, 'La categoría seleccionada no es válida');
+    END IF;
+
+    IF INSERTING THEN
+        :NEW.room_name_snapshot     := NVL(:NEW.room_name_snapshot, l_room_name);
+        :NEW.office_name_snapshot   := NVL(:NEW.office_name_snapshot, l_office_name);
+        :NEW.category_name_snapshot := NVL(:NEW.category_name_snapshot, l_cat_name);
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_incidencia_clasificacion</sql>
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
