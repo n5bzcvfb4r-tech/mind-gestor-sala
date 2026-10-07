@@ -57,4 +57,51 @@
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-05-02" author="MIND">
+        <comment>REQ-045: unicidad global del correo corporativo insensible a mayusculas y espacios</comment>
+        <!--
+            La unicidad se impone sobre la EXPRESION LOWER(TRIM(corporate_email)), no sobre la
+            columna: este indice funcional es lo que hace que 'A@mapfre.com' y ' a@mapfre.com '
+            se normalicen al mismo valor y colisionen con ORA-00001 en el segundo INSERT.
+        -->
+        <sql>CREATE UNIQUE INDEX ux_usuario_email_ci ON usuario (LOWER(TRIM(corporate_email)))</sql>
+        <rollback>
+            <sql>DROP INDEX ux_usuario_email_ci</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-05-03" author="MIND">
+        <comment>AC-TRZ-03: retention_until, derivada de deactivated_at, es siempre posterior a este</comment>
+        <sql>ALTER TABLE usuario ADD CONSTRAINT ck_usuario_retention_posterior CHECK (retention_until IS NULL OR retention_until &gt; CAST(deactivated_at AS DATE))</sql>
+        <rollback>
+            <sql>ALTER TABLE usuario DROP CONSTRAINT ck_usuario_retention_posterior</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-05-04" author="MIND">
+        <comment>Indices de apoyo del censo: filtro por rol y estado, y listado por antiguedad</comment>
+        <!--
+            ix_usuario_role_status cubre el filtrado combinado por rol y estado del censo.
+            ix_usuario_status_created_at sirve al listado por defecto de REQ-039, ordenado por
+            created_at descendente dentro de cada estado.
+        -->
+        <sql>CREATE INDEX ix_usuario_role_status ON usuario (role_code, status)</sql>
+        <sql>CREATE INDEX ix_usuario_status_created_at ON usuario (status, created_at DESC)</sql>
+        <rollback>
+            <sql>DROP INDEX ix_usuario_status_created_at</sql>
+            <sql>DROP INDEX ix_usuario_role_status</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-05-05" author="MIND">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT COUNT(*) FROM user_tab_cols WHERE table_name = 'USUARIO' AND virtual_column = 'YES' AND column_name IN ('IS_ACTIVE','RETENTION_UNTIL')</sqlCheck>
+        </preConditions>
+        <comment>Oraculo REQ-088/AC-TRZ-03: is_active y retention_until son columnas virtuales de solo lectura</comment>
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
