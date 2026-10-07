@@ -289,4 +289,141 @@ END;</sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-06-10" author="MIND">
+        <comment>Oraculo AC-AUT-04: un locked_until futuro convive con is_active sin alterarlo</comment>
+        <!--
+            El bloqueo por intentos fallidos es TEMPORAL y vive en locked_until: no toca status ni la
+            columna virtual is_active, que se deriva de status (AC-AUT-04 y REQ-055 RN-03, "un bloqueo
+            por intentos fallidos no altera el valor de is_active"). Una cuenta con el umbral de fallos
+            alcanzado y un bloqueo vigente sigue siendo ACTIVA en el censo.
+
+            El contador se lee de la fila de la cuenta, no de ninguna sesion: el oraculo relee
+            failed_password_attempts del propio usuario y comprueba que conserva el valor guardado.
+
+            Los datos que crea son EFIMEROS y se borran en el mismo bloque ANTES de evaluar, igual que
+            en ddl-0.0.1-06-09, de modo que el esquema queda como estaba y el oraculo es repetible; el
+            RAISE_APPLICATION_ERROR va despues de la limpieza para que el update termine en rojo sin
+            dejar residuos.
+        -->
+        <sql splitStatements="false" stripComments="false">DECLARE
+    v_user_id     usuario.user_id%TYPE;
+    v_rol_creado  BOOLEAN := FALSE;
+    v_n           NUMBER;
+    v_is_active   usuario.is_active%TYPE;
+    v_status      usuario.status%TYPE;
+    v_intentos    NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_n FROM cat_rol WHERE role_code = 'EMPLEADO';
+    IF v_n = 0 THEN
+        INSERT INTO cat_rol (role_code, role_name, display_order, is_active)
+        VALUES ('EMPLEADO', 'Empleado (oraculo TSK-049)', 9049, 'Y');
+        v_rol_creado := TRUE;
+    END IF;
+
+    -- Cuenta ACTIVA con el umbral de fallos alcanzado y un bloqueo temporal vigente.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash,
+                         password_algorithm, failed_password_attempts, last_failed_attempt_at, locked_until)
+    VALUES ('Oraculo Bloqueo TSK-049', 'oraculo.tsk049.bloqueo@mind.local',
+            'oraculo.tsk049.bloqueo@mind.local', 'EMPLEADO',
+            'hash-oraculo-bloqueo', 'argon2id',
+            5, SYS_EXTRACT_UTC(SYSTIMESTAMP), SYS_EXTRACT_UTC(SYSTIMESTAMP) + INTERVAL '15' MINUTE)
+    RETURNING user_id INTO v_user_id;
+
+    SELECT is_active, status, failed_password_attempts
+      INTO v_is_active, v_status, v_intentos
+      FROM usuario WHERE user_id = v_user_id;
+
+    DELETE FROM usuario WHERE user_id = v_user_id;
+    IF v_rol_creado THEN
+        DELETE FROM cat_rol WHERE role_code = 'EMPLEADO';
+    END IF;
+
+    IF v_is_active &lt;&gt; 'Y' OR v_status &lt;&gt; 'ACTIVO' THEN
+        RAISE_APPLICATION_ERROR(-20072,
+            'AC-AUT-04: un bloqueo temporal ha alterado el estado de la cuenta (status=' || v_status
+            || ', is_active=' || v_is_active || ')');
+    END IF;
+    IF v_intentos &lt;&gt; 5 THEN
+        RAISE_APPLICATION_ERROR(-20072,
+            'REQ-072: failed_password_attempts no ha conservado el valor por cuenta');
+    END IF;
+END;</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-06-11" author="MIND">
+        <comment>Oraculo REQ-054 / AC-AUT-03: dos usuarios con la misma contrasenia tienen password_hash distintos</comment>
+        <!--
+            La sal es POR USUARIO: dos cuentas con la misma contrasenia en claro producen hashes
+            distintos, de modo que un volcado de la tabla no permite deducir que comparten clave
+            (REQ-054 RN-02 / AC-AUT-03). El oraculo inserta las dos cuentas con la MISMA contrasenia
+            y sales distintas, y comprueba que los password_hash resultantes no coinciden.
+
+            STANDARD_HASH se usa aqui solo como hash de LABORATORIO para demostrar el efecto de la
+            sal dentro del propio motor; el algoritmo de produccion es el adaptativo que declara
+            password_algorithm (argon2id), calculado en el backend.
+
+            Los datos que crea son EFIMEROS y se borran en el mismo bloque ANTES de evaluar, de modo
+            que el esquema queda como estaba y el oraculo es repetible.
+        -->
+        <sql splitStatements="false" stripComments="false">DECLARE
+    v_rol_creado  BOOLEAN := FALSE;
+    v_n           NUMBER;
+    v_clave       VARCHAR2(50 CHAR) := 'MismaClave2026';
+    v_salt_a      VARCHAR2(64 CHAR) := 'sal-usuario-a-tsk049';
+    v_salt_b      VARCHAR2(64 CHAR) := 'sal-usuario-b-tsk049';
+    v_hash_a      usuario.password_hash%TYPE;
+    v_hash_b      usuario.password_hash%TYPE;
+BEGIN
+    -- El DDL se aplica antes que las semillas DML, asi que cat_rol puede estar vacio:
+    -- el oraculo se procura el rol que necesita y lo retira si fue el quien lo creo.
+    SELECT COUNT(*) INTO v_n FROM cat_rol WHERE role_code = 'EMPLEADO';
+    IF v_n = 0 THEN
+        INSERT INTO cat_rol (role_code, role_name, display_order, is_active)
+        VALUES ('EMPLEADO', 'Empleado (oraculo TSK-049)', 9049, 'Y');
+        v_rol_creado := TRUE;
+    END IF;
+
+    -- Misma contrasenia en claro, sal propia de cada usuario.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash,
+                         password_salt, password_algorithm)
+    VALUES ('Oraculo Sal A TSK-049', 'oraculo.tsk049.sal.a@mind.local',
+            'oraculo.tsk049.sal.a@mind.local', 'EMPLEADO',
+            LOWER(RAWTOHEX(STANDARD_HASH(v_clave || v_salt_a, 'SHA256'))),
+            v_salt_a, 'argon2id');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, password_hash,
+                         password_salt, password_algorithm)
+    VALUES ('Oraculo Sal B TSK-049', 'oraculo.tsk049.sal.b@mind.local',
+            'oraculo.tsk049.sal.b@mind.local', 'EMPLEADO',
+            LOWER(RAWTOHEX(STANDARD_HASH(v_clave || v_salt_b, 'SHA256'))),
+            v_salt_b, 'argon2id');
+
+    SELECT password_hash INTO v_hash_a
+      FROM usuario WHERE username = 'oraculo.tsk049.sal.a@mind.local';
+    SELECT password_hash INTO v_hash_b
+      FROM usuario WHERE username = 'oraculo.tsk049.sal.b@mind.local';
+
+    DELETE FROM usuario
+     WHERE username IN ('oraculo.tsk049.sal.a@mind.local', 'oraculo.tsk049.sal.b@mind.local');
+    IF v_rol_creado THEN
+        DELETE FROM cat_rol WHERE role_code = 'EMPLEADO';
+    END IF;
+
+    IF v_hash_a IS NULL OR v_hash_b IS NULL THEN
+        RAISE_APPLICATION_ERROR(-20054,
+            'REQ-054: no se ha podido leer el hash de los usuarios del oraculo');
+    END IF;
+    IF v_hash_a = v_hash_b THEN
+        RAISE_APPLICATION_ERROR(-20054,
+            'REQ-054 / AC-AUT-03: dos usuarios con la misma contrasenia comparten password_hash: no hay sal por usuario');
+    END IF;
+END;</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
