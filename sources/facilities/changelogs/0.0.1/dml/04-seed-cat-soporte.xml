@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="dml-0.0.1-04-01" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM cat_motivo_desactivacion</sqlCheck>
+        </preConditions>
+        <comment>Carga semilla del catalogo de motivos de desactivacion (cat_motivo_desactivacion)</comment>
+        <!-- [gap RFP: el catalogo de motivos no esta aportado; valores provisionales pendientes de validacion con el cliente] -->
+        <insert tableName="cat_motivo_desactivacion">
+            <column name="reason_code" value="BAJA_EMPRESA"/>
+            <column name="reason_name" value="Baja en la empresa"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_motivo_desactivacion">
+            <column name="reason_code" value="CAMBIO_FUNCIONES"/>
+            <column name="reason_name" value="Cambio de funciones"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_motivo_desactivacion">
+            <column name="reason_code" value="CESE_TEMPORAL"/>
+            <column name="reason_name" value="Cese temporal"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <insert tableName="cat_motivo_desactivacion">
+            <column name="reason_code" value="OTROS"/>
+            <column name="reason_name" value="Otros"/>
+            <column name="is_active" value="Y"/>
+        </insert>
+        <rollback>
+            <delete tableName="cat_motivo_desactivacion">
+                <where>reason_code IN ('BAJA_EMPRESA','CAMBIO_FUNCIONES','CESE_TEMPORAL','OTROS')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-04-02" author="MIND">
+        <preConditions onFail="MARK_RAN">
+            <sqlCheck expectedResult="0">SELECT COUNT(*) FROM configuracion_smtp</sqlCheck>
+        </preConditions>
+        <comment>Configuracion SMTP por defecto, inactiva hasta que el administrador la complete</comment>
+        <!--
+            Los valores de host y remitente son PROVISIONALES: la fila nace INACTIVA
+            (is_active = 'N') y no se usa para enviar correo hasta que el administrador
+            introduzca la configuracion real desde la aplicacion.
+            La columna config_id es GENERATED ALWAYS AS IDENTITY: no se informa en el insert.
+            Las columnas smtp_username, secreto_ref y facilities_fallback_email quedan NULL;
+            el secreto vive en el gestor de secretos externo, nunca en BBDD.
+        -->
+        <!-- updated_by = 1: cuenta semilla administradora; la FK a usuario la declara la TSK que crea esa tabla -->
+        <insert tableName="configuracion_smtp">
+            <column name="smtp_host" value="localhost"/>
+            <column name="smtp_port" valueNumeric="25"/>
+            <column name="use_tls" value="N"/>
+            <column name="sender_address" value="no-reply@facilities.local"/>
+            <column name="sender_display_name" value="Gestor de Salas"/>
+            <column name="max_attempts" valueNumeric="3"/>
+            <column name="is_active" value="N"/>
+            <column name="updated_at" valueComputed="SYSTIMESTAMP"/>
+            <column name="updated_by" valueNumeric="1"/>
+        </insert>
+        <rollback>
+            <delete tableName="configuracion_smtp">
+                <where>smtp_host = 'localhost' AND sender_address = 'no-reply@facilities.local'</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dml-0.0.1-04-03" author="MIND">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="1">SELECT CASE WHEN COUNT(*) &gt;= 1 THEN 1 ELSE 0 END FROM cat_motivo_desactivacion</sqlCheck>
+            <sqlCheck expectedResult="1">SELECT CASE WHEN COUNT(*) &gt;= 1 THEN 1 ELSE 0 END FROM configuracion_smtp</sqlCheck>
+        </preConditions>
+        <comment>Oraculo DoD: cada catalogo de soporte devuelve al menos una fila</comment>
+        <sql>SELECT 1 FROM DUAL</sql>
+        <rollback>
+            <!-- Changeset de solo verificacion: no hay cambio que deshacer -->
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
