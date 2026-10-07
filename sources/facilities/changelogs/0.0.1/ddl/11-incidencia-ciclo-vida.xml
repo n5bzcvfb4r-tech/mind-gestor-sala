@@ -294,7 +294,7 @@ AND (closed_at IS NULL OR resolved_at IS NULL OR closed_at &gt;= resolved_at)
     <changeSet id="ddl-0.0.1-11-06" author="MIND" runOnChange="true">
         <comment>REQ-119 / REQ-120 / REQ-122 / REQ-111 / REQ-118: marcas selladas una sola vez, ninguna marca futura, comentario de resolucion obligatorio al cerrar e incremento automatico de version</comment>
         <!--
-            Este trigger impone las cuatro reglas del ciclo de vida que NO caben en una restriccion
+            Este trigger impone las reglas del ciclo de vida que NO caben en una restriccion
             declarativa, porque necesitan comparar :NEW con :OLD, leer el reloj del servidor o
             manipular un CLOB. Son, en el orden en que se ejecutan:
 
@@ -315,7 +315,32 @@ AND (closed_at IS NULL OR resolved_at IS NULL OR closed_at &gt;= resolved_at)
             La guarda ":OLD.x IS NOT NULL" delante deja intacto el caso legitimo: escribir por PRIMERA
             vez una marca que aun estaba vacia.
 
-            (2) NINGUNA MARCA EN EL FUTURO (REQ-122 RN-03, validacion 2). Ninguna de las siete marcas
+            (2) SELLADO DE assigned_at EN EL MOTOR (RED DE SEGURIDAD DE AC-ASG-01). Si la
+            escritura deja tecnico asignado y la marca de asignacion vacia, el motor la rellena con
+            el instante del servidor (l_ahora, la misma lectura unica en UTC contra la que se valida
+            el resto de la fila). Es exactamente la tecnica con la que trg_incidencia_clasificacion
+            sella los tres *_snapshot desde el catalogo en 10-incidencia.xml: el valor correcto lo
+            pone el motor, no la sentencia.
+
+            Hace falta porque ck_incidencia_asignacion (ddl-0.0.1-11-04) exige assigned_at informado
+            siempre que haya assigned_technician_id, mientras que la sentencia canonica de
+            autoasignacion de REQ-153 / AC-ASG-02 es
+                UPDATE incidencia SET assigned_technician_id = :u
+                 WHERE incident_id = :id AND assigned_technician_id IS NULL
+            que NO informa la marca. Sin este sellado, esa sentencia moriria con ORA-02290 y la toma
+            de la incidencia tendria que partirse en dos pasos (leer el reloj y escribir) o mandar la
+            marca desde el cliente, que es justo lo que AC-ASG-01 prohibe ("assigned_at se informa
+            con el instante del SERVIDOR"). Con el sellado aqui, la toma condicional de AC-ASG-02 es
+            UNA SOLA sentencia atomica y el instante lo decide siempre la base de datos.
+
+            Es una RED DE SEGURIDAD, no una reescritura: la guarda ":NEW.assigned_at IS NULL" hace
+            que solo actue cuando la marca viene vacia, de modo que un valor enviado explicitamente
+            manda igual que mandan los *_snapshot enviados por el backend. Y NUNCA puede pisar una
+            marca ya sellada, porque el bloque (1) rechaza antes, con ORA-20052, cualquier intento de
+            modificarla o de ponerla a NULL; cuando el control llega hasta aqui en un UPDATE, o la
+            marca antigua era NULL o :NEW conserva su valor.
+
+            (3) NINGUNA MARCA EN EL FUTURO (REQ-122 RN-03, validacion 2). Ninguna de las siete marcas
             del ciclo de vida puede ser posterior al instante actual: una fecha futura falsearia
             cualquier metrica de tiempos y cualquier calculo de retencion (retention_expires_at se
             deriva de created_at). Todas se comparan contra UNA UNICA variable local l_ahora sellada al
@@ -328,7 +353,7 @@ AND (closed_at IS NULL OR resolved_at IS NULL OR closed_at &gt;= resolved_at)
             columnas del proyecto; compararlas contra SYSTIMESTAMP local daria falsos positivos o
             falsos negativos de hasta la diferencia horaria del servidor.
 
-            (3) COMENTARIO DE RESOLUCION (AC-CIE-01 / AC-CIE-02, REQ-111). Aqui estan las dos reglas
+            (4) COMENTARIO DE RESOLUCION (AC-CIE-01 / AC-CIE-02, REQ-111). Aqui estan las dos reglas
             del CLOB que, como se explica en ddl-0.0.1-11-04, no pueden ir en una CHECK porque Oracle
             no admite columnas LOB en la condicion de una restriccion:
               - cerrar sin comentario de resolucion se rechaza con -20054, y "sin comentario" incluye
@@ -343,7 +368,7 @@ AND (closed_at IS NULL OR resolved_at IS NULL OR closed_at &gt;= resolved_at)
             como argumento sin truncarlo a 4000 bytes y devuelve 0 cuando no encuentra ni un solo
             caracter distinto de espacio. El NVL cubre el caso del CLOB vacio.
 
-            (4) INCREMENTO DE version (REQ-118 RN-03, DoD). En todo UPDATE el motor hace
+            (5) INCREMENTO DE version (REQ-118 RN-03, DoD). En todo UPDATE el motor hace
             :NEW.version := NVL(:OLD.version, 0) + 1, SIEMPRE y sea cual sea el valor que traiga la
             sentencia: ni una escritura que "olvide" tocar version, ni una que mande un valor
             arbitrario, pueden dejar el contador estancado o retrocederlo. Va AL FINAL del trigger a
@@ -395,7 +420,14 @@ BEGIN
         END IF;
     END IF;
 
-    -- (2) Ninguna marca temporal del ciclo de vida puede ser futura.
+    -- (2) Red de seguridad de AC-ASG-01: si la sentencia deja tecnico asignado sin marca de
+    --     asignacion, la sella el motor con el instante del servidor. Solo actua con la marca
+    --     vacia; una marca ya sellada la protege el bloque (1), que rechaza reescribirla.
+    IF :NEW.assigned_technician_id IS NOT NULL AND :NEW.assigned_at IS NULL THEN
+        :NEW.assigned_at := l_ahora;
+    END IF;
+
+    -- (3) Ninguna marca temporal del ciclo de vida puede ser futura.
     IF (:NEW.created_at        IS NOT NULL AND :NEW.created_at        > l_ahora)
     OR (:NEW.in_progress_at    IS NOT NULL AND :NEW.in_progress_at    > l_ahora)
     OR (:NEW.resolved_at       IS NOT NULL AND :NEW.resolved_at       > l_ahora)
@@ -406,7 +438,7 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20053, 'Una marca temporal del ciclo de vida no puede ser futura');
     END IF;
 
-    -- (3) Comentario de resolucion: obligatorio al cerrar y prohibido fuera del cierre.
+    -- (4) Comentario de resolucion: obligatorio al cerrar y prohibido fuera del cierre.
     --     REGEXP_INSTR recorre el CLOB completo sin truncarlo y devuelve 0 si no hay
     --     ningun caracter distinto de espacio (equivalente al "no vacio tras TRIM").
     IF :NEW.status = 'CERRADA' THEN
@@ -419,7 +451,7 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20055, 'El comentario de resolución solo existe en una incidencia cerrada');
     END IF;
 
-    -- (4) Concurrencia optimista: version la lleva el motor, nunca la sentencia.
+    -- (5) Concurrencia optimista: version la lleva el motor, nunca la sentencia.
     --     Va al final para no incrementarla en escrituras que las reglas anteriores rechazan.
     IF UPDATING THEN
         :NEW.version := NVL(:OLD.version, 0) + 1;
@@ -427,6 +459,291 @@ BEGIN
 END;]]></sql>
         <rollback>
             <sql>DROP TRIGGER trg_incidencia_ciclo_vida</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-11-07" author="MIND">
+        <comment>Oraculo AC-ASG-02 / REQ-153: 100 tomas concurrentes de la misma incidencia dejan exactamente una asignacion ganadora</comment>
+        <!--
+            ORACULO DE COMPORTAMIENTO, igual que los de 10-incidencia.xml: no describe la regla de
+            concurrencia, la EJECUTA contra el Oracle real durante el propio despliegue. No mira
+            metadatos (ni USER_CONSTRAINTS, ni USER_TRIGGERS, ni USER_TAB_COLUMNS): monta el
+            escenario completo, lanza 100 tomas en disputa, comprueba el resultado fila a fila y
+            DESHACE sus propios datos con un ROLLBACK final, de modo que no deja ni una fila en la
+            base de datos.
+
+            QUE DEMUESTRA Y POR QUE ASI
+            ===========================
+            AC-ASG-02 fija tanto la regla como su mecanismo de verificacion: "verificado por filas
+            afectadas del UPDATE ... WHERE assigned_technician_id IS NULL". Por eso cada una de las
+            100 iteraciones emite la sentencia canonica de REQ-153
+
+                UPDATE incidencia SET assigned_technician_id = :u
+                 WHERE incident_id = :id AND assigned_technician_id IS NULL
+
+            dos veces, con dos tecnicos distintos, y compara el numero de filas afectadas: la primera
+            toma tiene que afectar a 1 fila (gana) y la segunda a 0 (pierde). Ademas relee la fila y
+            exige que el responsable siga siendo el tecnico A y jamas el B: ninguna doble asignacion,
+            ni siquiera transitoria. El predicado "assigned_technician_id IS NULL" es la parte
+            atomica del mecanismo: el motor lo reevalua sobre la version actual de la fila en el
+            momento de aplicarlo, de modo que la segunda sentencia ya no encuentra fila que casar.
+
+            Comprueba ademas las dos consecuencias que REQ-153 exige de una toma valida: que
+            assigned_at queda informado por el motor (AC-ASG-01; lo sella el trigger
+            trg_incidencia_ciclo_vida del changeset anterior, que es justamente lo que permite que la
+            toma sea UNA sola sentencia sin que la aplicacion informe la marca) y que status sigue
+            siendo ABIERTA, porque asignar no es cambiar de estado (REQ-153 RN-06).
+
+            LA LIMITACION, DICHA SIN ADORNOS
+            ================================
+            Un changeset de Liquibase dispone de UNA sola conexion JDBC, asi que las dos tomas de
+            cada iteracion se emiten una tras otra sobre la MISMA transaccion: no hay simultaneidad
+            fisica y este oraculo no la finge. Lo que se verifica es el mecanismo que AC-ASG-02 fija
+            literalmente, las FILAS AFECTADAS del UPDATE ... WHERE assigned_technician_id IS NULL
+            (1 fila la ganadora, 0 filas la perdedora), repetido 100 veces sin ninguna doble
+            asignacion.
+
+            La transaccion autonoma representa a la segunda conexion en lo unico que puede
+            representarla desde aqui: sobre la ultima incidencia del bucle, ya tomada por el tecnico
+            A y todavia SIN CONFIRMAR, comprueba que ninguna otra transaccion obtiene la fila. No la
+            ve (ORA-01403, porque una fila sin confirmar no existe para otra transaccion) o no la
+            puede bloquear (ORA-00054, resource busy), pero nunca la toma: el intento de
+            SELECT ... FOR UPDATE NOWAIT jamas devuelve exito.
+
+            Con dos conexiones simultaneas de verdad, la perdedora esperaria ese mismo bloqueo de
+            fila y, al confirmar la ganadora, reevaluaria el predicado assigned_technician_id IS NULL
+            y afectaria a 0 filas: exactamente el resultado que este oraculo asegura 100 veces. La
+            verificacion con dos conexiones reales corresponde a un test de integracion de la capa de
+            aplicacion, fuera del alcance de un changelog.
+
+            DATOS Y LIMPIEZA
+            ================
+            Siembra por MERGE los catalogos que necesita porque los changelogs dml se aplican DESPUES
+            de los ddl y aqui todavia estan vacios; los display_order / sort_order 9xx y los correos
+            @example.invalid evitan cualquier colision con el catalogo real. Los usuarios informan
+            username, password_hash y password_algorithm porque 06-usuario-credenciales.xml los
+            declara NOT NULL. El bloque entero es una UNICA sentencia JDBC
+            (splitStatements="false"), no contiene ni una sola sentencia DDL (provocaria un commit
+            implicito) y no hace ningun commit: termina en ROLLBACK, igual en la salida normal que en
+            el manejador de excepciones, de modo que no deja ni una fila en la base de datos.
+
+            Si cualquier comprobacion falla, RAISE_APPLICATION_ERROR aborta el despliegue.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_empleado    NUMBER;
+    v_tec_a       NUMBER;
+    v_tec_b       NUMBER;
+    v_office      NUMBER;
+    v_room        NUMBER;
+    v_cat         NUMBER;
+    v_inc         NUMBER;
+    v_ultima      NUMBER;
+    v_filas_a     NUMBER;
+    v_filas_b     NUMBER;
+    v_ganadores   NUMBER := 0;
+    v_codigo      NUMBER;
+    v_tecnico     incidencia.assigned_technician_id%TYPE;
+    v_asignado_en incidencia.assigned_at%TYPE;
+    v_status      incidencia.status%TYPE;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, 'N', 'Y');
+    END sembrar_estado;
+
+    PROCEDURE sembrar_categoria(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_categoria_incidencia d
+        USING (SELECT p_code AS category_code FROM dual) s
+           ON (d.category_code = s.category_code)
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+
+        -- La categoria tiene que estar ACTIVA aunque la fila ya existiese: el trigger
+        -- trg_incidencia_clasificacion rechaza el alta sobre catalogo inactivo (REQ-100).
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_code = p_code;
+    END sembrar_categoria;
+
+    -- SEGUNDA CONEXION sobre la incidencia ganadora. La transaccion autonoma es independiente
+    -- de la principal: ni ve sus cambios sin confirmar ni comparte sus bloqueos. Devuelve el
+    -- SQLCODE obtenido (0 si pudo tomar la fila, que es justo lo que no debe ocurrir) y hace
+    -- ROLLBACK SIEMPRE antes de salir, porque una transaccion autonoma que termina sin cerrarse
+    -- (sin confirmar ni deshacer) provoca ORA-06519. Aqui solo se deshace: nada se confirma.
+    FUNCTION tomar_en_otra_transaccion(p_inc NUMBER) RETURN NUMBER IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+        l_tecnico NUMBER;
+        l_codigo  NUMBER;
+    BEGIN
+        SELECT assigned_technician_id
+          INTO l_tecnico
+          FROM incidencia
+         WHERE incident_id = p_inc
+           FOR UPDATE NOWAIT;
+        l_codigo := 0;
+        ROLLBACK;
+        RETURN l_codigo;
+    EXCEPTION
+        WHEN OTHERS THEN
+            l_codigo := SQLCODE;
+            ROLLBACK;
+            RETURN l_codigo;
+    END tomar_en_otra_transaccion;
+
+BEGIN
+    sembrar_rol('EMPLEADO', 'Empleado', 901);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 902);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 903);
+    sembrar_estado('ABIERTA', 'Abierta', 901);
+    sembrar_categoria('MOBILIARIO', 'Mobiliario oraculo concurrencia', 901);
+
+    SELECT category_id INTO v_cat FROM cat_categoria_incidencia WHERE category_code = 'MOBILIARIO';
+
+    MERGE INTO cat_oficina d
+    USING (SELECT 'OF-ORA54A' AS office_code FROM dual) s
+       ON (d.office_code = s.office_code)
+    WHEN NOT MATCHED THEN
+        INSERT (office_code, office_name, city, is_active)
+        VALUES ('OF-ORA54A', 'Oficina Oraculo Concurrencia', 'Madrid', 'Y');
+    SELECT office_id INTO v_office FROM cat_oficina WHERE office_code = 'OF-ORA54A';
+
+    -- Los usuarios se crean ANTES que la sala porque cat_sala.created_by es NOT NULL.
+    -- username, password_hash y password_algorithm son NOT NULL desde 06-usuario-credenciales.xml.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES ('Oraculo Concurrencia Admin', 'oraculo.tsk054.conc.admin@example.invalid',
+                 'oraculo.tsk054.conc.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk054-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Concurrencia Empleado', 'oraculo.tsk054.conc.empleado@example.invalid',
+                 'oraculo.tsk054.conc.empleado', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk054-empleado', 'argon2id', v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Concurrencia Tecnico A', 'oraculo.tsk054.conc.tecnico.a@example.invalid',
+                 'oraculo.tsk054.conc.tecnico.a', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk054-tecnico-a', 'argon2id', v_admin)
+      RETURNING user_id INTO v_tec_a;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_by)
+         VALUES ('Oraculo Concurrencia Tecnico B', 'oraculo.tsk054.conc.tecnico.b@example.invalid',
+                 'oraculo.tsk054.conc.tecnico.b', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk054-tecnico-b', 'argon2id', v_admin)
+      RETURNING user_id INTO v_tec_b;
+
+    MERGE INTO cat_sala d
+    USING (SELECT 'SAL-ORA54A' AS room_code FROM dual) s
+       ON (d.room_code = s.room_code)
+    WHEN NOT MATCHED THEN
+        INSERT (room_code, room_name, office_id, is_active, created_by)
+        VALUES ('SAL-ORA54A', 'Sala Oraculo Concurrencia', v_office, 'Y', v_admin);
+    SELECT room_id INTO v_room FROM cat_sala WHERE room_code = 'SAL-ORA54A';
+
+    -- 100 tomas en disputa de 100 incidencias distintas: en cada una, dos tecnicos emiten la
+    -- MISMA sentencia condicional de REQ-153 y solo uno puede ganar.
+    FOR i IN 1 .. 100 LOOP
+        INSERT INTO incidencia (reference_code, room_id, category_id, description, reported_by)
+             VALUES ('INC-9054-' || LPAD(i, 6, '0'), v_room, v_cat,
+                     'Toma concurrente numero ' || i || ' del oraculo de asignacion de incidencias',
+                     v_empleado)
+          RETURNING incident_id INTO v_inc;
+
+        -- Conexion 1 (tecnico A): sentencia canonica de autoasignacion de AC-ASG-02.
+        UPDATE incidencia
+           SET assigned_technician_id = v_tec_a
+         WHERE incident_id = v_inc
+           AND assigned_technician_id IS NULL;
+        v_filas_a := SQL%ROWCOUNT;
+
+        -- Conexion 2 (tecnico B): exactamente la misma sentencia sobre la misma incidencia.
+        UPDATE incidencia
+           SET assigned_technician_id = v_tec_b
+         WHERE incident_id = v_inc
+           AND assigned_technician_id IS NULL;
+        v_filas_b := SQL%ROWCOUNT;
+
+        IF v_filas_a <> 1 THEN
+            RAISE_APPLICATION_ERROR(-20940, 'ORACULO AC-ASG-02 iteracion ' || i ||
+                ': la primera toma afecto a ' || v_filas_a || ' filas en lugar de 1');
+        END IF;
+
+        IF v_filas_b <> 0 THEN
+            RAISE_APPLICATION_ERROR(-20941, 'ORACULO AC-ASG-02 iteracion ' || i ||
+                ': la segunda toma afecto a ' || v_filas_b ||
+                ' filas en lugar de 0: la incidencia admite doble asignacion');
+        END IF;
+
+        SELECT assigned_technician_id, assigned_at, status
+          INTO v_tecnico, v_asignado_en, v_status
+          FROM incidencia
+         WHERE incident_id = v_inc;
+
+        IF v_tecnico IS NULL OR v_tecnico <> v_tec_a OR v_tecnico = v_tec_b THEN
+            RAISE_APPLICATION_ERROR(-20942, 'ORACULO AC-ASG-02 iteracion ' || i ||
+                ': el responsable de la incidencia es ' || NVL(TO_CHAR(v_tecnico), 'NULL') ||
+                ' y deberia ser el tecnico ganador ' || v_tec_a);
+        END IF;
+
+        IF v_asignado_en IS NULL THEN
+            RAISE_APPLICATION_ERROR(-20943, 'ORACULO AC-ASG-01 iteracion ' || i ||
+                ': la toma no ha sellado assigned_at con el instante del servidor');
+        END IF;
+
+        IF v_status <> 'ABIERTA' THEN
+            RAISE_APPLICATION_ERROR(-20944, 'ORACULO REQ-153 RN-06 iteracion ' || i ||
+                ': la asignacion ha cambiado el estado a ' || v_status || ' en lugar de dejarlo en ABIERTA');
+        END IF;
+
+        v_ganadores := v_ganadores + 1;
+        v_ultima := v_inc;
+    END LOOP;
+
+    IF v_ganadores <> 100 THEN
+        RAISE_APPLICATION_ERROR(-20945, 'ORACULO AC-ASG-02: se han contado ' || v_ganadores ||
+            ' tomas ganadoras en lugar de 100');
+    END IF;
+
+    -- Bloqueo de fila entre transacciones DISTINTAS: la ultima incidencia, tomada por el tecnico A
+    -- y todavia SIN CONFIRMAR, es intocable desde otra transaccion. ORA-01403 (100) porque la fila
+    -- sin confirmar no existe para ella; ORA-00054 (-54) si llegase a verla y no pudiese bloquearla.
+    -- Lo que NUNCA puede devolver es 0, que significaria que otra transaccion la ha arrebatado.
+    v_codigo := tomar_en_otra_transaccion(v_ultima);
+    IF v_codigo NOT IN (-54, 100) THEN
+        RAISE_APPLICATION_ERROR(-20946, 'ORACULO AC-ASG-02: una transaccion ajena obtuvo ' || v_codigo ||
+            ' sobre la incidencia tomada y sin confirmar; mientras la ganadora no confirma ninguna' ||
+            ' transaccion ajena puede arrebatar la fila, solo cabe ORA-01403 (100) u ORA-00054 (-54)');
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
         </rollback>
     </changeSet>
 
