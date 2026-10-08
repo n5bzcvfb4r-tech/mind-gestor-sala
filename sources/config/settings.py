@@ -120,6 +120,7 @@ LOCAL_APPS = [
     "apps.catalogos",
     "apps.incidencias",
     "apps.ciclo_vida",
+    "apps.avisos",
     "apps.trazabilidad",
 ]
 
@@ -256,6 +257,43 @@ SPECTACULAR_SETTINGS = {
 # -------------------------------------------------------------
 # El proceso servidor no debe levantarse con los catalogos maestros vacios.
 VERIFICAR_CATALOGOS_AL_ARRANQUE = evaluate_bool_default("VERIFICAR_CATALOGOS_AL_ARRANQUE", "True")
+
+# MOTOR DE COLA DE AVISOS (ARC-014)
+# -------------------------------------------------------------
+# Despachador en proceso (APScheduler) del outbox de avisos por correo: toma las
+# solicitudes PENDIENTE en FIFO con bloqueo, las entrega por SMTP y recupera las que
+# quedan atascadas en ENVIANDO tras una caida del worker.
+#
+# La ventana de recuperacion y la franja de horario laboral son GAPS declarados del RFP
+# (REQ-132: "gap: ventana de recuperacion de solicitudes atascadas y franja concreta del
+# horario laboral"). Van parametrizadas por entorno con un valor por defecto documentado,
+# nunca fijadas en el codigo del despachador.
+AVISOS_MOTOR = {
+    # Arranque del planificador en proceso. Se desactiva en los comandos de gestion y en
+    # las pruebas para que ningun hilo de fondo toque la base de datos sin pedirlo.
+    "habilitado": evaluate_bool_default("AVISOS_MOTOR_HABILITADO", "True"),
+    "intervalo_despacho_segundos": int(os.environ.get("AVISOS_INTERVALO_DESPACHO_SEGUNDOS", "30")),
+    "intervalo_recuperacion_segundos": int(os.environ.get("AVISOS_INTERVALO_RECUPERACION_SEGUNDOS", "60")),
+    # Ventana tras la cual una solicitud atascada en ENVIANDO vuelve a PENDIENTE (REQ-132).
+    "ventana_recuperacion_minutos": int(os.environ.get("AVISOS_VENTANA_RECUPERACION_MINUTOS", "15")),
+    "tamano_lote": int(os.environ.get("AVISOS_TAMANO_LOTE", "25")),
+    # Tope de intentos por solicitud; la columna configuracion_smtp.max_attempts manda
+    # cuando hay configuracion activa, este es el valor de respaldo (T.5 ARC-109).
+    "max_attempts_por_defecto": int(os.environ.get("AVISOS_MAX_ATTEMPTS", "3")),
+    # Espera creciente entre reintentos, en minutos (REQ-134 / AC-SMTP-04: 1, 5 y 15 min).
+    "backoff_minutos": tuple(int(v) for v in os.environ.get("AVISOS_BACKOFF_MINUTOS", "1,5,15").split(",") if v.strip()),
+    "smtp_timeout_segundos": int(os.environ.get("AVISOS_SMTP_TIMEOUT_SEGUNDOS", "30")),
+    # Ventana de servicio del DESPACHADOR. No restringe el ENCOLADO, que es siempre posible:
+    # las solicitudes generadas fuera de hora se conservan y se procesan al reanudar (REQ-132).
+    "respetar_horario_laboral": evaluate_bool_default("AVISOS_RESPETAR_HORARIO_LABORAL", "True"),
+    "hora_inicio_laboral": int(os.environ.get("AVISOS_HORA_INICIO_LABORAL", "8")),
+    "hora_fin_laboral": int(os.environ.get("AVISOS_HORA_FIN_LABORAL", "20")),
+    # Convenio de datetime.weekday(): 0=lunes .. 6=domingo.
+    "dias_laborables": tuple(int(v) for v in os.environ.get("AVISOS_DIAS_LABORABLES", "0,1,2,3,4").split(",") if v.strip()),
+    # Testigo que el worker escribe en aviso_correo.locked_by (VARCHAR2(60 CHAR)). Si queda
+    # vacio, apps/avisos/motor/configuracion.py deriva uno del hostname y el PID del proceso.
+    "identificador_worker": os.environ.get("AVISOS_WORKER_ID", "")[:60],
+}
 
 # LOGGING
 # -------------------------------------------------------------
