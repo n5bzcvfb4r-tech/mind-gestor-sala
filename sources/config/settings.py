@@ -316,6 +316,21 @@ AVISOS_MOTOR = {
     "identificador_worker": os.environ.get("AVISOS_WORKER_ID", "")[:60],
 }
 
+# COMPOSICION DEL CONTENIDO DE LOS AVISOS (ARC-014, REQ-131)
+# -------------------------------------------------------------
+# Enlace al detalle de la incidencia que viaja en el correo de aviso de alta. El correo NO
+# adjunta la foto de la incidencia: solo enlaza al detalle en la SPA, donde la fotografia ya
+# esta custodiada.
+#
+# La URL base publica de la SPA es un GAP declarado del RFP (REQ-131): el RFP no fija la
+# direccion con la que se publica la aplicacion y el correo necesita una URL absoluta, porque
+# se lee fuera del navegador que sirvio la SPA. Por eso va parametrizada por entorno con un
+# valor por defecto documentado y NUNCA fijada en el codigo del compositor.
+AVISOS_COMPOSICION = {
+    "url_base_spa": os.environ.get("AVISOS_URL_BASE_SPA", "http://localhost:4200"),
+    "ruta_detalle_incidencia": os.environ.get("AVISOS_RUTA_DETALLE_INCIDENCIA", "/incidencias/{incident_id}"),
+}
+
 # LOGGING
 # -------------------------------------------------------------
 LOGGING = {
