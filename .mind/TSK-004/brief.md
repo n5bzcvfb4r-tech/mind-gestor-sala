@@ -2210,3 +2210,44 @@ Variables: `MIND_ENV_ORACLE_HOST`, `MIND_ENV_ORACLE_PORT`, `MIND_ENV_ORACLE_URL`
 
 ### Si el entorno no está disponible
 Comprueba `.mind/TSK-004/env.json`: si su `status` es `unavailable` o `degraded`, la plataforma no pudo darte (todo) el entorno. En ese caso ESCRIBE igualmente los tests de integración y déjalos en el entregable, y repórtalo como health check **Warning** con `check: entorno-de-prueba` — NO como Blocker: no es un defecto de tu tarea, y la verificación queda diferida al CI. Reserva el Blocker para cuando el entorno SÍ estaba y los tests fallan por el código o por el brief.
+
+## Código ya presente en la zona (zone-extend) — OBLIGATORIO
+
+En el tip actual del workspace YA hay código bajo tus `zone_paths` (típicamente de una TSK predecesora mergeada). **Léelo antes de escribir.**
+
+Ficheros presentes (muestra):
+- `sources/apps/core_security/__init__.py`
+- `sources/apps/core_security/apps.py`
+- `sources/apps/core_security/autenticacion.py`
+- `sources/apps/core_security/errores.py`
+- `sources/apps/core_security/esquema.py`
+- `sources/apps/core_security/manejadores.py`
+- `sources/apps/core_security/mensajes.py`
+- `sources/apps/core_security/middleware.py`
+- `sources/apps/core_security/permisos.py`
+- `sources/apps/core_security/respuestas.py`
+- `sources/apps/core_security/rutas_publicas.py`
+- `sources/apps/core_security/serializers/__init__.py`
+- `sources/apps/core_security/serializers/permisos.py`
+- `sources/apps/core_security/serializers/sesiones.py`
+- `sources/apps/core_security/servicios/__init__.py`
+- `sources/apps/core_security/servicios/contexto.py`
+- `sources/apps/core_security/servicios/permisos.py`
+- `sources/apps/core_security/servicios/sesiones.py`
+- `sources/apps/core_security/tests/__init__.py`
+- `sources/apps/core_security/tests/conftest.py`
+- `sources/apps/core_security/tests/test_contexto_autorizacion_oracle.py`
+- `sources/apps/core_security/tests/test_matriz_permisos_oracle.py`
+- `sources/apps/core_security/tests/test_permisos_efectivos_api.py`
+- `sources/apps/core_security/tests/test_rutas_protegidas.py`
+- `sources/apps/core_security/tests/test_sesion_oracle_api.py`
+- `sources/apps/core_security/trazas.py`
+- `sources/apps/core_security/urls.py`
+- `sources/apps/core_security/views/__init__.py`
+- `sources/apps/core_security/views/permisos.py`
+- `sources/apps/core_security/views/sesiones.py`
+
+Disciplina:
+1. **EDIT/EXTIENDE** símbolos existentes (`class`/`def`/exports) — **PROHIBIDO** una segunda declaración con el mismo nombre en el mismo fichero.
+2. Añade routers/handlers nuevos en ficheros dedicados o ampliando el existente sin redefinir tipos ya presentes.
+3. Si el DoD pide API pública sobre el mismo dominio, reutiliza servicios/modelos del CRUD previo; no copies otra `MembershipPlanService`.

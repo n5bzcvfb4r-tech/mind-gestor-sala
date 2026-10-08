@@ -65,3 +65,15 @@ ERROR_INESPERADO = "No se ha podido completar la operación, inténtalo de nuevo
 # motivo ni la existencia del recurso.
 SIN_PERMISOS = "No tiene permisos para realizar esta acción"
 PERMISOS_CAMBIADOS = "Sus permisos han cambiado; la acción solicitada ya no está autorizada"
+
+# --- Alcance de datos (REQ-023, REQ-031, AC-PERM-04) ---------------------
+# Literal UNIFORME de la denegacion por alcance. Es el MISMO texto para los tres casos que el
+# solicitante podria querer distinguir: incidencia AJENA (existe, pero no es suya), incidencia
+# INEXISTENTE (no hay fila en la tabla) e identificador MAL FORMADO (ni siquiera es un numero
+# valido). Que compartan respuesta es el requisito, no una simplificacion de redaccion: si el
+# cuerpo variase entre esos casos, bastaria con recorrer identificadores para saber cuales
+# existen, y la API se convertiria en un oraculo de enumeracion de incidencias ajenas.
+# Por la misma razon la denegacion por alcance viaja como 404 y no como 403 (REQ-023): un 403
+# confirmaria que el recurso existe y que lo unico que falta es el permiso. El motivo real
+# ("ajeno", "inexistente", "identificador_invalido") se queda en la traza interna.
+RECURSO_NO_ENCONTRADO = "No hemos encontrado esa incidencia"
