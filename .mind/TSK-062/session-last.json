@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-062",
+  "attempt": 2,
+  "at": "2026-10-08T11:22:51.929621+00:00",
+  "construction_id": "6029d275-1389-40f3-9c29-7e2e169f69ac",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-062 — Cimientos del servicio (app core Django, modelos ORM T.5 y reglas transversales), arquetipo `container-python`.\n\n## Qué se ha corregido en este intento\n\nEste intento partía de un build COMPILANDO con un único defecto reportado por la verificación:\n\n> `dependency-manifest`: el código importa paquetes no declarados en requirements/pyproject: `docker`, `testcontainers`.\n\n**Diagnóstico.** Pinché primero en por qué `testcontainers` salía como \"no declarado\" si ya figuraba en el manifiesto. ",
+  "model": "claude-opus-5",
+  "input_tokens": 2027544,
+  "output_tokens": 21283,
+  "llm_calls": 93,
+  "cost_usd": 3.373229750000001,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "4679c7b89cb7f37483c71d98b596fbbedb655de6",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}

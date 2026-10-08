@@ -1,0 +1,109 @@
+[project]
+name = "incidencias-backend"
+version = "0.1.0-dev"
+description = "Servicio de gestion de incidencias de salas (MOD-001, MOD-002)"
+readme = "README.md"
+authors = []
+license = { text = "" }
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "gunicorn==23.0.0",
+    "django==5.2.7",
+    "djangorestframework==3.16.1",
+    "drf-spectacular==0.28.0",
+    "drf-spectacular-sidecar==2025.9.1",
+    "oracledb==3.4.1",
+    "python-json-logger==4.0.0",
+    # Solo se importan desde las pruebas de integracion (apps/core/tests): levantan el
+    # contenedor Oracle 23ai real (gvenzl/oracle-free:23-slim). Se declaran aqui, en el
+    # manifiesto del host, para que ningun import de terceros quede sin pin explicito.
+    # `testcontainers` sin extras a proposito: el modulo `testcontainers.oracle` viaja en
+    # la distribucion base y el unico contenido del extra `oracle-free` es el driver
+    # `oracledb`, ya pineado mas arriba.
+    "testcontainers==4.13.2",
+    "docker==7.2.0",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# --- Poetry - Configuration -----------------------------------------
+[tool.poetry]
+package-mode = false
+
+[[tool.poetry.source]]
+name = "azure"
+url = "https://pkgs.dev.azure.com/devopsmapfre/devopsmapfre/_packaging/snapshots/pypi/simple/"
+priority = "supplemental"
+
+# --- Development ----------------------------------------------------
+[tool.poetry.group.dev]
+optional = false
+
+[tool.poetry.group.dev.dependencies]
+ipdb = "^0.13.13"
+pre-commit = "^4.2.0"
+
+# --- Linters & Formatters -------------------------------------------
+[tool.poetry.group.lint]
+optional = false
+
+[tool.poetry.group.lint.dependencies]
+ruff = "^0.14.6"
+
+# --- Testing --------------------------------------------------------
+[tool.poetry.group.tests]
+optional = false
+
+[tool.poetry.group.tests.dependencies]
+coverage = "^7.8.0"
+pytest = "^8.4.2"
+pytest-cov = "^6.0.0"
+pytest-django = "^4.11.1"
+pytest-mock = "^3.14.1"
+# `testcontainers` y `docker` van pineados en [project].dependencies (manifiesto del host).
+
+# --- Pytest - Unit Testing ------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.3.4"
+addopts = "-v"
+pythonpath = ["."]
+python_files = ["test_*.py"]
+cache_dir = "/tmp/.pytest_cache"
+DJANGO_SETTINGS_MODULE = "config.settings"
+markers = [
+    "integration: prueba de integracion contra Oracle 23ai real (Testcontainers); requiere Docker",
+]
+
+# --- Coverage - Code coverage ---------------------------------------
+[tool.coverage.run]
+data_file = "/tmp/.coverage"
+relative_files = true
+omit = [
+    "**/tests/**",
+    "**/migrations/**",
+    "**/conftest.py",
+    "config/*",
+    "manage.py",
+]
+
+[tool.coverage.report]
+skip_empty = true
+precision = 2
+
+# --- Ruff - Linting and Formatting ----------------------------------
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+indent-width = 4
+exclude = [".git", "__pycache__", "docs"]
+include = ["*.py", "*.pyi"]
+cache-dir = "/tmp/.ruff"
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E203", "E501", "W605", "C901"]
