@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-061",
+  "attempt": 1,
+  "at": "2026-10-08T09:11:09.763532+00:00",
+  "construction_id": "5098ef3d-f8e3-4205-a64f-8f4e12a0857e",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-061 · Permisos DCL append-only, invariantes de integridad e informes de verificación.\n\nENTREGA (dos ficheros nuevos, ambos dentro de las zonas declaradas, más el enganche del maestro de release):\n\n1) `sources/facilities/changelogs/0.0.1/ddl/18-integridad-retencion.xml` — 9 changesets `ddl-0.0.1-18-01..09` (author MIND, todos con `<rollback>`):\n- 18-01/18-02: `integridad_informe` (integrity_report_id IDENTITY PK, executed_at, executed_by FK→usuario NULLABLE para la ejecución programada, scope",
+  "model": "claude-opus-5",
+  "input_tokens": 4887605,
+  "output_tokens": 104348,
+  "llm_calls": 191,
+  "cost_usd": 13.798394000000002,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "d44937b64ea38063cc5cab17f3c7875a36d470d8",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
