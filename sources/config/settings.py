@@ -186,7 +186,9 @@ REST_FRAMEWORK = {
     # El proyecto usa sesion opaca en servidor (tabla sesion_usuario), NUNCA JWT autocontenido:
     # el rol vigente se relee de la base en cada peticion y la revocacion es inmediata (REQ-057).
     "DEFAULT_AUTHENTICATION_CLASSES": ("apps.core_security.autenticacion.AutenticacionSesionOpaca",),
-    "EXCEPTION_HANDLER": "rest_framework.views.exception_handler",
+    # Envolvente UNICA de error: todo fallo atendido por DRF sale con el mismo cuerpo
+    # (`code`, `message`, `details`, `traceId`) que devuelve el guardia de sesion.
+    "EXCEPTION_HANDLER": "apps.core_security.manejadores.manejador_excepciones",
 }
 
 # SESION DE USUARIO (ARC-012)

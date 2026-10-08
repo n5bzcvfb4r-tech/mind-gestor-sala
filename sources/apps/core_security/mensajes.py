@@ -22,3 +22,14 @@ SESION_REQUERIDA = "Debes iniciar sesión para continuar"
 # --- Inicio de sesion ----------------------------------------------------
 CREDENCIALES_INVALIDAS = "Usuario o contraseña incorrectos"
 CUENTA_BLOQUEADA = "Tu cuenta está bloqueada temporalmente, inténtalo más tarde"
+
+# --- Envolvente de error de la superficie de enrutado --------------------
+# Textos que devuelve el manejador unico de excepciones (`manejadores.py`). El detalle
+# tecnico del fallo NUNCA viaja en el mensaje: se queda en la traza, junto al `traceId`.
+DATOS_INVALIDOS = "Revisa los datos introducidos"
+PERMISO_DENEGADO = "No tienes permisos para realizar esta acción"
+METODO_NO_PERMITIDO = "El método HTTP no está permitido para este recurso"
+FORMATO_NO_ACEPTABLE = "No se puede atender la petición en el formato solicitado"
+MEDIO_NO_SOPORTADO = "El formato del contenido enviado no está soportado"
+DEMASIADAS_PETICIONES = "Has realizado demasiadas peticiones, inténtalo más tarde"
+ERROR_INESPERADO = "No se ha podido completar la operación, inténtalo de nuevo más tarde"

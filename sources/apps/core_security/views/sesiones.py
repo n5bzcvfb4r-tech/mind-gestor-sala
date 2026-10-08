@@ -10,8 +10,10 @@ FRONTERA TRANSACCIONAL. El caso de uso abre la transaccion: el sello de `last_lo
 usuario y el alta de la fila de `sesion_usuario` se confirman juntos o no se confirma ninguno.
 
 SECRETOS (REQ-063). La contrasenia no se registra, no se traza y no vuelve en la respuesta.
-Los fallos de credencial responden con el mismo cuerpo de error del resto del servicio
-(`code`, `message`, `details`, `traceId`), sin revelar si la cuenta existe.
+Los fallos de credencial (`CredencialesInvalidasError`, `CuentaBloqueadaError`) se dejan
+PROPAGAR: el manejador unico de excepciones (`apps.core_security.manejadores`) los traduce
+al mismo cuerpo de error del resto del servicio (`code`, `message`, `details`, `traceId`),
+sin revelar si la cuenta existe. La vista no compone ningun cuerpo de error propio.
 """
 
 from django.db import transaction
@@ -21,8 +23,6 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.core_security.errores import CredencialesInvalidasError, CuentaBloqueadaError
-from apps.core_security.respuestas import cuerpo_error
 from apps.core_security.serializers.sesiones import LoginRequestSerializer, SessionDetailSerializer
 from apps.core_security.servicios.sesiones import ServicioSesiones
 
@@ -47,14 +47,11 @@ class IniciarSesionView(APIView):
         entrada.is_valid(raise_exception=True)
 
         servicio = ServicioSesiones()
-        try:
-            with transaction.atomic():
-                usuario = servicio.autenticar(
-                    entrada.validated_data["username"],
-                    entrada.validated_data["password"],
-                )
-                sesion = servicio.emitir(usuario)
-        except (CredencialesInvalidasError, CuentaBloqueadaError) as error:
-            return Response(cuerpo_error(error.codigo, error.mensaje), status=error.http_status)
+        with transaction.atomic():
+            usuario = servicio.autenticar(
+                entrada.validated_data["username"],
+                entrada.validated_data["password"],
+            )
+            sesion = servicio.emitir(usuario)
 
         return Response(SessionDetailSerializer(sesion).data, status=status.HTTP_201_CREATED)
