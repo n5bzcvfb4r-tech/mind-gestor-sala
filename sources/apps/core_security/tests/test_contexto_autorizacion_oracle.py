@@ -200,3 +200,89 @@ def test_AC_ROL_01_el_rol_y_la_identidad_se_leen_de_la_base_y_el_dato_del_client
     sesion_releida = SesionUsuarioEntity.objects.get(pk=sesion_vigente.session_id)
     assert sesion_releida.revoked_at is None, "un intento de suplantacion no revoca la sesion: se ignora en silencio"
     assert sesion_releida.role_code_id == ROL_EMPLEADO, "la sesion conserva el rol real del usuario; el rol enviado por el cliente no se escribe en base"
+
+
+@SALTAR_SIN_DOCKER
+def test_AC_PERM_05_el_cambio_de_rol_surte_efecto_en_la_siguiente_peticion_sin_relogin(
+    usuario_activo: UsuarioEntity, sesion_vigente: SesionUsuarioEntity
+) -> None:
+    """
+    [AC-PERM-05] Promocion y degradacion de rol con la MISMA credencial de sesion: el rol efectivo
+    lo manda la tabla usuario, no el congelado al emitir la sesion.
+    """
+
+    # --- 1. Situacion de partida: EMPLEADO ---
+    assert usuario_activo.role_code_id == ROL_EMPLEADO, (
+        f"la fixture debe sembrar un {ROL_EMPLEADO} y ha sembrado {usuario_activo.role_code_id}"
+    )
+
+    administrador = sembrar_usuario(ROL_ADMINISTRADOR, "admin")
+
+    request, _ = resolver_por_http(sesion_vigente.session_id)
+    contexto = request.contexto_sesion
+    assert contexto.role_code == ROL_EMPLEADO, "la peticion de partida se resuelve con el rol que hoy tiene el usuario en base"
+
+    # El listado completo le esta vedado hoy.
+    with pytest.raises(PermisoDenegadoError):
+        ServicioPermisos().alcance_de(contexto, OPERACION_LISTADO_COMPLETO)
+
+    credencial = sesion_vigente.session_id
+    sesion_de_partida = SesionUsuarioEntity.objects.get(pk=credencial)
+    assert sesion_de_partida.permissions_refreshed_at is None, (
+        "sin cambio de rol no hay recarga que sellar: el instante de refresco solo se escribe cuando el rol cambia"
+    )
+
+    # --- 2. El ADMINISTRADOR promueve el usuario a TECNICO_MANTENIMIENTO ---
+    # El endpoint de cambio de rol (EP-011) es propiedad de otra TSK; lo que se reproduce aqui es
+    # su EFECTO EN BASE DE DATOS, que es exactamente lo que REQ-011 exige que observe la siguiente
+    # peticion. El `update()` de queryset no pasa por `save()` y por tanto no exige contexto de
+    # atribucion publicado. `role_changed_by` es una ForeignKey con `db_column="role_changed_by"`,
+    # asi que en un `update()` de queryset el nombre correcto del atributo es `role_changed_by_id`.
+    UsuarioEntity.objects.filter(pk=usuario_activo.user_id).update(
+        role_code_id=ROL_TECNICO,
+        role_changed_at=utc_now(),
+        role_changed_by_id=administrador.user_id,
+    )
+
+    # --- 3. SIGUIENTE peticion con la MISMA credencial, sin relogin ---
+    request_2, respuesta_2 = resolver_por_http(credencial)
+    assert respuesta_2.status_code == 204, "la sesion sigue viva: el cambio de rol no obliga a autenticarse de nuevo"
+
+    contexto_2 = request_2.contexto_sesion
+    assert contexto_2.role_code == ROL_TECNICO, (
+        "la siguiente peticion se evalua con el rol NUEVO, nunca con el anterior (REQ-011 regla 2)"
+    )
+
+    assert ServicioPermisos().alcance_de(contexto_2, OPERACION_LISTADO_COMPLETO).data_scope == "ALL", (
+        f"el {ROL_TECNICO} alcanza el listado completo en cuanto el rol nuevo esta vigente en base"
+    )
+
+    sesion_tras_promocion = SesionUsuarioEntity.objects.get(pk=credencial)
+    assert sesion_tras_promocion.revoked_at is None, (
+        "un cambio de rol NO invalida la sesion (REQ-011 regla 3): no se exige relogin"
+    )
+    assert sesion_tras_promocion.permissions_refreshed_at is not None, (
+        "se sella el instante de la recarga de rol y capacidades"
+    )
+    assert sesion_tras_promocion.role_code_id == ROL_TECNICO, (
+        "las capacidades cacheadas en la sesion se han recargado (REQ-011 regla 1)"
+    )
+
+    # --- 4. Degradacion: el ADMINISTRADOR devuelve el usuario a EMPLEADO ---
+    UsuarioEntity.objects.filter(pk=usuario_activo.user_id).update(
+        role_code_id=ROL_EMPLEADO,
+        role_changed_at=utc_now(),
+        role_changed_by_id=administrador.user_id,
+    )
+
+    request_3, _ = resolver_por_http(credencial)
+    contexto_3 = request_3.contexto_sesion
+    assert contexto_3.role_code == ROL_EMPLEADO, (
+        "la degradacion surte efecto en la siguiente peticion, con la misma credencial de sesion"
+    )
+
+    # La MISMA peticion que hace un momento le daba acceso ahora se deniega.
+    with pytest.raises(PermisoDenegadoError) as excinfo:
+        ServicioPermisos().alcance_de(contexto_3, OPERACION_LISTADO_COMPLETO)
+    assert excinfo.value.codigo == CODIGO_PERMISO_DENEGADO, "sin ventana de privilegio residual tras la degradacion"
+    assert excinfo.value.http_status == 403, "sin ventana de privilegio residual tras la degradacion"
