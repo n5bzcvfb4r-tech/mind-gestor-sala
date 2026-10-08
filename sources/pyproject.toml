@@ -14,6 +14,14 @@ dependencies = [
     "drf-spectacular-sidecar==2025.9.1",
     "oracledb==3.4.1",
     "python-json-logger==4.0.0",
+    # Solo se importan desde las pruebas de integracion (apps/core/tests): levantan el
+    # contenedor Oracle 23ai real (gvenzl/oracle-free:23-slim). Se declaran aqui, en el
+    # manifiesto del host, para que ningun import de terceros quede sin pin explicito.
+    # `testcontainers` sin extras a proposito: el modulo `testcontainers.oracle` viaja en
+    # la distribucion base y el unico contenido del extra `oracle-free` es el driver
+    # `oracledb`, ya pineado mas arriba.
+    "testcontainers==4.13.2",
+    "docker==7.2.0",
 ]
 
 [build-system]
@@ -54,7 +62,7 @@ pytest = "^8.4.2"
 pytest-cov = "^6.0.0"
 pytest-django = "^4.11.1"
 pytest-mock = "^3.14.1"
-testcontainers = { version = "^4.9.0", extras = ["oracle-free"] }
+# `testcontainers` y `docker` van pineados en [project].dependencies (manifiesto del host).
 
 # --- Pytest - Unit Testing ------------------------------------------
 [tool.pytest.ini_options]
