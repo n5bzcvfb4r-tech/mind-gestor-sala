@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-058",
+  "attempt": 2,
+  "at": "2026-10-08T08:29:01.471258+00:00",
+  "construction_id": "5098ef3d-f8e3-4205-a64f-8f4e12a0857e",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-058 — `aviso_correo_intento`: registro inmutable de cada intento de entrega.\n\n## Qué hay entregado\nUn único fichero de zona, `sources/facilities/changelogs/0.0.1/ddl/15-aviso-correo-intento.xml`, extendido (EDIT, nunca reescrito) hasta 9 changesets Liquibase. Lo encontré con los changesets 15-01..15-06 de un intento anterior ya mergeado en la rama; esta sesión los ha auditado y ha añadido los tres oráculos que faltaban frente al DoD.\n\n**Estructura (15-01..15-04, revisados y correctos):**\n- `",
+  "model": "claude-opus-5",
+  "input_tokens": 3129951,
+  "output_tokens": 42323,
+  "llm_calls": 150,
+  "cost_usd": 7.4874712500000005,
+  "build_status": "skipped",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "2360ea38d8d8c77a0d3fecc8473cadfc114c622c",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
