@@ -191,4 +191,140 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-18-06" author="MIND" runOnChange="true">
+        <comment>Vistas de invariante del historico (REQ-152): alta, alineacion de estado, cadena de huellas y cierre uno a uno</comment>
+        <!--
+            Estas cuatro vistas son el MOTOR de la verificacion de integridad de REQ-152: cada una
+            materializa una de las cuatro reglas del requisito. (a) toda incidencia tiene entrada de
+            alta (v_chk_incidencia_sin_alta), (b) la secuencia de transiciones es contigua
+            (v_chk_cierre_1a1), (c) el estado vigente coincide con la ultima entrada de cambio de
+            estado (v_chk_estado_desalineado) y (d) ninguna entrada ha sido alterada segun la cadena
+            de huellas (v_chk_cadena_hash).
+
+            FIRMA COMUN DE TRES COLUMNAS
+            ============================
+            Las cuatro publican EXACTAMENTE la misma firma de tres columnas: incident_id, rule_code
+            y finding_detail. Asi el servicio de verificacion puede volcarlas a integridad_hallazgo
+            sin transformar nada. rule_code lleva ya el valor exacto del enumerado de
+            ck_integridad_hallazgo_rule (sin_alta, estado_desalineado, hash_alterado y
+            secuencia_rota), de modo que la CHECK de la tabla de destino no puede rechazar lo que la
+            vista produce.
+
+            finding_detail SOLO contiene identificadores, codigos de estado, huellas y marcas
+            temporales. NUNCA la description de la incidencia ni su resolution_comment (REQ-152
+            RN-08): un informe de integridad no puede convertirse en una puerta trasera para leer el
+            contenido de incidencias ajenas. El SUBSTR a 500 caracteres respeta ademas la cota de la
+            columna finding_detail.
+
+            La verificacion es SOLO DIAGNOSTICA (REQ-152 RN-01): esto son VISTAS de lectura. No
+            reparan, no borran y no modifican ninguna entrada del historico; se limitan a senalar
+            donde esta la inconsistencia.
+
+            v_chk_estado_desalineado
+            ========================
+            Compara el estado vigente de la incidencia contra la ULTIMA entrada que MUEVE el estado
+            (CREACION o CAMBIO_ESTADO), desempatando por history_id cuando dos asientos comparten
+            changed_at. Las entradas ASIGNACION, RECLASIFICACION y COMENTARIO_RESOLUCION quedan FUERA
+            a proposito: no mueven el estado (de hecho ck_inc_hist_asignacion obliga a
+            from_status = to_status) y tomarlas como referencia daria FALSOS NEGATIVOS, porque una
+            asignacion posterior a un cambio de estado taparia el desajuste real.
+
+            v_chk_cadena_hash
+            =================
+            Devuelve UNA FILA POR ENTRADA cuyo eslabon no encaja, no una por incidencia: el
+            finding_detail identifica el history_id exacto donde se rompe la cadena. El centinela
+            '@' hace que el PRIMER asiento de cada incidencia (sin anterior y con
+            previous_entry_hash nulo, que es lo que exige ck_inc_hist_previous_hash) cuente como
+            cadena intacta, y que en cambio un previous_entry_hash nulo CON asiento anterior cuente
+            como ruptura.
+
+            v_chk_cierre_1a1
+            ================
+            Comprueba la correspondencia en los DOS sentidos: una incidencia CERRADA sin su asiento
+            RESUELTA -&gt; CERRADA, y un asiento de cierre sobre una incidencia que no esta cerrada.
+            El tercer caso teorico, dos asientos de cierre para la misma incidencia, ya lo impide el
+            indice unico ux_inc_hist_cierre de TSK-056, pero la vista lo contempla igualmente porque
+            el contador &lt;&gt; 1 lo cubre sin coste.
+
+            VENTANA DE RETENCION
+            ====================
+            Las vistas NO filtran por ventana de retencion: el acotado temporal opcional
+            (scope_date_from / scope_date_to del informe) lo aplica el servicio de verificacion
+            sobre incidencia.created_at, de modo que las vistas siguen siendo DETERMINISTAS y
+            auditables en cualquier instante.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_incidencia_sin_alta AS
+SELECT i.incident_id                                AS incident_id,
+       CAST('sin_alta' AS VARCHAR2(30 CHAR))        AS rule_code,
+       SUBSTR('La incidencia ' || i.reference_code ||
+              ' creada el ' || TO_CHAR(i.created_at, 'YYYY-MM-DD HH24:MI:SS') ||
+              ' no tiene entrada de historico de tipo CREACION', 1, 500) AS finding_detail
+  FROM incidencia i
+ WHERE NOT EXISTS (SELECT 1
+                     FROM incidencia_historico h
+                    WHERE h.incident_id = i.incident_id
+                      AND h.entry_type  = 'CREACION')]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_estado_desalineado AS
+SELECT i.incident_id                                         AS incident_id,
+       CAST('estado_desalineado' AS VARCHAR2(30 CHAR))       AS rule_code,
+       SUBSTR('El estado vigente ' || i.status ||
+              ' de la incidencia ' || i.reference_code ||
+              ' no coincide con el to_status ' || u.to_status ||
+              ' de su ultima entrada de historico (history_id ' || u.history_id || ')', 1, 500) AS finding_detail
+  FROM incidencia i
+  JOIN (SELECT incident_id,
+               history_id,
+               to_status,
+               ROW_NUMBER() OVER (PARTITION BY incident_id
+                                      ORDER BY changed_at DESC, history_id DESC) AS rn
+          FROM incidencia_historico
+         WHERE entry_type IN ('CREACION', 'CAMBIO_ESTADO')) u
+    ON u.incident_id = i.incident_id
+   AND u.rn          = 1
+ WHERE i.status <> u.to_status]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_cadena_hash AS
+SELECT c.incident_id                                   AS incident_id,
+       CAST('hash_alterado' AS VARCHAR2(30 CHAR))      AS rule_code,
+       SUBSTR('La entrada de historico ' || c.history_id ||
+              ' de la incidencia ' || c.incident_id ||
+              ' rompe la cadena de huellas: su previous_entry_hash ' || NVL(c.previous_entry_hash, '(nulo)') ||
+              ' no coincide con el entry_hash ' || NVL(c.huella_anterior, '(nulo)') ||
+              ' de la entrada anterior ' || NVL(TO_CHAR(c.history_id_anterior), '(ninguna)'), 1, 500) AS finding_detail
+  FROM (SELECT incident_id,
+               history_id,
+               previous_entry_hash,
+               LAG(entry_hash) OVER (PARTITION BY incident_id
+                                         ORDER BY changed_at, history_id) AS huella_anterior,
+               LAG(history_id) OVER (PARTITION BY incident_id
+                                         ORDER BY changed_at, history_id) AS history_id_anterior
+          FROM incidencia_historico) c
+ WHERE NVL(c.previous_entry_hash, '@') <> NVL(c.huella_anterior, '@')]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_cierre_1a1 AS
+SELECT i.incident_id                                    AS incident_id,
+       CAST('secuencia_rota' AS VARCHAR2(30 CHAR))      AS rule_code,
+       SUBSTR(CASE WHEN i.status = 'CERRADA'
+                   THEN 'La incidencia ' || i.reference_code ||
+                        ' esta CERRADA y tiene ' || NVL(c.cierres, 0) ||
+                        ' entradas de historico RESUELTA -> CERRADA en lugar de exactamente una'
+                   ELSE 'La incidencia ' || i.reference_code ||
+                        ' tiene ' || NVL(c.cierres, 0) ||
+                        ' entradas de historico RESUELTA -> CERRADA pero su estado vigente es ' || i.status
+              END, 1, 500)                              AS finding_detail
+  FROM incidencia i
+  LEFT JOIN (SELECT incident_id, COUNT(*) AS cierres
+               FROM incidencia_historico
+              WHERE from_status = 'RESUELTA'
+                AND to_status   = 'CERRADA'
+              GROUP BY incident_id) c
+    ON c.incident_id = i.incident_id
+ WHERE (i.status =  'CERRADA' AND NVL(c.cierres, 0) <> 1)
+    OR (i.status <> 'CERRADA' AND NVL(c.cierres, 0) <> 0)]]></sql>
+        <rollback>
+            <sql>DROP VIEW v_chk_cierre_1a1</sql>
+            <sql>DROP VIEW v_chk_cadena_hash</sql>
+            <sql>DROP VIEW v_chk_estado_desalineado</sql>
+            <sql>DROP VIEW v_chk_incidencia_sin_alta</sql>
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
