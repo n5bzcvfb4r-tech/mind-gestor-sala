@@ -1064,4 +1064,1066 @@ END;]]></sql>
         </rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-15-07" author="MIND">
+        <comment>Oraculo AC-SMTP-02 / REQ-135 RN-05: el snapshot de destinatarios de un intento ya registrado no varia cuando despues cambia el rol o el estado del tecnico</comment>
+        <!--
+            Este es el TERCER ORACULO DE COMPORTAMIENTO de la traza de envios y el que cierra
+            AC-SMTP-02. Como los oraculos 15-05 y 15-06, se ejecuta contra el motor Oracle REAL
+            durante el propio despliegue: monta el escenario completo (catalogos, cuentas, oficina,
+            sala, categoria, incidencia y la fila de aviso_correo que se intenta entregar), escribe
+            los intentos sobre datos reales, comprueba las invariantes leyendolas DE LA TABLA y
+            deshace todo lo que ha sembrado con un ROLLBACK final.
+
+            QUE DICE LA REGLA Y POR QUE NECESITA UN ORACULO
+            ===============================================
+            REQ-135 RN-05: "el snapshot de destinatarios de un intento es el vigente en el momento
+            del intento y no varia ante cambios posteriores de rol o estado de los tecnicos".
+            AC-SMTP-02: "dado un tecnico de mantenimiento con la cuenta desactivada, cuando se
+            resuelven los destinatarios del aviso, entonces su direccion no figura en el mensaje
+            enviado ni en el snapshot de destinatarios del intento".
+
+            Las dos frases hablan de la MISMA columna, recipients_snapshot, pero en dos momentos
+            distintos, y solo juntas describen el comportamiento correcto: el snapshot de un intento
+            YA REGISTRADO es historia congelada y no se reescribe cuando el directorio cambia, y el
+            snapshot de un intento NUEVO se calcula con el directorio VIGENTE, de modo que el tecnico
+            dado de baja ya no aparece en el. Una implementacion que guardase una referencia al
+            directorio en lugar de la instantanea (o que resolviese los destinatarios por consulta
+            diferida al leer la traza) cumpliria la segunda frase y romperia la primera: la auditoria
+            de un envio de hace dos anios mostraria los destinatarios de HOY y no a quien se escribio
+            de verdad. Este oraculo fija las dos mitades a la vez sobre el motor.
+
+            EL ESCENARIO
+            ============
+            Dos tecnicos de mantenimiento ACTIVOS (A y B) son los destinatarios resueltos del aviso
+            de alta de la incidencia. Se registra el INTENTO 1 con los dos en el snapshot
+            (recipient_count = 2) y un fallo transitorio 451. DESPUES del intento se cambia el
+            directorio: al tecnico A se le cambia el ROL a EMPLEADO (role_changed_at /
+            role_changed_by) y al tecnico B se le DESACTIVA la cuenta (status INACTIVO con
+            deactivated_at, deactivated_by y deactivation_reason_code, que ck_usuario_coherencia_baja
+            exige a la vez, y con un deactivated_by distinto del propio usuario, que exige
+            ck_usuario_deactivated_by_self). Esos dos cambios son exactamente los dos que nombra
+            RN-05: uno de rol y otro de estado.
+
+            QUE DEMUESTRA, PUNTO POR PUNTO
+            ==============================
+            (1) RN-05, el corazon del oraculo: tras cambiar el directorio se vuelve a leer DE LA
+            TABLA el recipients_snapshot y el recipient_count del intento 1 y se comparan con el
+            texto integro guardado ANTES del cambio (leido con DBMS_LOB.SUBSTR, porque la columna es
+            un CLOB). Tienen que ser IDENTICOS (-20801, -20802) y los correos de AMBOS tecnicos
+            tienen que SEGUIR figurando en el (-20803, INSTR > 0), incluido el del tecnico que ya no
+            es tecnico y el del tecnico desactivado. Eso es lo que convierte la traza en auditable:
+            el intento dice a quien se escribio ENTONCES, no a quien se escribiria ahora.
+
+            (2) AC-SMTP-02, la otra mitad: se registra el INTENTO 2 resolviendo los destinatarios
+            AHORA, con el PREDICADO REAL del directorio (role_code = 'TECNICO_MANTENIMIENTO' AND
+            status = 'ACTIVO'), no con una constante escrita a mano. La misma consulta que antes
+            devolvia dos filas devuelve ahora cero (-20804), de modo que el intento 2 queda con
+            recipient_count = 0 y result_code = 'NO_RECIPIENTS' (-20805), que es lo unico que
+            ck_aviso_intento_sin_dest admite con recuento cero: no se puede registrar un envio
+            "exitoso" a nadie. Y se comprueba leyendo el snapshot DE LA TABLA que la direccion del
+            tecnico DESACTIVADO no figura en el (-20806, INSTR = 0), que es la frase literal del AC.
+
+            (3) La traza del aviso tiene exactamente 2 filas (-20807) y el intento 1 conserva su
+            snapshot original al final del escenario (-20808), ya con el intento 2 escrito: escribir
+            un intento nuevo con otros destinatarios no toca el anterior.
+
+            POR QUE LA LIMPIEZA ES SIEMPRE POR ROLLBACK Y NUNCA POR DELETE
+            ==============================================================
+            aviso_correo_intento es append-only: el trigger trg_aviso_correo_intento_inmutable del
+            changeset 15-04 rechaza con ORA-20004 CUALQUIER UPDATE o DELETE sobre la tabla, incluso
+            el que no afecta a ninguna fila, porque es un trigger de SENTENCIA. Un
+            "DELETE FROM aviso_correo_intento WHERE ..." para recoger los datos del escenario no
+            limpiaria nada: reventaria el oraculo y con el todo el despliegue. La unica forma de
+            deshacer lo escrito en una tabla inmutable es NO confirmarlo, de modo que el oraculo
+            trabaja dentro de una transaccion y termina con ROLLBACK, que revierte a la vez los dos
+            intentos, el aviso, la incidencia, los cambios de rol y de estado, las cuentas y las
+            semillas de catalogo. El manejador WHEN OTHERS hace el mismo ROLLBACK antes de relanzar,
+            para que tampoco un fallo deje restos. Esa es exactamente la razon de que el bloque de
+            rollback del changeset solo lleve un comentario: el oraculo no cambia nada que revertir.
+            Notese que ese mismo trigger es, ademas, la garantia estructural de RN-05: el snapshot no
+            varia porque NADIE puede actualizarlo; este oraculo demuestra la consecuencia observable
+            de esa garantia ante el caso concreto que pide el AC.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL, que provocaria un commit implicito y dejaria grabadas las filas
+            del oraculo. Los catalogos se siembran con MERGE (clave fija) y con el patron "buscar o
+            insertar" (clave IDENTITY) igual que en 15-05 y 15-06, porque los changelogs dml se
+            aplican DESPUES de los ddl y aqui pueden estar todavia vacios. Todos los literales llevan
+            marca propia y DISTINTA de la de los dos oraculos anteriores (office_code 'ORA58C',
+            room_code 'ORA58C-SALA-01', reference_code 'INC-ORA58-000003', correos
+            oraculo.tsk058.snap.*, display_order de rol en el rango 983..985) para que los tres
+            puedan convivir en el mismo despliegue sin chocar en ninguna clave unica.
+
+            TODAS las marcas temporales del escenario son PASADAS porque trg_incidencia_ciclo_vida
+            rechaza con ORA-20053 cualquier marca futura.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin        NUMBER;
+    v_empleado     NUMBER;
+    v_tecnico_a    NUMBER;
+    v_tecnico_b    NUMBER;
+    v_oficina      NUMBER;
+    v_sala         NUMBER;
+    v_categoria    NUMBER;
+    v_inc          NUMBER;
+    v_aviso        VARCHAR2(36 CHAR);
+    v_intento_1    VARCHAR2(36 CHAR);
+    v_intento_2    VARCHAR2(36 CHAR);
+    v_now          TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0           TIMESTAMP;
+    v_t_intento1   TIMESTAMP;
+    v_t_cambio     TIMESTAMP;
+    v_t_intento2   TIMESTAMP;
+
+    -- Resolucion de destinatarios ANTES del cambio de directorio (la que congela el intento 1)
+    v_snap_1       VARCHAR2(2000 CHAR);
+    v_count_1      NUMBER;
+
+    -- Testigo del snapshot del intento 1 guardado ANTES de tocar el directorio
+    a_snap_1       VARCHAR2(2000 CHAR);
+    a_count_1      NUMBER;
+
+    -- Relecturas DE LA TABLA
+    d_snap_1       VARCHAR2(2000 CHAR);
+    d_count_1      NUMBER;
+    f_snap_1       VARCHAR2(2000 CHAR);
+    v_snap_2       VARCHAR2(2000 CHAR);
+    v_count_2      NUMBER;
+    l_snap_2       VARCHAR2(2000 CHAR);
+    l_count_2      NUMBER;
+    l_result_2     VARCHAR2(30 CHAR);
+    v_filas        NUMBER;
+
+    c_prefijo       CONSTANT VARCHAR2(26 CHAR)  := 'ORACULO-TSK058-SNAP|';
+    c_admin_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Snapshot Administrador';
+    c_empleado_nom  CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Snapshot Reportante';
+    c_empleado_mail CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk058.snap.reportante@example.invalid';
+    c_tec_a_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Snapshot Tecnico A';
+    c_tec_a_mail    CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk058.snap.tecnico.a@example.invalid';
+    c_tec_b_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Snapshot Tecnico B';
+    c_tec_b_mail    CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk058.snap.tecnico.b@example.invalid';
+    c_referencia    CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA58-000003';
+    c_descripcion   CONSTANT VARCHAR2(500 CHAR) := 'La luminaria del techo de la sala de reuniones parpadea de forma continua y no se puede trabajar en ella';
+    c_sala_nom      CONSTANT VARCHAR2(80 CHAR)  := 'Sala del oraculo TSK-058 Snapshot';
+    c_oficina_nom   CONSTANT VARCHAR2(80 CHAR)  := 'Oficina del oraculo TSK-058 Snapshot';
+    c_categoria_nm  CONSTANT VARCHAR2(60 CHAR)  := 'Climatizacion oraculo TSK-058 Snapshot';
+    c_asunto        CONSTANT VARCHAR2(255 CHAR) := 'Nueva incidencia registrada (oraculo TSK-058 snapshot)';
+    c_cuerpo        CONSTANT VARCHAR2(500 CHAR) := 'Cuerpo congelado del aviso de alta del oraculo TSK-058 de snapshot de destinatarios.';
+    c_error_msg     CONSTANT VARCHAR2(500 CHAR) := 'El servidor de correo respondio 451: buzon temporalmente no disponible, procede reintento';
+    c_nulo          CONSTANT VARCHAR2(30 CHAR)  := '~SIN~VALOR~';
+
+    -- Semillas idempotentes de los catalogos de clave fija, mismo patron que los oraculos 15-05 y
+    -- 15-06. Los display_order quedan fuera del rango de las semillas reales y fuera del de los
+    -- oraculos anteriores (901..903, 956, 971..982) porque uk_cat_rol_display_order y
+    -- uk_cat_categoria_display_order son UNIQUE.
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- El motivo de baja es obligatorio en cuanto la cuenta pasa a INACTIVO
+    -- (ck_usuario_coherencia_baja) y tiene clave ajena contra este catalogo, que tambien puede
+    -- estar todavia vacio.
+    PROCEDURE sembrar_motivo(p_code VARCHAR2, p_name VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_motivo_desactivacion d
+        USING (SELECT p_code AS reason_code FROM dual) s
+           ON (d.reason_code = s.reason_code)
+        WHEN NOT MATCHED THEN
+            INSERT (reason_code, reason_name, is_active)
+            VALUES (p_code, p_name, 'Y');
+    END sembrar_motivo;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven con
+    -- el equivalente "buscar o insertar": si la fila ya existe se reutiliza (reactivandola, porque
+    -- los triggers de clasificacion rechazan oficinas, salas y categorias inactivas) y si no se crea
+    -- una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA58C';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA58C', c_oficina_nom, 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA58C-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA58C-SALA-01', c_sala_nom, p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        -- El oraculo NO puede usar un category_code propio porque ck_cat_categoria_code cierra el
+        -- enumerado, de modo que reutiliza CLIMATIZACION.
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', c_categoria_nm, 985, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+BEGIN
+    v_t0         := v_now - INTERVAL '4' HOUR;
+    v_t_intento1 := v_t0 + INTERVAL '10' MINUTE;
+    v_t_cambio   := v_t0 + INTERVAL '30' MINUTE;
+    v_t_intento2 := v_t0 + INTERVAL '45' MINUTE;
+
+    -- ==================================================================================
+    -- MONTAJE: catalogos, cuentas, clasificacion, incidencia y el aviso a entregar
+    -- ==================================================================================
+    sembrar_rol('EMPLEADO',              'Empleado',                 983);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 984);
+    sembrar_rol('ADMINISTRADOR',         'Administrador',            985);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    sembrar_motivo('BAJA_EMPRESA', 'Baja en la empresa');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk058.snap.admin@example.invalid',
+                 'oraculo.tsk058.snap.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk058-snap-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_empleado_nom, c_empleado_mail,
+                 'oraculo.tsk058.snap.reportante', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk058-snap-reportante', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    -- Los DOS tecnicos de mantenimiento ACTIVOS que el directorio resuelve como destinatarios del
+    -- aviso de alta en el momento del intento 1.
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_tec_a_nom, c_tec_a_mail,
+                 'oraculo.tsk058.snap.tecnico.a', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk058-snap-tecnico-a', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_tecnico_a;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_tec_b_nom, c_tec_b_mail,
+                 'oraculo.tsk058.snap.tecnico.b', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk058-snap-tecnico-b', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_tecnico_b;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t0, v_t0, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    -- El identificador del aviso y los de los intentos los genera el emisor (VARCHAR2(36)):
+    -- SYS_GUID en hexadecimal minuscula ocupa 32 caracteres y cabe de sobra.
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso     FROM dual;
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_intento_1 FROM dual;
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_intento_2 FROM dual;
+
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              incident_id, history_entry_id,
+                              recipient_user_id, recipient_email, subject, body_text,
+                              status)
+         VALUES (v_aviso, c_prefijo || 'NEW_INCIDENT_ALERT|' || v_inc, 'NEW_INCIDENT_ALERT',
+                 v_inc, NULL,
+                 NULL, NULL, c_asunto, c_cuerpo,
+                 'PENDIENTE');
+
+    -- ==================================================================================
+    -- RESOLUCION DE DESTINATARIOS EN EL MOMENTO DEL INTENTO 1
+    -- Se resuelve con el PREDICADO REAL del directorio (tecnico de mantenimiento y cuenta
+    -- activa), no con una constante: es la MISMA consulta que se volvera a ejecutar despues del
+    -- cambio de directorio, y lo que demuestra el oraculo es justamente que su resultado cambia
+    -- mientras el snapshot ya escrito NO. El documento solo lleva el identificador y el correo
+    -- CORPORATIVO, jamas una credencial del servidor de correo (AC-SMTP-11).
+    -- ==================================================================================
+    SELECT COUNT(*),
+           '[' || LISTAGG('{"user_id":' || user_id || ',"corporate_email":"' || corporate_email || '"}', ',')
+                      WITHIN GROUP (ORDER BY user_id) || ']'
+      INTO v_count_1, v_snap_1
+      FROM usuario
+     WHERE role_code = 'TECNICO_MANTENIMIENTO'
+       AND status    = 'ACTIVO'
+       AND user_id IN (v_tecnico_a, v_tecnico_b);
+
+    IF v_count_1 <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20800, 'ORACULO AC-SMTP-02: el montaje deberia resolver 2 tecnicos de mantenimiento activos como destinatarios del aviso y resolvio ' || v_count_1);
+    END IF;
+
+    -- ==================================================================================
+    -- INTENTO 1: fallo transitorio con el snapshot de los DOS tecnicos congelado
+    -- ==================================================================================
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (v_intento_1, v_aviso, v_inc,
+                 1, v_t_intento1, 'TRANSIENT_ERROR',
+                 '451', 'SMTP_TEMP_UNAVAILABLE', c_error_msg,
+                 v_snap_1, v_count_1, NULL);
+
+    -- Testigo del snapshot TAL Y COMO QUEDO PERSISTIDO, leido de la tabla antes de tocar el
+    -- directorio. recipients_snapshot es un CLOB y se lee a VARCHAR2 con DBMS_LOB.SUBSTR para
+    -- poder compararlo despues como texto.
+    SELECT DBMS_LOB.SUBSTR(recipients_snapshot, 2000, 1), recipient_count
+      INTO a_snap_1, a_count_1
+      FROM aviso_correo_intento
+     WHERE attempt_id = v_intento_1;
+
+    -- ==================================================================================
+    -- EL CAMBIO DE DIRECTORIO, POSTERIOR AL INTENTO: los dos cambios que nombra RN-05
+    -- ==================================================================================
+    -- Al tecnico A se le cambia el ROL: deja de ser tecnico de mantenimiento.
+    UPDATE usuario
+       SET role_code       = 'EMPLEADO',
+           role_changed_at = v_t_cambio,
+           role_changed_by = v_admin
+     WHERE user_id = v_tecnico_a;
+
+    -- Al tecnico B se le DESACTIVA la cuenta. ck_usuario_coherencia_baja exige deactivated_at,
+    -- deactivated_by y deactivation_reason_code informados a la vez en cuanto el estado pasa a
+    -- INACTIVO, y ck_usuario_deactivated_by_self exige que quien da la baja no sea el propio
+    -- usuario: la da el administrador del escenario.
+    UPDATE usuario
+       SET status                   = 'INACTIVO',
+           deactivated_at           = v_t_cambio,
+           deactivated_by           = v_admin,
+           deactivation_reason_code = 'BAJA_EMPRESA'
+     WHERE user_id = v_tecnico_b;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (REQ-135 RN-05, el corazon del oraculo): el snapshot del intento YA
+    -- REGISTRADO no varia ante el cambio posterior de rol o de estado. Se relee DE LA TABLA y
+    -- se compara con el testigo guardado antes del cambio: texto integro y recuento identicos,
+    -- y los correos de AMBOS tecnicos todavia presentes. Si variase, la traza historica se
+    -- estaria reescribiendo sola y la auditoria de un envio diria a quien se escribiria HOY en
+    -- lugar de a quien se escribio entonces.
+    -- -------------------------------------------------------------------------------------
+    SELECT DBMS_LOB.SUBSTR(recipients_snapshot, 2000, 1), recipient_count
+      INTO d_snap_1, d_count_1
+      FROM aviso_correo_intento
+     WHERE attempt_id = v_intento_1;
+
+    IF NVL(d_count_1, -1) <> NVL(a_count_1, -1) THEN
+        RAISE_APPLICATION_ERROR(-20801, 'ORACULO AC-SMTP-02 / RN-05: el recipient_count del intento 1 cambio de ' || a_count_1 || ' a ' || d_count_1 || ' tras cambiar el rol de un tecnico y desactivar al otro');
+    END IF;
+
+    IF NVL(d_snap_1, c_nulo) <> NVL(a_snap_1, c_nulo) THEN
+        RAISE_APPLICATION_ERROR(-20802, 'ORACULO AC-SMTP-02 / RN-05: el recipients_snapshot del intento 1 ya no es el vigente en el momento del intento: antes [' || a_snap_1 || '] y ahora [' || d_snap_1 || ']');
+    END IF;
+
+    IF INSTR(d_snap_1, c_tec_a_mail) = 0 OR INSTR(d_snap_1, c_tec_b_mail) = 0 THEN
+        RAISE_APPLICATION_ERROR(-20803, 'ORACULO AC-SMTP-02 / RN-05: el snapshot del intento 1 deberia seguir conteniendo los correos de los dos tecnicos a los que se escribio entonces, y es [' || d_snap_1 || ']');
+    END IF;
+
+    -- ==================================================================================
+    -- INTENTO 2: se resuelven los destinatarios AHORA, con el directorio ya cambiado
+    -- La resolucion es una CONSULTA REAL al directorio con el mismo predicado de antes; el
+    -- recuento y el documento NO son constantes escritas a mano. Con A convertido en empleado y
+    -- B desactivado no queda ningun destinatario, de modo que el intento se registra con
+    -- recipient_count 0 y result_code NO_RECIPIENTS, que es lo unico que ck_aviso_intento_sin_dest
+    -- admite con recuento cero.
+    -- ==================================================================================
+    SELECT COUNT(*),
+           '[' || LISTAGG('{"user_id":' || user_id || ',"corporate_email":"' || corporate_email || '"}', ',')
+                      WITHIN GROUP (ORDER BY user_id) || ']'
+      INTO v_count_2, v_snap_2
+      FROM usuario
+     WHERE role_code = 'TECNICO_MANTENIMIENTO'
+       AND status    = 'ACTIVO'
+       AND user_id IN (v_tecnico_a, v_tecnico_b);
+
+    IF v_count_2 <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20804, 'ORACULO AC-SMTP-02: tras cambiar el rol de un tecnico y desactivar al otro, la resolucion de destinatarios deberia devolver 0 y devolvio ' || v_count_2 || ' (snapshot resuelto [' || v_snap_2 || '])');
+    END IF;
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (v_intento_2, v_aviso, v_inc,
+                 2, v_t_intento2, 'NO_RECIPIENTS',
+                 NULL, NULL, NULL,
+                 v_snap_2, v_count_2, NULL);
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-SMTP-02): se lee DE LA TABLA el intento 2 y la direccion del tecnico
+    -- DESACTIVADO no figura en su snapshot, que es la frase literal del criterio. El intento
+    -- queda ademas trazado como NO_RECIPIENTS con recuento 0: no se registra un envio
+    -- "exitoso" a nadie, la ausencia de destinatarios tiene nombre propio.
+    -- -------------------------------------------------------------------------------------
+    SELECT DBMS_LOB.SUBSTR(recipients_snapshot, 2000, 1), recipient_count, result_code
+      INTO l_snap_2, l_count_2, l_result_2
+      FROM aviso_correo_intento
+     WHERE attempt_id = v_intento_2;
+
+    IF l_count_2 <> 0 OR l_result_2 <> 'NO_RECIPIENTS' THEN
+        RAISE_APPLICATION_ERROR(-20805, 'ORACULO AC-SMTP-02: el intento 2 deberia quedar persistido con recipient_count 0 y result_code NO_RECIPIENTS, y tiene recuento ' || l_count_2 || ' y resultado ' || l_result_2);
+    END IF;
+
+    IF INSTR(NVL(l_snap_2, c_nulo), c_tec_b_mail) <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20806, 'ORACULO AC-SMTP-02: la direccion del tecnico con la cuenta desactivada SIGUE figurando en el snapshot de destinatarios del intento 2: [' || l_snap_2 || ']');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3: la traza del aviso tiene exactamente 2 filas y el intento 1 conserva su
+    -- snapshot original tambien DESPUES de escribir el intento 2 con otros destinatarios. Un
+    -- intento nuevo nunca reescribe al anterior: la traza crece, no se corrige.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_filas
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso;
+
+    IF v_filas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20807, 'ORACULO AC-SMTP-02: la traza del aviso deberia tener exactamente 2 intentos y tiene ' || v_filas);
+    END IF;
+
+    SELECT DBMS_LOB.SUBSTR(recipients_snapshot, 2000, 1)
+      INTO f_snap_1
+      FROM aviso_correo_intento
+     WHERE attempt_id = v_intento_1;
+
+    IF NVL(f_snap_1, c_nulo) <> NVL(a_snap_1, c_nulo) THEN
+        RAISE_APPLICATION_ERROR(-20808, 'ORACULO AC-SMTP-02 / RN-05: el snapshot del intento 1 dejo de ser el original despues de registrar el intento 2: antes [' || a_snap_1 || '] y ahora [' || f_snap_1 || ']');
+    END IF;
+
+    -- La limpieza es SIEMPRE por ROLLBACK: trg_aviso_correo_intento_inmutable rechaza con
+    -- ORA-20004 cualquier DELETE sobre aviso_correo_intento, de modo que un borrado explicito
+    -- de los datos del escenario tumbaria el despliegue en lugar de limpiarlo.
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-15-08" author="MIND">
+        <comment>Oraculo AC-SMTP-08 / REQ-144 / REQ-015: un intento de entrega registrado hace 23 meses sigue disponible e integro dentro de la retencion de 2 anios</comment>
+        <!--
+            Este es el CUARTO ORACULO DE COMPORTAMIENTO de la traza de envios y el equivalente, para
+            aviso_correo_intento, del oraculo ddl-0.0.1-16-08 de resolucion_destinatario_log: se
+            ejecuta contra el motor Oracle REAL durante el propio despliegue, monta su escenario,
+            comprueba la retencion sobre datos reales y DESHACE sus propios datos con un ROLLBACK
+            final, de modo que no deja ni una fila en la base de datos.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL, que provocaria un commit implicito y dejaria grabadas las filas
+            del oraculo. Reutiliza el mismo esqueleto de fixture de los oraculos 15-05, 15-06 y
+            15-07 (MERGE para los catalogos de clave fija, "buscar o insertar" para los de clave
+            IDENTITY), porque los changelogs dml se aplican DESPUES de los ddl y los catalogos
+            pueden estar todavia vacios. Todos los literales llevan marca propia y DISTINTA de la de
+            los oraculos anteriores (office_code 'ORA58D', room_code 'ORA58D-SALA-01',
+            reference_code 'INC-ORA58-000004', correos oraculo.tsk058.ret.*, display_order en el
+            rango 986..988) para que los cuatro oraculos puedan convivir en el mismo despliegue sin
+            chocar en ninguna clave unica.
+
+            QUE DEMUESTRA, PUNTO POR PUNTO
+            ==============================
+            (1) AC-SMTP-08 / REQ-015, DISPONIBILIDAD: el escenario escribe DOS intentos del mismo
+            aviso, uno fechado hace 23 MESES (dentro de la ventana de retencion de 2 anios) y otro
+            fechado hace 2 ANIOS Y UN DIA (fuera de ella). Contar que hay EXACTAMENTE 1 fila dentro
+            de la ventana y EXACTAMENTE 1 fuera es lo que fija el BORDE: las dos mitades juntas
+            demuestran donde cae el limite de los 24 meses, no solo que "haya filas".
+
+            (2) AC-SMTP-08, INTEGRIDAD, que es la palabra exacta del AC: no basta con que la fila de
+            23 meses exista, tiene que seguir diciendo LO MISMO que el dia que se escribio. El
+            oraculo la relee DE LA TABLA por su attempt_id y la compara CAMPO A CAMPO con los
+            valores que inserto: notification_id, incident_id, attempt_number, attempted_at,
+            result_code, smtp_response_code, recipient_count, message_id (la prueba de entrega de
+            AC-SMTP-06) y el TEXTO del CLOB recipients_snapshot leido con DBMS_LOB.SUBSTR, que es la
+            instantanea congelada de destinatarios de AC-SMTP-02. La marca temporal se compara con
+            TO_CHAR y mascara hasta el microsegundo para que el resultado no dependa del formato de
+            la sesion, y las columnas nulables con NVL contra un centinela que no puede aparecer en
+            los datos, para que un nulo no se confunda con una cadena vacia ni haga que la
+            comparacion evalue a NULL y se escape del IF.
+
+            (3) AC-TRZ-04, NO HAY PURGA HABILITADA: el oraculo ejecuta exactamente la sentencia de
+            purga por retencion que alguien podria programar algun dia
+            (DELETE ... WHERE attempted_at < SYSTIMESTAMP - 24 MONTH) y exige que el motor la
+            rechace con el codigo EXACTO -20004, el de trg_aviso_correo_intento_inmutable. Un 0
+            significaria que la purga SE EJECUTO y que la traza es borrable; cualquier otro codigo,
+            que la rechazo otra regla distinta de la inmutabilidad. Ese es el sentido literal de
+            AC-TRZ-04: no existe NINGUNA operacion de borrado fisico habilitada sobre la tabla de
+            intentos, ni siquiera la que se disfraza de mantenimiento. Despues se vuelve a contar y
+            las dos filas siguen ahi, porque Oracle hace rollback A NIVEL DE SENTENCIA y el
+            escenario sobrevive al DELETE rechazado.
+
+            [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+            implementa purga alguna al cumplirse los 2 anios]
+
+            POR QUE LA LIMPIEZA ES SIEMPRE POR ROLLBACK Y NUNCA POR DELETE
+            ==============================================================
+            Lo mismo que impide la purga impide la limpieza: trg_aviso_correo_intento_inmutable
+            rechaza con ORA-20004 cualquier UPDATE o DELETE sobre aviso_correo_intento, incluido el
+            que no afecta a ninguna fila, porque es un trigger de SENTENCIA. Un
+            "DELETE FROM aviso_correo_intento WHERE ..." para recoger los datos del escenario no
+            limpiaria nada: reventaria el oraculo y con el todo el despliegue. La unica forma de
+            deshacer lo escrito en una tabla inmutable es NO confirmarlo, de modo que el oraculo
+            trabaja dentro de una transaccion y termina con ROLLBACK, que revierte a la vez los dos
+            intentos, el aviso, la incidencia, las cuentas y las semillas de catalogo. El manejador
+            WHEN OTHERS hace el mismo ROLLBACK antes de relanzar, para que tampoco un fallo deje
+            restos. Esa es exactamente la razon de que el bloque de rollback del changeset solo
+            lleve un comentario: el oraculo no cambia nada que revertir.
+
+            TODAS las marcas temporales del escenario son PASADAS porque trg_incidencia_ciclo_vida
+            rechaza con ORA-20053 cualquier marca futura, y la incidencia se crea 25 MESES atras,
+            antes del mas antiguo de los dos intentos, para que el escenario sea cronologicamente
+            coherente.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin       NUMBER;
+    v_empleado    NUMBER;
+    v_oficina     NUMBER;
+    v_sala        NUMBER;
+    v_categoria   NUMBER;
+    v_inc         NUMBER;
+    v_aviso       VARCHAR2(36 CHAR);
+    v_intento     VARCHAR2(36 CHAR);
+    v_snapshot    VARCHAR2(400 CHAR);
+    v_t_inc       TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '25' MONTH;
+    v_t23         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '23' MONTH;
+    v_t24         TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH - INTERVAL '1' DAY;
+    v_en_ventana  NUMBER;
+    v_fuera       NUMBER;
+    v_filas       NUMBER;
+    v_sqlcode     NUMBER := 0;
+
+    -- Relectura DE LA TABLA de la fila de 23 meses
+    r_aviso       VARCHAR2(36 CHAR);
+    r_incidencia  NUMBER;
+    r_numero      NUMBER;
+    r_attempted   VARCHAR2(40 CHAR);
+    r_result      VARCHAR2(30 CHAR);
+    r_smtp        VARCHAR2(3 CHAR);
+    r_recipients  NUMBER;
+    r_message_id  VARCHAR2(255 CHAR);
+    r_snapshot    VARCHAR2(2000 CHAR);
+
+    c_prefijo       CONSTANT VARCHAR2(24 CHAR)  := 'ORACULO-TSK058-RET|';
+    c_admin_nom     CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Retencion Administrador';
+    c_empleado_nom  CONSTANT VARCHAR2(120 CHAR) := 'Oraculo TSK-058 Retencion Reportante';
+    c_empleado_mail CONSTANT VARCHAR2(150 CHAR) := 'oraculo.tsk058.ret.reportante@example.invalid';
+    c_referencia    CONSTANT VARCHAR2(30 CHAR)  := 'INC-ORA58-000004';
+    c_descripcion   CONSTANT VARCHAR2(500 CHAR) := 'La persiana motorizada de la sala de reuniones no sube y la sala se queda sin luz natural toda la jornada';
+    c_sala_nom      CONSTANT VARCHAR2(80 CHAR)  := 'Sala del oraculo TSK-058 Retencion';
+    c_oficina_nom   CONSTANT VARCHAR2(80 CHAR)  := 'Oficina del oraculo TSK-058 Retencion';
+    c_categoria_nm  CONSTANT VARCHAR2(60 CHAR)  := 'Climatizacion oraculo TSK-058 Retencion';
+    c_asunto        CONSTANT VARCHAR2(255 CHAR) := 'Nueva incidencia registrada (oraculo TSK-058 retencion)';
+    c_cuerpo        CONSTANT VARCHAR2(500 CHAR) := 'Cuerpo congelado del aviso de alta del oraculo TSK-058 de retencion.';
+    c_message       CONSTANT VARCHAR2(255 CHAR) := '<oraculo-tsk058-ret-1@mapfre.invalid>';
+    c_smtp          CONSTANT VARCHAR2(3 CHAR)   := '250';
+    c_error_code    CONSTANT VARCHAR2(50 CHAR)  := 'SMTP_TEMP_UNAVAILABLE';
+    c_error_msg     CONSTANT VARCHAR2(500 CHAR) := 'El servidor de correo respondio 451: buzon temporalmente no disponible, procede reintento';
+    c_nulo          CONSTANT VARCHAR2(30 CHAR)  := '~SIN~VALOR~';
+
+    -- Semillas idempotentes de los catalogos de clave fija, mismo patron que los oraculos 15-05,
+    -- 15-06 y 15-07. Los display_order quedan fuera del rango de las semillas reales y fuera del de
+    -- los oraculos anteriores (901..903, 956, 971..985) porque uk_cat_rol_display_order y
+    -- uk_cat_categoria_display_order son UNIQUE.
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    -- Los catalogos de clave IDENTITY no admiten MERGE con RETURNING, de modo que se resuelven con
+    -- el equivalente "buscar o insertar": si la fila ya existe se reutiliza (reactivandola, porque
+    -- los triggers de clasificacion rechazan oficinas, salas y categorias inactivas) y si no se crea
+    -- una propia del oraculo que el ROLLBACK final se lleva por delante.
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA58D';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA58D', c_oficina_nom, 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA58D-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA58D-SALA-01', c_sala_nom, p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        -- El oraculo NO puede usar un category_code propio porque ck_cat_categoria_code cierra el
+        -- enumerado, de modo que reutiliza CLIMATIZACION.
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', c_categoria_nm, 988, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+BEGIN
+    -- ==================================================================================
+    -- MONTAJE: catalogos, cuentas, clasificacion, incidencia y el aviso a entregar
+    -- ==================================================================================
+    sembrar_rol('EMPLEADO',      'Empleado',      986);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 987);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk058.ret.admin@example.invalid',
+                 'oraculo.tsk058.ret.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk058-ret-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_empleado_nom, c_empleado_mail,
+                 'oraculo.tsk058.ret.reportante', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk058-ret-reportante', 'argon2id', v_t_inc, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    -- La incidencia nace 25 MESES atras, ANTES del mas antiguo de los dos intentos, para que la
+    -- historia del escenario sea cronologicamente coherente.
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at,
+                            status_changed_at, status_changed_by)
+         VALUES (c_referencia, v_sala, v_categoria,
+                 c_sala_nom, c_oficina_nom, c_categoria_nm,
+                 c_descripcion,
+                 'ABIERTA', v_empleado, v_t_inc, v_t_inc, NULL)
+      RETURNING incident_id INTO v_inc;
+
+    -- El identificador del aviso y el del intento los genera el emisor (VARCHAR2(36)): SYS_GUID en
+    -- hexadecimal minuscula ocupa 32 caracteres y cabe de sobra.
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_aviso   FROM dual;
+    SELECT LOWER(RAWTOHEX(SYS_GUID())) INTO v_intento FROM dual;
+
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              incident_id, history_entry_id,
+                              recipient_user_id, recipient_email, subject, body_text,
+                              status)
+         VALUES (v_aviso, c_prefijo || 'NEW_INCIDENT_ALERT|' || v_inc, 'NEW_INCIDENT_ALERT',
+                 v_inc, NULL,
+                 NULL, NULL, c_asunto, c_cuerpo,
+                 'PENDIENTE');
+
+    -- Instantanea de destinatarios CONGELADA (AC-SMTP-02). Solo lleva el identificador y el correo
+    -- CORPORATIVO, jamas una credencial del servidor de correo (AC-SMTP-11).
+    v_snapshot := '[{"user_id":' || v_empleado || ',"corporate_email":"' || c_empleado_mail || '"}]';
+
+    -- ==================================================================================
+    -- EL ESCENARIO DE AC-SMTP-08: un intento DENTRO de la ventana de 2 anios (hace 23 meses)
+    -- y otro FUERA de ella (hace 2 anios y un dia), que juntos fijan el borde
+    -- ==================================================================================
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (v_intento, v_aviso, v_inc,
+                 1, v_t23, 'SENT',
+                 c_smtp, NULL, NULL,
+                 v_snapshot, 1, c_message);
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, incident_id,
+                                      attempt_number, attempted_at, result_code,
+                                      smtp_response_code, error_code, error_message,
+                                      recipients_snapshot, recipient_count, message_id)
+         VALUES (LOWER(RAWTOHEX(SYS_GUID())), v_aviso, v_inc,
+                 2, v_t24, 'TRANSIENT_ERROR',
+                 '451', c_error_code, c_error_msg,
+                 v_snapshot, 1, NULL);
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-SMTP-08 / REQ-015): DISPONIBILIDAD. Dentro de la ventana de 24 meses
+    -- tiene que haber EXACTAMENTE la fila de 23 meses, y fuera EXACTAMENTE la de 2 anios y un
+    -- dia. Las dos mitades juntas fijan el BORDE de la retencion, no solo que "haya filas".
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_en_ventana
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso
+       AND attempted_at >= SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+
+    IF v_en_ventana <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20820, 'ORACULO AC-SMTP-08: se esperaba 1 intento de entrega disponible dentro de la ventana de retencion de 2 anios (el de hace 23 meses) y hay ' || v_en_ventana);
+    END IF;
+
+    SELECT COUNT(*) INTO v_fuera
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso
+       AND attempted_at < SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+
+    IF v_fuera <> 1 THEN
+        RAISE_APPLICATION_ERROR(-20821, 'ORACULO AC-SMTP-08 / REQ-015: se esperaba 1 intento de entrega fuera de la ventana de retencion de 2 anios (el de hace 2 anios y un dia) y hay ' || v_fuera);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 (AC-SMTP-08): INTEGRIDAD, que es la palabra del AC. No basta con que la
+    -- fila de 23 meses exista: tiene que seguir diciendo LO MISMO que el dia que se escribio.
+    -- Se relee DE LA TABLA por su attempt_id y se compara campo a campo con lo insertado. La
+    -- marca temporal va por TO_CHAR con mascara hasta el microsegundo, para que el resultado no
+    -- dependa del formato de la sesion, y las nulables por NVL contra un centinela que no puede
+    -- aparecer en los datos, para que un nulo no se confunda con una cadena vacia ni haga que
+    -- la comparacion evalue a NULL y se escape del IF. recipients_snapshot es un CLOB y se lee a
+    -- VARCHAR2 con DBMS_LOB.SUBSTR para compararlo como texto.
+    -- -------------------------------------------------------------------------------------
+    SELECT notification_id, incident_id, attempt_number,
+           TO_CHAR(attempted_at, 'YYYY-MM-DD HH24:MI:SS.FF6'),
+           result_code, smtp_response_code, recipient_count, message_id,
+           DBMS_LOB.SUBSTR(recipients_snapshot, 2000, 1)
+      INTO r_aviso, r_incidencia, r_numero,
+           r_attempted,
+           r_result, r_smtp, r_recipients, r_message_id,
+           r_snapshot
+      FROM aviso_correo_intento
+     WHERE attempt_id = v_intento;
+
+    IF r_aviso <> v_aviso
+       OR NVL(TO_CHAR(r_incidencia), c_nulo) <> NVL(TO_CHAR(v_inc), c_nulo)
+       OR r_numero <> 1
+       OR r_attempted <> TO_CHAR(v_t23, 'YYYY-MM-DD HH24:MI:SS.FF6')
+       OR r_result <> 'SENT'
+       OR NVL(r_smtp, c_nulo) <> NVL(c_smtp, c_nulo)
+       OR NVL(TO_CHAR(r_recipients), c_nulo) <> '1'
+       OR NVL(r_message_id, c_nulo) <> NVL(c_message, c_nulo)
+       OR NVL(r_snapshot, c_nulo) <> NVL(v_snapshot, c_nulo)
+    THEN
+        RAISE_APPLICATION_ERROR(-20822, 'ORACULO AC-SMTP-08: el intento de hace 23 meses no se conserva integro campo a campo dentro de la ventana de retencion de 2 anios');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3 (AC-TRZ-04): NO HAY PURGA HABILITADA. Se ejecuta exactamente la sentencia
+    -- de purga por retencion que alguien podria programar algun dia y se exige que el motor la
+    -- rechace con el codigo EXACTO -20004, el de trg_aviso_correo_intento_inmutable. Un 0
+    -- significaria que la purga SE EJECUTO y que la traza es borrable; cualquier otro codigo,
+    -- que la rechazo una regla distinta de la inmutabilidad.
+    -- [gap RFP: el RFP no indica que ocurre al vencer el plazo de retencion, por lo que no se
+    -- implementa purga alguna al cumplirse los 2 anios]
+    -- -------------------------------------------------------------------------------------
+    v_sqlcode := 0;
+    BEGIN
+        DELETE FROM aviso_correo_intento
+         WHERE attempted_at < SYS_EXTRACT_UTC(SYSTIMESTAMP) - INTERVAL '24' MONTH;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20004 THEN
+        RAISE_APPLICATION_ERROR(-20823, 'ORACULO AC-TRZ-04: la purga por retencion sobre aviso_correo_intento devolvio ' || v_sqlcode || ' en lugar de ORA-20004, de modo que existe una operacion de borrado fisico habilitada sobre la tabla de intentos');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- El escenario sobrevive al DELETE rechazado: Oracle hace rollback A NIVEL DE SENTENCIA, no
+    -- de la transaccion entera, asi que los dos intentos siguen ahi.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_filas
+      FROM aviso_correo_intento
+     WHERE notification_id = v_aviso;
+
+    IF v_filas <> 2 THEN
+        RAISE_APPLICATION_ERROR(-20824, 'ORACULO AC-TRZ-04: tras la purga rechazada deberia seguir habiendo 2 intentos del aviso y hay ' || v_filas);
+    END IF;
+
+    -- La limpieza es SIEMPRE por ROLLBACK: trg_aviso_correo_intento_inmutable rechaza con
+    -- ORA-20004 cualquier DELETE sobre aviso_correo_intento, de modo que un borrado explicito
+    -- de los datos del escenario tumbaria el despliegue en lugar de limpiarlo.
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-15-09" author="MIND">
+        <comment>Oraculo AC-SMTP-11 / REQ-135 RN-06: la tabla aviso_correo_intento no declara ninguna columna de credencial SMTP, verificado por inspeccion de USER_TAB_COLUMNS</comment>
+        <!--
+            Este es el ORACULO DE SUPERFICIE de la traza de envios, y es el unico de este fichero que
+            no monta fixture de negocio: no inserta ni una sola fila. Lo que AC-SMTP-11 y REQ-135
+            RN-06 exigen demostrar no es que una fila concreta no lleve la contrasenia del servidor de
+            correo, sino algo mucho mas fuerte: que NO EXISTE EN LA TABLA UN SITIO DONDE ESCRIBIRLA.
+            Una propiedad sobre la FORMA del esquema solo se puede comprobar interrogando a la forma
+            del esquema, y la forma del esquema, contra el motor real, es el diccionario de datos.
+
+            POR QUE EL DICCIONARIO DE DATOS Y NO UNA REVISION DE CODIGO
+            ===========================================================
+            La lectura literal de AC-SMTP-11 ("cuando se inspeccionan codigo, base de datos, logs y
+            registros de intentos...") invita a resolverlo con una revision manual. Una revision
+            manual se hace una vez, el dia que se escribe la tabla, y no se vuelve a hacer nunca: el
+            dia que alguien anade un smtp_password_used "solo para depurar" no hay nadie mirando. Este
+            changeset convierte esa revision en una comprobacion EJECUTABLE que corre en CADA
+            despliegue contra el motor Oracle real, justo despues de que Liquibase haya creado la
+            tabla: si la superficie de la tabla deja de cumplir RN-06, el despliegue se cae aqui y la
+            credencial no llega nunca a produccion. USER_TAB_COLUMNS es la fuente de verdad del propio
+            motor sobre esa superficie, no una copia ni una documentacion que pueda haber envejecido.
+
+            Se consulta USER_TAB_COLUMNS y NO ALL_TAB_COLUMNS ni DBA_TAB_COLUMNS a proposito:
+            USER_TAB_COLUMNS solo ve las tablas del esquema CONECTADO, que es exactamente el esquema
+            en el que Liquibase acaba de crear aviso_correo_intento. Con ALL_ o DBA_ el oraculo podria
+            estar leyendo una tabla homonima de otro esquema y dar un verde que no significa nada.
+            Las columnas VIRTUALES dispatch_id y result aparecen en USER_TAB_COLUMNS igual que las
+            fisicas (con VIRTUAL_COLUMN = 'YES'), de modo que el inventario que se comprueba abajo es
+            el de las 15 columnas, no el de las 13 fisicas.
+
+            QUE DEMUESTRA, PUNTO POR PUNTO
+            ==============================
+            (1) NINGUNA COLUMNA DE CREDENCIAL. Se cuentan las columnas de AVISO_CORREO_INTENTO cuyo
+            nombre delate una credencial, con un predicado de familias de nombres amplio y explicito:
+            PASSWORD, PASSWD, PWD, SECRET, CREDENTIAL, TOKEN, APIKEY / API_KEY, AUTH, SMTP_USER,
+            SMTP_USERNAME, SMTP_PASSWORD, PRIVATE_KEY y PASSPHRASE. El recuento tiene que ser 0, y si
+            no lo es el mensaje de error nombra las columnas infractoras con LISTAGG para que quien
+            rompa el despliegue sepa de inmediato cual ha anadido. La comparacion va con LIKE '%...%'
+            en MAYUSCULAS porque el diccionario guarda asi los nombres de los objetos.
+
+            POR QUE EL PREDICADO BUSCA SMTP_USER / SMTP_PASSWORD Y NO UN SMTP% GENERICO: la tabla SI
+            declara, legitimamente, una columna SMTP_RESPONSE_CODE. Esa columna guarda el codigo
+            numerico de TRES DIGITOS con que respondio el servidor de correo (250 entrega aceptada,
+            421 servicio no disponible, 550 buzon inexistente...), que es justo el dato de diagnostico
+            que alimenta REQ-144; no es una credencial ni se le parece, pese a empezar por SMTP_. Un
+            predicado SMTP% generico marcaria esa columna como infractora y haria fallar el
+            despliegue por un dato perfectamente legitimo, de modo que el oraculo apunta a las dos
+            familias de nombres que SI serian credenciales del servidor: el usuario y la contrasenia.
+
+            (2) LA TABLA EXISTE DE VERDAD. Un recuento de columnas sospechosas igual a 0 sobre una
+            tabla que no existe tambien da 0: seria un falso verde, el peor resultado posible para un
+            oraculo de seguridad. Por eso se comprueba antes que el recuento TOTAL de columnas de
+            AVISO_CORREO_INTENTO en USER_TAB_COLUMNS es mayor que cero, con su propio codigo de error
+            distinguible. Sin esta comprobacion el changeset pasaria igual de verde con la tabla mal
+            nombrada o sencillamente ausente.
+
+            (3) EL INVENTARIO DE COLUMNAS ES EXACTAMENTE EL ESPERADO, ni una mas ni una menos. Se
+            cuentan las columnas que NO estan en la lista blanca de las 15 columnas de la tabla
+            (tiene que ser 0, y el error las nombra con LISTAGG) y se cuenta el total (tienen que ser
+            15). Esta es la red de seguridad de la comprobacion 1: una credencial anadida en el futuro
+            con un nombre creativo que escape a las familias conocidas (un MAIL_KEY, un CFG_BLOB, un
+            X1) no entrara por el predicado de nombres, pero cae aqui sin remedio, porque cualquier
+            columna que no estuviera prevista rompe el inventario. Comprobar las dos cosas (las
+            sobrantes y el total) y no solo el total hace ademas que el oraculo detecte el caso de una
+            columna anadida y otra eliminada a la vez.
+
+            (4) NINGUN DATO PERSONAL MAS ALLA DE NOMBRE Y CORREO CORPORATIVO. REQ-135 RN-06 tiene dos
+            mitades y la segunda es de proteccion de datos: la traza no puede acumular datos
+            personales. Se comprueba que la tabla no declara columnas de las familias DNI, NIF,
+            PHONE / TELEFONO, ADDRESS / DIRECCION, BIRTH / NACIMIENTO, IBAN y SALARY / SALARIO. Los
+            unicos datos personales admitidos viven DENTRO del CLOB RECIPIENTS_SNAPSHOT y se limitan
+            al identificador y al correo corporativo del destinatario (REQ-049, REQ-076).
+
+            Las credenciales del servidor de correo viven unicamente en
+            configuracion_smtp.smtp_password_encrypted, que es otra tabla y otra tarea, y jamas en la
+            traza de intentos.
+
+            El bloque entero es una UNICA sentencia JDBC (splitStatements="false") y no contiene ni
+            una sola sentencia DDL, que provocaria un commit implicito. Tampoco escribe nada: no hay
+            INSERT, de modo que no hace falta ROLLBACK de datos y el rollback del changeset esta
+            vacio. Aun asi cierra con EXCEPTION WHEN OTHERS THEN RAISE, para que cualquier fallo se
+            propague sin ambiguedad y tumbe el despliegue en lugar de quedar enterrado.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_total        NUMBER;
+    v_credenciales NUMBER;
+    v_personales   NUMBER;
+    v_sobrantes    NUMBER;
+    v_nombres      VARCHAR2(4000 CHAR);
+
+    c_tabla CONSTANT VARCHAR2(30 CHAR) := 'AVISO_CORREO_INTENTO';
+BEGIN
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 2 primero (anti falso verde): la tabla EXISTE en el esquema conectado y
+    -- declara columnas. Un recuento de columnas sospechosas igual a 0 sobre una tabla
+    -- inexistente tambien daria 0, de modo que sin esta comprobacion previa el oraculo entero
+    -- podria estar dando un verde vacio.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_total
+      FROM user_tab_columns
+     WHERE table_name = c_tabla;
+
+    IF v_total = 0 THEN
+        RAISE_APPLICATION_ERROR(-20841, 'ORACULO AC-SMTP-11: USER_TAB_COLUMNS no conoce ninguna columna de ' || c_tabla || ' en el esquema conectado; el oraculo estaria dando un falso verde sobre una tabla inexistente');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 1 (AC-SMTP-11 / REQ-135 RN-06): la tabla NO declara ninguna columna de
+    -- credencial SMTP. El predicado cubre las familias de nombres habituales en MAYUSCULAS,
+    -- que es como el diccionario guarda los nombres de los objetos. SMTP_RESPONSE_CODE queda
+    -- deliberadamente fuera: es el codigo de tres digitos que devuelve el servidor (250, 421,
+    -- 550...) y no una credencial, por eso se buscan SMTP_USER y SMTP_PASSWORD y no un SMTP%
+    -- generico que marcaria como infractora una columna legitima de diagnostico.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*),
+           LISTAGG(column_name, ', ') WITHIN GROUP (ORDER BY column_name)
+      INTO v_credenciales, v_nombres
+      FROM user_tab_columns
+     WHERE table_name = c_tabla
+       AND (column_name LIKE '%PASSWORD%'
+         OR column_name LIKE '%PASSWD%'
+         OR column_name LIKE '%PWD%'
+         OR column_name LIKE '%SECRET%'
+         OR column_name LIKE '%CREDENTIAL%'
+         OR column_name LIKE '%TOKEN%'
+         OR column_name LIKE '%APIKEY%'
+         OR column_name LIKE '%API_KEY%'
+         OR column_name LIKE '%AUTH%'
+         OR column_name LIKE '%SMTP_USER%'
+         OR column_name LIKE '%SMTP_USERNAME%'
+         OR column_name LIKE '%SMTP_PASSWORD%'
+         OR column_name LIKE '%PRIVATE_KEY%'
+         OR column_name LIKE '%PASSPHRASE%');
+
+    IF v_credenciales <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20842, 'ORACULO AC-SMTP-11: la tabla ' || c_tabla || ' declara ' || v_credenciales || ' columna(s) de credencial SMTP (' || v_nombres || '); la traza de intentos jamas persiste credenciales del servidor de correo, que viven solo en configuracion_smtp');
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 3 (red de seguridad de la anterior): el inventario de columnas es
+    -- EXACTAMENTE el esperado, ni una mas ni una menos, incluidas las dos VIRTUALES
+    -- (DISPATCH_ID y RESULT), que USER_TAB_COLUMNS lista igual que las fisicas. Primero se
+    -- cuentan las columnas que NO estan en la lista blanca: asi una credencial anadida en el
+    -- futuro con un nombre creativo que escape al predicado de la comprobacion 1 cae aqui
+    -- igualmente. Despues se exige el total de 15, para detectar tambien la columna eliminada.
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*),
+           LISTAGG(column_name, ', ') WITHIN GROUP (ORDER BY column_name)
+      INTO v_sobrantes, v_nombres
+      FROM user_tab_columns
+     WHERE table_name = c_tabla
+       AND column_name NOT IN ('ATTEMPT_ID', 'NOTIFICATION_ID', 'INCIDENT_ID', 'ATTEMPT_NUMBER',
+                               'ATTEMPTED_AT', 'RESULT_CODE', 'SMTP_RESPONSE_CODE', 'ERROR_CODE',
+                               'ERROR_MESSAGE', 'RECIPIENTS_SNAPSHOT', 'RECIPIENT_COUNT',
+                               'MESSAGE_ID', 'SUPPRESSION_REASON_CODE', 'DISPATCH_ID', 'RESULT');
+
+    IF v_sobrantes <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20843, 'ORACULO AC-SMTP-11: la tabla ' || c_tabla || ' declara ' || v_sobrantes || ' columna(s) fuera del inventario aprobado (' || v_nombres || '); cualquier columna no prevista en la traza de intentos tiene que justificarse frente a REQ-135 RN-06');
+    END IF;
+
+    IF v_total <> 15 THEN
+        RAISE_APPLICATION_ERROR(-20844, 'ORACULO AC-SMTP-11: la tabla ' || c_tabla || ' deberia declarar exactamente 15 columnas (13 fisicas mas las virtuales DISPATCH_ID y RESULT) y declara ' || v_total);
+    END IF;
+
+    -- -------------------------------------------------------------------------------------
+    -- Comprobacion 4 (REQ-135 RN-06, segunda mitad): ningun dato personal mas alla del nombre
+    -- y el correo corporativo. La tabla no declara columnas de las familias de datos
+    -- personales sensibles; los unicos datos de persona admitidos viven DENTRO del CLOB
+    -- RECIPIENTS_SNAPSHOT y se limitan a identificador y correo corporativo (REQ-049,
+    -- REQ-076).
+    -- -------------------------------------------------------------------------------------
+    SELECT COUNT(*),
+           LISTAGG(column_name, ', ') WITHIN GROUP (ORDER BY column_name)
+      INTO v_personales, v_nombres
+      FROM user_tab_columns
+     WHERE table_name = c_tabla
+       AND (column_name LIKE '%DNI%'
+         OR column_name LIKE '%NIF%'
+         OR column_name LIKE '%PHONE%'
+         OR column_name LIKE '%TELEFONO%'
+         OR column_name LIKE '%ADDRESS%'
+         OR column_name LIKE '%DIRECCION%'
+         OR column_name LIKE '%BIRTH%'
+         OR column_name LIKE '%NACIMIENTO%'
+         OR column_name LIKE '%IBAN%'
+         OR column_name LIKE '%SALARY%'
+         OR column_name LIKE '%SALARIO%');
+
+    IF v_personales <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20845, 'ORACULO AC-SMTP-11: la tabla ' || c_tabla || ' declara ' || v_personales || ' columna(s) de datos personales fuera de lo permitido (' || v_nombres || '); REQ-135 RN-06 limita los datos personales de la traza al nombre y al correo corporativo');
+    END IF;
+
+-- El oraculo es de SOLA LECTURA del diccionario: no inserta ni modifica nada, de modo que no
+-- hay ROLLBACK de datos que hacer. El manejador se mantiene para que cualquier fallo se
+-- propague sin ambiguedad y tumbe el despliegue.
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE;
+END;]]></sql>
+        <rollback>
+            <!-- Oraculo de solo verificacion sobre el diccionario de datos: no escribe nada, no hay cambio que revertir -->
+        </rollback>
+    </changeSet>
+
 </databaseChangeLog>
