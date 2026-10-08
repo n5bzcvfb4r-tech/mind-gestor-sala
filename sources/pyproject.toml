@@ -113,6 +113,11 @@ pytest = "^8.4.2"
 pytest-cov = "^6.0.0"
 pytest-django = "^4.11.1"
 pytest-mock = "^3.14.1"
+# Generador de casos de las pruebas basadas en propiedades (PBT-011, PBT-012): el catalogo
+# TEST_SUITES las exige "para todo padron generado" / "para toda resolucion generada", que es
+# cuantificacion universal sobre un espacio de entradas, no una lista de ejemplos escogidos a
+# mano. Solo se importa desde `apps/avisos/resolucion/tests/`, nunca desde codigo de producto.
+hypothesis = "^6.140.3"
 # `testcontainers` y `docker` van pineados en [project].dependencies (manifiesto del host).
 
 # --- Pytest - Unit Testing ------------------------------------------
