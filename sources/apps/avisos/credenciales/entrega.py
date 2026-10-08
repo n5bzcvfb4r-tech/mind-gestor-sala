@@ -63,10 +63,23 @@ import html
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from apps.avisos.alta.composicion import configuracion_composicion
+from apps.avisos.motor.configuracion import ConfiguracionMotorAvisos, configuracion_motor
 from apps.avisos.motor.errores import ErrorMotorAvisos
-from apps.avisos.motor.outbox import TIPO_CREDENCIAL_EMITIDA, TIPO_RESTABLECIMIENTO, TIPOS_CREDENCIAL
+from apps.avisos.motor.estados import EstadoAviso, validar_transicion
+from apps.avisos.motor.outbox import (
+    TIPO_CREDENCIAL_EMITIDA,
+    TIPO_RESTABLECIMIENTO,
+    TIPOS_CREDENCIAL,
+    ServicioOutboxAvisos,
+    outbox,
+)
+from apps.core.contexto import utc_now
+
+if TYPE_CHECKING:  # pragma: no cover - solo anotaciones: los modelos no se importan antes de django.setup()
+    from apps.core.models import AvisoCorreoEntity
 
 logger = logging.getLogger(__name__)
 
@@ -446,3 +459,216 @@ def asunto_persistible(datos: DatosCredencial) -> str:
     """
 
     return componer_asunto(datos)
+
+
+@dataclass(frozen=True, slots=True)
+class SolicitudCredencial:
+    """
+    Solicitud de aviso de credencial ya encolada, en viaje entre las dos fases de la entrega.
+
+    Es lo que el servicio de negocio recibe al ENCOLAR (fase 1, dentro de su `transaction.atomic()`) y
+    lo que despues le devuelve al servicio para ENTREGAR (fase 2, ya fuera de la transaccion). Existe
+    precisamente porque las dos fases NO pueden ocurrir en el mismo punto del codigo: entre una y otra
+    hay un commit, y algo tiene que cruzarlo llevando la fila que se acaba de encolar. Ese «algo» es
+    esta estructura, y por eso es inmutable (`frozen=True`) y cerrada (`slots=True`): no transporta
+    nada mas que la referencia a la solicitud, su clave de idempotencia y si la creo ESTA peticion.
+
+    `creada=False` significa que la solicitud ya estaba encolada con esa misma `notification_key`
+    (REQ-130, AC-AVI-01): la entrega no la ha generado esta peticion y, por tanto, esta peticion no la
+    ha tomado para si. No lleva la credencial: el secreto viaja aparte, en `DatosCredencial`, y nunca
+    se guarda en una estructura que pueda acabar en una traza de la fila.
+    """
+
+    aviso: "AvisoCorreoEntity"
+    notification_key: str
+    creada: bool
+
+    @property
+    def notification_id(self) -> str:
+        """Identificador de la solicitud para trazas y respuestas; es un UUID y viaja siempre como texto."""
+
+        return str(self.aviso.pk)
+
+
+# --- Textos de traza de la entrega en dos fases (identificadores, nunca secretos) ---------
+TRAZA_SOLICITUD_ENCOLADA = "Solicitud de aviso de credencial encolada en el outbox dentro de la transaccion de negocio"
+TRAZA_SOLICITUD_TOMADA = "Solicitud de aviso de credencial tomada para la entrega sincrona de esta peticion"
+TRAZA_SOLICITUD_PREEXISTENTE = "La solicitud de aviso de credencial ya estaba encolada: no se toma ni se reescribe su estado"
+
+
+class ServicioEntregaCredencial:
+    """
+    Entrega de los avisos de credencial en DOS FASES, que es la unica forma en que el DoD se sostiene.
+
+    FASE 1 - `encolar(datos)`, DENTRO del `transaction.atomic()` del alta de usuario o del
+    restablecimiento. Es el patron outbox (ADR-006, REQ-132): la solicitud se inserta en la misma
+    transaccion que crea el usuario o confirma el restablecimiento, de modo que si el SMTP esta caido
+    el usuario queda CREADO igualmente y el cambio queda CONFIRMADO (AC-AVI-05, REQ-038 regla 6). Un
+    fallo de correo no revierte jamas una operacion de negocio que ya es valida.
+
+    FASE 2 - `entregar(...)`, DESPUES del commit, NUNCA con la transaccion abierta. Abrir una conexion
+    SMTP dentro de la transaccion es el anti-patron que el handbook declara prohibido, y aqui tiene
+    ademas una consecuencia muy concreta: una conexion colgada (un servidor que acepta el TCP y no
+    responde) mantendria abierta la transaccion y con ella el bloqueo de la fila del usuario recien
+    creado durante todo el timeout, atascando cualquier otra operacion sobre ese usuario. Por eso no
+    puede ser una sola llamada: no es una comodidad de diseno, es que las dos mitades pertenecen a dos
+    contextos transaccionales distintos y solo el LLAMANTE conoce la frontera entre ambos.
+
+    El uso correcto, que es el que deben copiar el alta y el restablecimiento:
+
+    ```
+    servicio = ServicioEntregaCredencial()
+    with transaction.atomic():
+        usuario = repositorio.crear(...)  # alta o restablecimiento
+        solicitud = servicio.encolar(datos)  # outbox, misma transaccion
+    resultado = servicio.entregar(solicitud, datos)  # ya fuera: SMTP real
+    if not resultado.entregado:
+        raise AppError(502, resultado.mensaje_usuario)
+    ```
+
+    Los colaboradores se inyectan por constructor para poder verificar el comportamiento sin base de
+    datos y sin servidor de correo, pero la POLITICA no es sustituible: que el cuerpo no se persista,
+    que la solicitud se tome en la fase 1 y que un fallo de entrega no revierta nada se deciden aqui.
+    """
+
+    def __init__(self, *, outbox_servicio: ServicioOutboxAvisos | None = None, config: ConfiguracionMotorAvisos | None = None) -> None:
+        """
+        Construye el servicio guardando sus colaboradores SIN resolverlos.
+
+        La resolucion es PEREZOSA, igual que en `ServicioOutboxAvisos`: este modulo se importa al
+        cargar las URLs y los servicios de negocio, antes de que `django.setup()` haya terminado, y
+        tanto el outbox (que toca modelos del ORM) como `configuracion_motor()` (que lee `settings`)
+        reventarian si se construyeran a nivel de modulo o en el constructor.
+
+        Args:
+            outbox_servicio: servicio de encolado; por defecto, el real (`outbox()`).
+            config: configuracion del motor, de donde sale el identificador del trabajador; por
+                defecto, la vigente en `settings.AVISOS_MOTOR`.
+        """
+
+        self._outbox: ServicioOutboxAvisos | None = outbox_servicio
+        self._config: ConfiguracionMotorAvisos | None = config
+
+    # --- Resolucion perezosa de dependencias -------------------------------
+
+    def _resolver_outbox(self) -> ServicioOutboxAvisos:
+        """Devuelve el outbox inyectado o construye el real en el primer uso, nunca a nivel de modulo."""
+
+        if self._outbox is None:
+            self._outbox = outbox()
+        return self._outbox
+
+    def _resolver_config(self) -> ConfiguracionMotorAvisos:
+        """Devuelve la configuracion inyectada o la lee de `settings.AVISOS_MOTOR` en el primer uso."""
+
+        if self._config is None:
+            self._config = configuracion_motor()
+        return self._config
+
+    # --- Fase 1: encolado dentro de la transaccion de negocio ---------------
+
+    def encolar(self, datos: DatosCredencial) -> SolicitudCredencial:
+        """
+        Encola la solicitud del aviso de credencial y la TOMA para entregarla en esta misma peticion.
+
+        Se invoca DENTRO del `transaction.atomic()` del alta o del restablecimiento. No abre ni cierra
+        transaccion alguna: la frontera transaccional es del servicio de negocio que encola.
+
+        De la solicitud se persiste el `subject` y NADA del cuerpo. Los datos se validan antes de
+        tocar la base, porque un aviso de credencial incompleto es un defecto del llamante y debe
+        saltar en castellano y no como una restriccion de la base en mitad del alta.
+
+        Args:
+            datos: datos del aviso de credencial, con el secreto todavia en memoria.
+
+        Returns:
+            SolicitudCredencial: la solicitud encolada, lista para pasarsela a `entregar` tras el commit.
+
+        Raises:
+            ErrorEntregaCredencial: si los datos no bastan para redactar el aviso (ver `DatosCredencial.validar`).
+            ErrorMotorAvisos: si el tipo de aviso no pertenece al catalogo de avisos de credencial.
+            TransicionAvisoNoPermitidaError: si la solicitud recien creada no admite pasar a `ENVIANDO`.
+        """
+
+        datos.validar()
+
+        resultado = self._resolver_outbox().encolar_aviso_credencial(
+            notification_type=datos.notification_type,
+            recipient_user_id=datos.user_id,
+            discriminante=datos.discriminante,
+            recipient_email=datos.corporate_email.strip(),
+            subject=asunto_persistible(datos),
+            # DECISION CENTRAL DE ESTE METODO: `body_text` y `body_html` NO se pasan, de modo que las
+            # dos columnas quedan a NULO. El cuerpo lleva la credencial temporal EN CLARO y REQ-073
+            # (regla 4) y REQ-038 (regla 1) prohiben persistirla: congelarla en la fila seria escribir
+            # la contrasena en la base de datos. El cuerpo se compone en memoria al entregar.
+        )
+
+        aviso = resultado.aviso
+        if resultado.creado:
+            self._tomar_para_entrega(aviso)
+        else:
+            # Idempotencia (REQ-130, AC-AVI-01): la solicitud ya existia con esa misma clave, asi que
+            # NO se fuerza a `ENVIANDO`. Reescribir el estado de una solicitud ajena le robaria la fila
+            # a quien la tomo. Reemitir una credencial es encolar con un `discriminante` NUEVO -una
+            # solicitud distinta-, nunca reaprovechar la anterior.
+            logger.info(
+                TRAZA_SOLICITUD_PREEXISTENTE,
+                extra={"data": {"notification_id": str(aviso.pk), "notification_type": datos.notification_type}},
+            )
+
+        # Traza con identificadores y nada mas: ni la credencial ni la direccion del destinatario, que
+        # es dato personal y no viaja a los logs (REQ-076, REQ-079).
+        logger.info(
+            TRAZA_SOLICITUD_ENCOLADA,
+            extra={
+                "data": {
+                    "notification_id": str(aviso.pk),
+                    "notification_type": datos.notification_type,
+                    "recipient_user_id": datos.user_id,
+                    "creada": resultado.creado,
+                }
+            },
+        )
+        return SolicitudCredencial(aviso=aviso, notification_key=resultado.notification_key, creada=resultado.creado)
+
+    def _tomar_para_entrega(self, aviso: "AvisoCorreoEntity") -> None:
+        """
+        Marca la solicitud recien creada como `ENVIANDO` a nombre de este proceso, aqui y no despues.
+
+        POR QUE SE TOMA DENTRO DE LA TRANSACCION DE NEGOCIO: porque es lo que cierra la carrera con el
+        despachador de fondo. En cuanto el commit publica la fila, el barrido de fondo puede verla; y
+        el despachador, que solo sabe reenviar el contenido CONGELADO de la fila, encontraria un aviso
+        sin cuerpo y lo cerraria como `COMPOSICION_INCOMPLETA` mientras esta peticion todavia lo esta
+        entregando con la credencial viva en memoria. Dejandola en `ENVIANDO` ya desde la transaccion
+        eso no puede pasar: `tomar_pendientes` solo mira solicitudes en `PENDIENTE`, de modo que la
+        fila no es visible para el despachador y nadie puede robarla.
+
+        SI EL PROCESO MUERE ANTES DE ENTREGAR, la solicitud se queda tomada y la recuperacion de
+        atascados (`recuperar_atascados`) la devuelve a `PENDIENTE` pasada la ventana; el despachador
+        la encontrara entonces sin contenido y la cerrara como `COMPOSICION_INCOMPLETA`. Esa traza NO
+        es un defecto: es la traza VERDADERA. Ese correo nunca fue entregable, porque el secreto que
+        debia llevar ya no existe en ninguna parte, y la unica salida correcta es REEMITIR la
+        credencial, no reenviar la solicitud.
+
+        Args:
+            aviso: solicitud recien creada, en `PENDIENTE`.
+
+        Raises:
+            TransicionAvisoNoPermitidaError: si el estado de la solicitud no admite pasar a `ENVIANDO`.
+        """
+
+        notification_id = str(aviso.pk)
+        validar_transicion(aviso.status, EstadoAviso.ENVIANDO, notification_id=notification_id)
+
+        aviso.status = EstadoAviso.ENVIANDO.value
+        aviso.locked_by = self._resolver_config().identificador_worker
+        aviso.locked_at = utc_now()
+        # `update_fields` acota el UPDATE al testigo de trabajador: los CLOB `body_text` y `body_html`
+        # NO se reescriben, que es justo lo que mantiene el cuerpo a NULO (REQ-038, REQ-073).
+        aviso.save(update_fields=["status", "locked_by", "locked_at"])
+
+        logger.debug(
+            TRAZA_SOLICITUD_TOMADA,
+            extra={"data": {"notification_id": notification_id, "status": aviso.status, "locked_by": aviso.locked_by}},
+        )
