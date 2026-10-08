@@ -53,9 +53,7 @@ ROL_EMPLEADO = "EMPLEADO"
 ROL_TECNICO = "TECNICO_MANTENIMIENTO"
 
 #: Lo que la matriz ACORDADA concede al EMPLEADO: cuatro operaciones, todas de alcance OWN.
-OPERACIONES_DEL_EMPLEADO = frozenset(
-    {"INCIDENT_CREATE", "INCIDENT_LIST_OWN", "INCIDENT_VIEW", "INCIDENT_HISTORY_VIEW"}
-)
+OPERACIONES_DEL_EMPLEADO = frozenset({"INCIDENT_CREATE", "INCIDENT_LIST_OWN", "INCIDENT_VIEW", "INCIDENT_HISTORY_VIEW"})
 
 #: Acciones «Asignarme», «Cambiar estado» y «Cerrar» de la pantalla del TECNICO_MANTENIMIENTO.
 #: El renderizado es de la SPA y queda fuera de este backend; su equivalente verificable aqui
@@ -78,9 +76,7 @@ def cliente() -> Client:
 
 
 @SALTAR_SIN_DOCKER
-def test_AC_ROL_04_el_empleado_recibe_solo_sus_capacidades_y_nunca_la_matriz_completa(
-    db, cliente_api: APIClient
-) -> None:
+def test_AC_ROL_04_el_empleado_recibe_solo_sus_capacidades_y_nunca_la_matriz_completa(db, cliente_api: APIClient) -> None:
     """
     [AC-ROL-04] Un EMPLEADO autenticado carga su contexto de permisos y recibe `roleCode`,
     `allowedOperations` y `dataScope = OWN` del rol de SU sesion, sin permisos de terceros y sin
@@ -151,9 +147,7 @@ def test_AC_ROL_04_el_empleado_recibe_solo_sus_capacidades_y_nunca_la_matriz_com
 
 
 @SALTAR_SIN_DOCKER
-def test_REQ_020_el_identificador_de_usuario_recibido_se_ignora_y_solo_se_resuelve_la_sesion(
-    db, cliente_api: APIClient
-) -> None:
+def test_REQ_020_el_identificador_de_usuario_recibido_se_ignora_y_solo_se_resuelve_la_sesion(db, cliente_api: APIClient) -> None:
     """
     [REQ-020] El recurso de permisos efectivos no admite NINGUN parametro de usuario: cualquier
     identificador que llegue en la query string se descarta y solo se resuelve el usuario de la
