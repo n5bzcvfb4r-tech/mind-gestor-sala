@@ -23,10 +23,17 @@ alcance se concede construyendo un objeto NUEVO, nunca reescribiendo el recibido
 """
 
 import dataclasses
+import logging
 
 from apps.core.contexto import AlcanceDatos, ContextoSesion
 from apps.core.models.catalogos import PermisoRolOperacionEntity
 from apps.core_security.errores import PermisoDenegadoError
+
+
+# Las decisiones de autorizacion no se registran aqui (las traza el manejador junto al
+# `traceId`); el logger existe para avisar de INCOHERENCIAS DE LA MATRIZ, que son defecto de
+# datos y no de peticion, y que de otro modo pasarian inadvertidas.
+logger = logging.getLogger(__name__)
 
 
 # Valores admitidos de `data_scope`, tomados del enumerado del dominio (`AlcanceDatos`), que es
@@ -52,13 +59,34 @@ class PermisoResuelto:
     data_scope: str
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PermisosEfectivos:
+    """
+    Proyeccion de solo lectura de lo que la matriz autoriza HOY al rol de la sesion en curso.
+
+    No es una decision de autorizacion y no sustituye a `PermisoResuelto`: aquel acredita que
+    una operacion CONCRETA fue autorizada por una fila concreta, mientras que este solo resume
+    capacidades para que la interfaz sepa que ensenar. Se separan los dos tipos justamente para
+    que ningun camino de decision pueda alimentarse por error de una lista de capacidades.
+
+    Es inmutable porque es una FOTO del momento en que se leyo la matriz: si la matriz cambia,
+    se vuelve a proyectar, nunca se parchea la foto anterior.
+    """
+
+    role_code: str
+    allowed_operations: tuple[str, ...]
+    data_scope: str
+
+
 class ServicioPermisos:
     """
     Evaluador de la matriz rol x operacion contra Oracle.
 
-    Tres operaciones y ninguna mas: `resolver` (decision autorizada o denegada), `alcance_de`
-    (contexto de sesion enriquecido con el alcance de ESA operacion) y `tiene_permiso`
-    (consulta booleana para componer capacidades, nunca para decidir).
+    Dos familias de operaciones que NO se mezclan. Las VINCULANTES, unicas que deciden una
+    peticion: `resolver` (decision autorizada o denegada) y `alcance_de` (contexto de sesion
+    enriquecido con el alcance de ESA operacion). Las INFORMATIVAS, para componer interfaz y
+    jamas para decidir: `tiene_permiso` (consulta booleana) y `efectivos` (proyeccion de las
+    capacidades del rol). Ninguna informativa lanza, y ninguna autoriza nada por si misma.
     """
 
     def resolver(self, role_code: str, operation_code: str) -> PermisoResuelto:
@@ -124,6 +152,54 @@ class ServicioPermisos:
         except PermisoDenegadoError:
             return False
         return True
+
+    def efectivos(self, role_code: str) -> PermisosEfectivos:
+        """
+        Proyecta las capacidades que la matriz concede al rol indicado, sin decidir nada.
+
+        PARA QUE SIRVE Y PARA QUE NO. Alimenta el recurso de solo lectura de permisos efectivos
+        (EP-004, REQ-020) para que la SPA oculte o deshabilite los controles que el backend va a
+        denegar. Es USABILIDAD, no seguridad: NO sustituye a `resolver`/`alcance_de`, que siguen
+        siendo la UNICA decision vinculante de cada peticion. Que el cliente reciba una
+        operacion en `allowed_operations` no la autoriza, y que no la reciba no es lo que la
+        deniega; si la matriz cambia entre esta lectura y la peticion siguiente, manda la matriz.
+
+        SOLO EL ROL QUE SE PIDE (AC-ROL-04). Se proyecta el rol de la sesion en curso y ninguno
+        mas: este servicio no tiene ninguna forma de devolver los permisos de otros usuarios ni
+        la matriz completa del sistema, porque la propia matriz es informacion sensible -revela
+        que operaciones existen y quien las puede ejecutar- y publicarla entera daria al cliente
+        un mapa del sistema que no necesita para pintar su interfaz.
+
+        SESGO A LA DENEGACION (fail-closed). El `data_scope` del rol es el MENOR privilegio
+        compatible con lo leido: sin entradas en la matriz, `OWN`; con entradas heterogeneas
+        (unas `OWN` y otras `ALL`), tambien `OWN`. Publicar `ALL` "por si acaso" haria que la
+        interfaz ofreciera acciones y volumenes de datos que el backend va a denegar despues, que
+        es peor experiencia que no ofrecerlos y, sobre todo, filtra expectativas de privilegio.
+        El caso heterogeneo se registra como `warning` porque es un sintoma de matriz mal
+        sembrada: el alcance por rol deja de ser representable en un unico valor.
+
+        NO LANZA NUNCA: es una LECTURA de capacidades, no una decision de autorizacion. Un rol
+        sin ningun permiso devuelve la proyeccion vacia, no un 403.
+        """
+
+        matriz = operaciones_permitidas(role_code)
+        alcances = set(matriz.values())
+
+        if len(alcances) == 1:
+            # Se normaliza por el enumerado, nunca por la cadena cruda de la fila: el valor
+            # publicado procede siempre de `AlcanceDatos` (`OWN`/`ALL`).
+            data_scope = AlcanceDatos(alcances.pop()).value
+        else:
+            data_scope = AlcanceDatos.OWN.value
+            if alcances:
+                logger.warning(
+                    "Matriz de permisos heterogenea para el rol %s: alcances %s; se proyecta el mas restrictivo (%s)",
+                    role_code,
+                    sorted(alcances),
+                    data_scope,
+                )
+
+        return PermisosEfectivos(role_code=role_code, allowed_operations=tuple(sorted(matriz)), data_scope=data_scope)
 
 
 def operaciones_permitidas(role_code: str) -> dict[str, str]:
