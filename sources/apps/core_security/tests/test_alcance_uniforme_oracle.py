@@ -39,7 +39,9 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
+from django.db import connections
 from django.db.models import Max
+from django.test.utils import CaptureQueriesContext
 from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory
 from rest_framework.views import APIView
@@ -59,27 +61,6 @@ from apps.core_security.tests.conftest import MOTIVO_SIN_DOCKER, SALTAR_SIN_DOCK
 from apps.core_security.tests.test_contexto_autorizacion_oracle import ROL_EMPLEADO, sembrar_usuario
 
 pytestmark = [pytest.mark.integration]
-
-
-def test_PBT_006_el_identificador_mal_formado_no_normaliza_a_ninguna_clave() -> None:
-    """[PBT-006] Un identificador que no es un entero positivo no produce clave de consulta.
-
-    Es el PRIMER ESLABON de la propiedad de no revelacion. Un identificador invalido no puede
-    convertirse en una clave que case con ninguna fila: `identificador_normalizado` devuelve
-    `None` y no lanza. Gracias a eso la capa de alcance consulta con su centinela (`PK_CENTINELA`)
-    y responde EXACTAMENTE lo mismo que ante una incidencia inexistente, con el mismo viaje a la
-    base. Si esta funcion lanzara, o si "normalizara" un texto a algun entero, el caso mal formado
-    tendria un camino -y un coste- propio, y seria distinguible desde fuera.
-
-    No necesita base de datos: es pura validacion de formato previa a cualquier consulta.
-    """
-
-    assert identificador_normalizado("") is None
-    assert identificador_normalizado("no-es-un-numero") is None
-    assert identificador_normalizado("x" * 5000) is None
-    assert identificador_normalizado(-1) is None
-    assert identificador_normalizado(0) is None
-    assert identificador_normalizado(42) == 42
 
 
 # ---------------------------------------------------------------------------------------------
@@ -507,3 +488,191 @@ def identificadores_inexistentes(db, incidencias_ajenas: tuple[int, ...]) -> tup
         "los identificadores 'inexistentes' casan con filas reales: el calculo sobre MAX(incident_id) no se sostiene"
     )
     return identificadores
+
+
+# ---------------------------------------------------------------------------------------------
+# LA PROPIEDAD
+# ---------------------------------------------------------------------------------------------
+
+#: Los TRES RECURSOS EQUIVALENTES sobre los que se enuncia la propiedad. El historial y el adjunto
+#: no tienen alcance propio: heredan el de su incidencia (REQ-023 regla 3, REQ-027 regla 3), de
+#: modo que los tres deben denegar exactamente igual. Se recorren como una sola tabla para que
+#: nadie pueda cubrir el detalle y olvidarse de los otros dos.
+RECURSOS_EQUIVALENTES: tuple[tuple[str, type[APIView]], ...] = (
+    ("detalle", _DetalleDePrueba),
+    ("historial", _HistorialDePrueba),
+    ("adjunto", _AdjuntoDePrueba),
+)
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+def test_PBT_006_toda_incidencia_fuera_de_alcance_responde_igual_que_una_inexistente(
+    contexto_empleado: ContextoSesion,
+    otro_reportante: UsuarioEntity,
+    incidencias_ajenas: tuple[int, ...],
+    incidencia_propia: int,
+    identificadores_inexistentes: tuple[int, ...],
+) -> None:
+    """
+    [PBT-006] Una incidencia ajena responde siempre igual que una inexistente.
+
+    Given un empleado autenticado cuyo alcance son sus propias incidencias
+    And cualquier identificador generado: de incidencia ajena, de incidencia inexistente o con
+        formato invalido
+    When solicita el detalle, el historial y el adjunto de ese identificador
+    Then las tres respuestas tienen el mismo codigo, el mismo cuerpo y las mismas cabeceras que
+        para un identificador inexistente
+    And ninguna respuesta contiene campos de la incidencia ni datos personales de terceros
+
+    ORDEN DE LAS FIXTURES. `incidencia_propia` se pide ANTES que `identificadores_inexistentes` a
+    proposito: los inexistentes se calculan sobre `MAX(incident_id)`, asi que si la incidencia del
+    control positivo se sembrara despues ocuparia el primer hueco y convertiria el patron de
+    referencia en una incidencia viva. La fixture lo detectaria igualmente -comprueba que ninguno
+    casa con una fila real-, pero el orden evita el falso rojo de raiz.
+    """
+
+    # --- Arrange: el corpus de identificadores generados -------------------------------------
+    # Primer eslabon de la propiedad: ningun identificador mal formado normaliza a una clave, y
+    # `identificador_normalizado` no lanza ante ninguno. Gracias a eso la capa de alcance puede
+    # consultar con `PK_CENTINELA` y hacer el MISMO viaje a Oracle que ante una incidencia ajena,
+    # en vez de atajar en memoria y delatarse por el coste de respuesta.
+    for mal_formado in IDENTIFICADORES_MAL_FORMADOS:
+        assert identificador_normalizado(mal_formado) is None, (
+            "un identificador que no es un entero positivo no puede producir clave de consulta: si normalizara, "
+            "designaria una fila y el caso mal formado dejaria de recorrer el mismo camino que el ajeno"
+        )
+    for valido in (*incidencias_ajenas, *identificadores_inexistentes):
+        assert identificador_normalizado(valido) == valido, (
+            "un identificador con formato valido debe normalizar a su propia clave; si no, el caso 'existente pero ajeno' "
+            "no llegaria siquiera a consultarse y la propiedad se verificaria sobre un camino que no es el real"
+        )
+
+    # Las tres clases de equivalencia del escenario en una sola secuencia: ajenos (existen en el
+    # Oracle real, el primero CON adjunto), inexistentes (formato valido, ninguna fila) y mal
+    # formados (ni siquiera son identificadores).
+    corpus: tuple[object, ...] = (*incidencias_ajenas, *identificadores_inexistentes, *IDENTIFICADORES_MAL_FORMADOS)
+
+    # --- Referencia: la respuesta ante un identificador INEXISTENTE --------------------------
+    # Es el patron con el que el escenario compara todo lo demas ("...que para un identificador
+    # inexistente"). Se calcula una sola vez, recurso a recurso.
+    patron_inexistente = identificadores_inexistentes[0]
+    referencia: dict[str, dict[str, Any]] = {
+        nombre: huella(invocar(vista, patron_inexistente, contexto_empleado)) for nombre, vista in RECURSOS_EQUIVALENTES
+    }
+
+    # Los tres recursos son indistinguibles tambien ENTRE SI. La cabecera `Allow` NO se silencia:
+    # las tres vistas exponen el mismo juego de metodos (`GET`, `HEAD`, `OPTIONS`), de modo que
+    # entra en la comparacion y coincide sin excepciones. Si algun dia dejara de coincidir seria
+    # una diferencia real entre recursos y esta prueba debe ponerse en rojo, no taparla.
+    huella_patron = referencia["detalle"]
+    for nombre, firma in referencia.items():
+        assert firma == huella_patron, (
+            f"el recurso {nombre} deniega de forma distinta a los demas: el detalle, el historial y el adjunto deben "
+            "responder lo mismo, o el cliente sabra por cual de ellos preguntar para distinguir"
+        )
+
+    # --- Act + Assert: la propiedad sobre TODO el corpus -------------------------------------
+    consultas_por_recurso: dict[str, set[int]] = {nombre: set() for nombre, _ in RECURSOS_EQUIVALENTES}
+    correladores: list[str] = []
+    cuerpos_denegados: list[str] = []
+
+    for identificador in corpus:
+        huellas_del_identificador: list[dict[str, Any]] = []
+        for nombre, vista in RECURSOS_EQUIVALENTES:
+            # COSTE DE RESPUESTA MEDIDO EN CONSULTAS, NO CON RELOJ DE PARED. Un cronometro en CI
+            # es inestable -contencion de la maquina, arranque en frio del contenedor, GC- y
+            # produciria rojos que no son fugas. La variable que de verdad hace OBSERVABLE la
+            # existencia del recurso es el numero de viajes a Oracle: si el identificador mal
+            # formado se atajase en memoria haria cero consultas y el ajeno una, y ESA diferencia
+            # si es medible desde fuera. Es justo lo que la capa cierra con `PK_CENTINELA`.
+            with CaptureQueriesContext(connections["default"]) as consultas:
+                respuesta = invocar(vista, identificador, contexto_empleado)
+            consultas_por_recurso[nombre].add(len(consultas.captured_queries))
+
+            assert respuesta.status_code == 404, (
+                f"el recurso {nombre} fuera de alcance debe responder el mismo 404 que uno inexistente; cualquier otro "
+                "codigo (403, 400) confirmaria que el identificador significa algo para el servidor"
+            )
+            firma = huella(respuesta)
+            assert firma == referencia[nombre], (
+                f"el recurso {nombre} responde distinto segun el identificador: codigo, cuerpo o cabeceras difieren "
+                "respecto de la denegacion por identificador inexistente, y esa diferencia es un oraculo de enumeracion"
+            )
+            huellas_del_identificador.append(firma)
+
+            correlador = trace_id_de(respuesta)
+            assert correlador, (
+                f"toda denegacion del recurso {nombre} debe traer su traceId: ausente en unos casos y presente en otros "
+                "volveria a distinguirlos, y ademas dejaria sin correlador una denegacion real en produccion"
+            )
+            correladores.append(correlador)
+
+            cuerpo_sin_correlador = cuerpo_de(respuesta)
+            cuerpo_sin_correlador.pop(CLAVE_TRACE_ID, None)
+            cuerpos_denegados.append(json.dumps(cuerpo_sin_correlador, ensure_ascii=False, sort_keys=True))
+
+        assert all(firma == huellas_del_identificador[0] for firma in huellas_del_identificador), (
+            "para un mismo identificador, el detalle, el historial y el adjunto deben responder lo mismo: si uno de los "
+            "tres se desvia, basta preguntar por ese para saber si el recurso existe"
+        )
+
+    assert len(set(correladores)) == len(correladores), (
+        "el traceId es un correlador NUEVO por peticion: dos respuestas no pueden compartirlo. Por ser aleatorio y no "
+        "depender del caso es lo unico que queda legitimamente fuera de la huella comparada"
+    )
+
+    # --- Assert de no filtracion: ni campos de la incidencia ni datos de terceros -------------
+    # Los valores prohibidos se toman de las FILAS REALES sembradas en el Oracle, nunca de
+    # literales: un literal escrito a mano podria no coincidir con lo que de verdad hay en base y
+    # dejar la comprobacion vacia. El `traceId` ya se ha retirado de los cuerpos: es hexadecimal
+    # aleatorio y contendria por azar cualquier digito suelto, lo que daria rojos que no son fugas.
+    filas_ajenas = list(IncidenciaEntity.objects.filter(pk__in=incidencias_ajenas))
+    assert len(filas_ajenas) == len(incidencias_ajenas), (
+        "las incidencias ajenas deben seguir existiendo en el Oracle real: si no existieran, el caso 'ajeno' no se "
+        "estaria probando y toda la propiedad se reduciria al caso 'inexistente'"
+    )
+
+    datos_prohibidos: list[str] = [otro_reportante.full_name, otro_reportante.corporate_email, str(otro_reportante.user_id)]
+    for fila in filas_ajenas:
+        datos_prohibidos.extend(
+            [
+                fila.reference_code,
+                fila.description,
+                fila.room_name_snapshot,
+                fila.office_name_snapshot,
+                fila.category_name_snapshot,
+                str(fila.incident_id),
+            ]
+        )
+
+    for cuerpo_serializado in cuerpos_denegados:
+        for dato in datos_prohibidos:
+            assert dato not in cuerpo_serializado, (
+                "el cuerpo de una denegacion no puede transportar ningun campo de la incidencia ajena ni ningun dato "
+                "personal de su reportante, ni siquiera como eco del identificador solicitado"
+            )
+
+    # --- Coste de respuesta: las mismas consultas para los tres casos -------------------------
+    for nombre, recuentos in consultas_por_recurso.items():
+        assert len(recuentos) == 1, (
+            f"el recurso {nombre} ejecuta distinto numero de consultas segun el identificador sea ajeno, inexistente o "
+            "mal formado: esa diferencia de coste es medible por tiempo desde fuera y revela si el recurso existe"
+        )
+        assert next(iter(recuentos)) >= 1, (
+            f"la denegacion del recurso {nombre} debe viajar a la base tambien con el identificador mal formado "
+            "(consulta con PK_CENTINELA); un atajo en memoria responderia antes y se delataria por el tiempo"
+        )
+
+    # --- Control positivo: la capa SI sirve lo que esta en alcance ---------------------------
+    # No puede faltar. Sin el, una capa que denegase absolutamente todo pasaria la propiedad de
+    # indistinguibilidad con nota -tres denegaciones iguales- y esta prueba no valdria nada.
+    respuesta_propia = invocar(_DetalleDePrueba, incidencia_propia, contexto_empleado)
+    assert respuesta_propia.status_code == 200, (
+        "la incidencia reportada por el propio solicitante SI esta en su alcance: si tambien se denegara, la uniformidad "
+        "verificada arriba seria la de una capa que no sirve nada"
+    )
+    assert cuerpo_de(respuesta_propia) == {"incidentId": incidencia_propia}, (
+        "el camino de exito debe devolver la incidencia pedida y no otra: es lo que acredita que el predicado de alcance "
+        "recorta sin romper la lectura legitima"
+    )
