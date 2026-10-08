@@ -31,6 +31,9 @@ dependencies = [
     # Argon2id: hasher de la credencial de usuario (PASSWORD_HASHERS). Lo importa Django
     # a traves de `django.contrib.auth.hashers.Argon2PasswordHasher`.
     "argon2-cffi==23.1.0",
+    # Planificador en proceso del despachador de avisos (ARC-014): el motor arranca sus
+    # tareas periodicas desde AppConfig.ready() con APScheduler, sin broker externo.
+    "APScheduler==3.11.0",  # import: apscheduler
     # Solo se importan desde las pruebas de integracion (apps/core/tests): levantan el
     # contenedor Oracle 23ai real (gvenzl/oracle-free:23-slim). Se declaran aqui, en el
     # manifiesto del host, para que ningun import de terceros quede sin pin explicito.
@@ -59,6 +62,7 @@ dependencies = [
 rest_framework = "djangorestframework==3.16.1"
 drf_spectacular = "drf-spectacular==0.28.0"
 pythonjsonlogger = "python-json-logger==4.0.0"
+apscheduler = "APScheduler==3.11.0"
 
 # --- Mismo mapa, en la clave ESTANDAR de deptry (el analizador de dependencias de uso
 # comun en Python). Clave: distribucion; valor: modulos de importacion que publica.
@@ -69,6 +73,7 @@ pythonjsonlogger = "python-json-logger==4.0.0"
 djangorestframework = ["rest_framework"]
 drf-spectacular = ["drf_spectacular"]
 python-json-logger = ["pythonjsonlogger"]
+APScheduler = ["apscheduler"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

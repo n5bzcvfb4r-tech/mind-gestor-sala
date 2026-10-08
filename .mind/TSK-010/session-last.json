@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-010",
+  "attempt": 2,
+  "at": "2026-10-08T13:39:02.592174+00:00",
+  "construction_id": "952fd5c8-e55f-46a7-afa4-5d74b4c2f724",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "REWORK atendido: el único punto del revisor era el conflicto de merge con `main` (`mergeable_state=dirty`). Resuelto e integrado; el motor de avisos de TSK-010 queda intacto y verificado sobre el árbol mergeado.\n\n## Causa del conflicto\nMientras este PR estaba abierto se mergearon en paralelo TSK-009 (resolución de destinatarios, que vive en la MISMA app `apps.avisos`) y TSK-001 (sesión opaca + nueva app `apps.core_security`). Solapaban 4 ficheros: `apps/avisos/__init__.py`, `apps/avisos/apps.py`",
+  "model": "claude-opus-5",
+  "input_tokens": 5860902,
+  "output_tokens": 23877,
+  "llm_calls": 114,
+  "cost_usd": 4.8096404999999995,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "7f8de76",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
