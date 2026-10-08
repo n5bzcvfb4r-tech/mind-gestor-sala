@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-010",
+  "attempt": 1,
+  "at": "2026-10-08T13:30:55.122394+00:00",
+  "construction_id": "952fd5c8-e55f-46a7-afa4-5d74b4c2f724",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "Motor de cola de avisos (ARC-014) implementado como app Django `apps.avisos` sobre el esquema T.5 ya aplicado por ARC-016, respetando el arquetipo `container-python` (Django + python-oracledb, NO el FastAPI/SQLAlchemy del handbook).\n\nQUÉ SE HA CONSTRUIDO (`sources/apps/avisos/motor/`, 11 módulos)\n- `estados.py`: catálogo CERRADO PENDIENTE→ENVIANDO→ENVIADO|FALLIDO|DESCARTADO|SUPRIMIDO y grafo de transiciones como fuente única de verdad. ENVIADO y SUPRIMIDO terminales; ENVIADO no reactivable ni si",
+  "model": "claude-opus-5",
+  "input_tokens": 13774925,
+  "output_tokens": 107520,
+  "llm_calls": 598,
+  "cost_usd": 28.338122499999997,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "0a371df0823f2a938b4ad3a64c251938895f3b2e",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
