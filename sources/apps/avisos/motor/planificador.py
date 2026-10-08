@@ -97,10 +97,20 @@ class PlanificadorMotorAvisos:
 
     @property
     def motor(self) -> MotorAvisos:
-        """Motor de avisos; se construye en el primer uso (sus puertos exigen `django.setup()` hecho)."""
+        """
+        Motor de avisos; se construye en el primer uso (sus puertos exigen `django.setup()` hecho).
+
+        AQUI se inyecta el compositor del aviso de alta (AVI-02), porque este es el UNICO sitio del
+        producto donde se construye el motor real: sin el, el despachador encontraria la solicitud
+        sin asunto ni cuerpo, supondria el contenido incompleto y la suprimiria con
+        `COMPOSICION_INCOMPLETA`. El import es PEREZOSO, dentro de la propiedad, igual que el resto
+        del arranque, para no arrastrar los modelos antes de que el registro de apps este listo.
+        """
 
         if self._motor is None:
-            self._motor = MotorAvisos(config=self._config)
+            from apps.avisos.alta.composicion import compositor_por_defecto
+
+            self._motor = MotorAvisos(config=self._config, compositor=compositor_por_defecto())
         return self._motor
 
     @property
