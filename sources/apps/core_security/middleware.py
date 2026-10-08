@@ -12,7 +12,7 @@ from collections.abc import Callable
 from django.http import HttpRequest, HttpResponse
 
 from apps.core_security import mensajes
-from apps.core_security.errores import SesionInvalidaError
+from apps.core_security.errores import RolNoResolubleError, SesionInvalidaError
 from apps.core_security.respuestas import nuevo_trace_id, respuesta_error_json
 from apps.core_security.rutas_publicas import es_ruta_exenta
 from apps.core_security.servicios.sesiones import ServicioSesiones
@@ -82,6 +82,14 @@ class SesionRequeridaMiddleware:
     consulta se deniega igual, sin usarla: en la URL quedaria registrada en logs de
     servidores intermedios, en el historial del navegador y en la cabecera `Referer`.
 
+    ROL VIGENTE Y FAIL-CLOSED (REQ-018, AC-ROL-02). Ademas del 401 de sesion, el guardia
+    resuelve el ROL EFECTIVO de la peticion releyendolo de la base de datos a partir del
+    usuario de la sesion, nunca del `role_code` congelado al emitirla ni de nada que venga del
+    cliente. Si ese rol no se puede resolver (usuario inactivo, sin rol o rol fuera de
+    `cat_rol`) se deniega con 403 FAIL-CLOSED, sin degradar jamas a un permiso mas amplio. El
+    403 se compone aqui porque el middleware va POR DELANTE de DRF y su manejador global de
+    excepciones no veria esta denegacion.
+
     SECRETOS (REQ-063, REQ-076). No se registra jamas la credencial, la cabecera
     `Authorization`, el `session_id` ni ninguna contrasenia.
     """
@@ -98,9 +106,12 @@ class SesionRequeridaMiddleware:
 
         credencial = credencial_de_la_peticion(request)
         try:
-            contexto = ServicioSesiones().validar(credencial)
+            # La peticion se pasa SOLO para dejar traza de lo que se ignora; el rol y la identidad NUNCA salen de ella (REQ-018).
+            contexto = ServicioSesiones().validar(credencial, request=request)
         except SesionInvalidaError as exc:
             return self._denegar(request, exc)
+        except RolNoResolubleError as exc:
+            return self._denegar_rol(request, exc)
 
         # `ContextoSesionMiddleware` (apps.core.middleware), que va DESPUES en la cadena, es
         # quien publica este contexto en el `ContextVar` del nucleo.
@@ -110,16 +121,55 @@ class SesionRequeridaMiddleware:
     def _denegar(self, request: HttpRequest, exc: SesionInvalidaError) -> HttpResponse:
         """Compone la respuesta 401 uniforme y deja UNA linea de traza con el motivo interno."""
 
+        # AC-SES-04: el texto del 401 es SIEMPRE el mismo, sea cual sea el motivo real.
+        return self._componer_denegacion(
+            request,
+            resumen="Peticion denegada por sesion invalida.",
+            motivo=exc.motivo,
+            codigo=exc.codigo,
+            mensaje=mensajes.SESION_REQUERIDA,
+            http_status=exc.http_status,
+        )
+
+    def _denegar_rol(self, request: HttpRequest, exc: RolNoResolubleError) -> HttpResponse:
+        """Compone el 403 FAIL-CLOSED de rol no resoluble (REQ-018, AC-ROL-02)."""
+
+        return self._componer_denegacion(
+            request,
+            resumen="Peticion denegada: el rol del usuario de la sesion no se puede resolver.",
+            motivo=exc.motivo,
+            codigo=exc.codigo,
+            mensaje=exc.mensaje,
+            http_status=exc.http_status,
+        )
+
+    def _componer_denegacion(
+        self,
+        request: HttpRequest,
+        *,
+        resumen: str,
+        motivo: str,
+        codigo: str,
+        mensaje: str,
+        http_status: int,
+    ) -> HttpResponse:
+        """
+        Compone el cuerpo canonico de error y deja UNA linea de traza con el motivo interno.
+
+        El motivo real viaja SOLO al log, nunca a la respuesta. Ni la credencial ni el
+        `session_id` se registran jamas (REQ-063, REQ-076).
+        """
+
         trace_id = nuevo_trace_id()
         logger.warning(
-            "Peticion denegada por sesion invalida.",
+            resumen,
             extra={
                 "data": {
                     "trace_id": trace_id,
-                    "motivo": exc.motivo,
+                    "motivo": motivo,
                     "path": request.path,
                     "method": request.method,
                 }
             },
         )
-        return respuesta_error_json(exc.codigo, mensajes.SESION_REQUERIDA, exc.http_status, trace_id)
+        return respuesta_error_json(codigo, mensaje, http_status, trace_id)
