@@ -14,6 +14,9 @@ dependencies = [
     "drf-spectacular-sidecar==2025.9.1",
     "oracledb==3.4.1",
     "python-json-logger==4.0.0",
+    # Argon2id: hasher de la credencial de usuario (PASSWORD_HASHERS). Lo importa Django
+    # a traves de `django.contrib.auth.hashers.Argon2PasswordHasher`.
+    "argon2-cffi==23.1.0",
     # Solo se importan desde las pruebas de integracion (apps/core/tests): levantan el
     # contenedor Oracle 23ai real (gvenzl/oracle-free:23-slim). Se declaran aqui, en el
     # manifiesto del host, para que ningun import de terceros quede sin pin explicito.

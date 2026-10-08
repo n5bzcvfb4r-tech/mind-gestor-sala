@@ -7,6 +7,8 @@ from drf_spectacular.views import (
 )
 
 urlpatterns = [
+    # Seguridad de sesion (ARC-012): aporta EP-001, la UNICA ruta publica del backend.
+    path("api/", include("apps.core_security.urls")),
     path("api/", include("apps.identidad.urls")),
     path("api/", include("apps.usuarios.urls")),
     path("api/", include("apps.catalogos.urls")),
