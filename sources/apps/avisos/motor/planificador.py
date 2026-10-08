@@ -105,12 +105,23 @@ class PlanificadorMotorAvisos:
         sin asunto ni cuerpo, supondria el contenido incompleto y la suprimiria con
         `COMPOSICION_INCOMPLETA`. El import es PEREZOSO, dentro de la propiedad, igual que el resto
         del arranque, para no arrastrar los modelos antes de que el registro de apps este listo.
+
+        Y AQUI se inyecta tambien la ENTREGA COLECTIVA del aviso de alta (REQ-133), por la misma
+        razon y en el mismo sitio: el aviso de alta se encola con `recipient_email` a NULO porque su
+        colectivo se resuelve en el instante del envio, de modo que sin esta inyeccion el despachador
+        no encontraria destinatario alguno y suprimiria el aviso con `NO_RECIPIENTS`, es decir, el
+        equipo de mantenimiento no recibiria nunca el correo del alta.
         """
 
         if self._motor is None:
             from apps.avisos.alta.composicion import compositor_por_defecto
+            from apps.avisos.alta.entrega import entrega_alta_por_defecto
 
-            self._motor = MotorAvisos(config=self._config, compositor=compositor_por_defecto())
+            self._motor = MotorAvisos(
+                config=self._config,
+                compositor=compositor_por_defecto(),
+                entrega_colectiva=entrega_alta_por_defecto(),
+            )
         return self._motor
 
     @property

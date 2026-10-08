@@ -63,12 +63,16 @@ from apps.avisos.motor.calendario import procesamiento_permitido, proxima_reanud
 from apps.avisos.motor.configuracion import ConfiguracionMotorAvisos, configuracion_motor
 from apps.avisos.motor.errores import ErrorMotorAvisos
 from apps.avisos.motor.estados import MOTIVOS_SUPRESION, RESULTADOS_INTENTO, EstadoAviso, validar_transicion
+from apps.avisos.motor.outbox import TIPO_ALTA
 from apps.avisos.motor.reintentos import decidir
 from apps.avisos.motor.repositorio import LONGITUD_MAXIMA_MENSAJE_ERROR, RepositorioAvisoCorreo
 from apps.avisos.motor.transporte import MensajeCorreo, ResultadoEntrega, TransporteCorreo, transporte_por_defecto
 from apps.core.contexto import utc_now
 
 if TYPE_CHECKING:  # pragma: no cover - solo anotaciones: los modelos no se importan antes de django.setup()
+    # `apps.avisos.alta.entrega` importa de `motor/`, asi que importarlo aqui en tiempo de
+    # ejecucion cerraria un ciclo de imports: la anotacion basta para el contrato del puerto.
+    from apps.avisos.alta.entrega import EntregaColectiva
     from apps.core.models import AvisoCorreoEntity
 
 logger = logging.getLogger(__name__)
@@ -173,6 +177,16 @@ class CompositorAviso(Protocol):
         ...
 
 
+@runtime_checkable
+class EntregaColectivaAvisos(Protocol):
+    """Puerto de entrega a un COLECTIVO: resuelve destinatarios y entrega en copia oculta."""
+
+    def entregar(self, aviso: "AvisoCorreoEntity") -> "EntregaColectiva":
+        """Entrega el aviso al colectivo y devuelve el desenlace; nunca propaga excepciones."""
+
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class ResumenCiclo:
     """
@@ -209,11 +223,13 @@ class MotorAvisos:
         repositorio: RepositorioAvisoCorreo | None = None,
         transporte: TransporteCorreo | None = None,
         compositor: CompositorAviso | None = None,
+        entrega_colectiva: "EntregaColectivaAvisos | None" = None,
         config: ConfiguracionMotorAvisos | None = None,
     ) -> None:
         self._repositorio = repositorio
         self._transporte = transporte
         self._compositor = compositor
+        self._entrega_colectiva = entrega_colectiva
         self._config = config
 
     # --- Resolucion perezosa de los puertos --------------------------------
@@ -239,6 +255,12 @@ class MotorAvisos:
         """Puerto de composicion, o `None` si no se ha inyectado ninguno (AVI-02 es de otra tarea)."""
 
         return self._compositor
+
+    @property
+    def entrega_colectiva(self) -> "EntregaColectivaAvisos | None":
+        """Puerto de entrega a un colectivo, o `None` si no se ha inyectado: sin el, ningun aviso se entrega en copia oculta."""
+
+        return self._entrega_colectiva
 
     def _resolver_transporte(self) -> TransporteCorreo | None:
         """
@@ -372,7 +394,12 @@ class MotorAvisos:
 
         # 2. Sin destinatario no hay entrega posible (REQ-140). La CHECK `ck_aviso_intento_sin_dest`
         #    obliga a que un intento con `recipient_count = 0` lleve exactamente `NO_RECIPIENTS`.
-        if not (aviso.recipient_email or "").strip():
+        #    EXCEPCION DECLARADA: el aviso de alta se encola con `recipient_email` a NULO A PROPOSITO
+        #    (REQ-133), porque su colectivo se resuelve en el INSTANTE de la entrega para no escribir
+        #    a un tecnico dado de baja entre el alta y el envio. Suprimirlo aqui mataria el aviso que
+        #    REQ-133 exige entregar, de modo que ese caso sigue su camino hasta la entrega colectiva.
+        es_entrega_colectiva = aviso.notification_type == TIPO_ALTA and self.entrega_colectiva is not None
+        if not es_entrega_colectiva and not (aviso.recipient_email or "").strip():
             return self._suprimir(
                 aviso,
                 result_code=RESULTADO_SIN_DESTINATARIOS,
@@ -400,20 +427,46 @@ class MotorAvisos:
         attempt_count = repositorio.incrementar_intento(aviso)
 
         # 5. Entrega, SIN transaccion abierta: el bloqueo se solto con el commit de `tomar_pendientes`.
-        if transporte is None:
-            resultado = ResultadoEntrega.de_configuracion(SIN_TRANSPORTE_ACTIVO)
+        #    La entrega colectiva usa su propio camino porque resuelve los destinatarios ella misma y
+        #    devuelve ademas la foto de REQ-135; el resto de tipos sigue con el transporte de uno a uno.
+        if es_entrega_colectiva:
+            colectiva = self.entrega_colectiva.entregar(aviso)
+            resultado = colectiva.resultado
+            recipients_snapshot = colectiva.recipients_snapshot
+            recipient_count = colectiva.recipient_count
         else:
-            mensaje = MensajeCorreo(
-                destinatarios=(aviso.recipient_email,),
-                asunto=aviso.subject,
-                cuerpo_texto=aviso.body_text,
-                cuerpo_html=aviso.body_html,
-            )
-            resultado = transporte.enviar(mensaje)
+            if transporte is None:
+                resultado = ResultadoEntrega.de_configuracion(SIN_TRANSPORTE_ACTIVO)
+            else:
+                mensaje = MensajeCorreo(
+                    destinatarios=(aviso.recipient_email,),
+                    asunto=aviso.subject,
+                    cuerpo_texto=aviso.body_text,
+                    cuerpo_html=aviso.body_html,
+                )
+                resultado = transporte.enviar(mensaje)
+            recipients_snapshot = None
+            recipient_count = DESTINATARIOS_POR_AVISO
 
         if resultado.entregado:
-            return self._cerrar_entrega(aviso, resultado=resultado, attempt_count=attempt_count)
-        return self._cerrar_fallo(aviso, resultado=resultado, attempt_count=attempt_count, config=config)
+            return self._cerrar_entrega(
+                aviso,
+                resultado=resultado,
+                attempt_count=attempt_count,
+                recipients_snapshot=recipients_snapshot,
+                recipient_count=recipient_count,
+            )
+        # Conjunto vacio de destinatarios: el DoD exige FALLIDO, no DESCARTADO (ver `_cerrar_sin_destinatarios`).
+        if resultado.error_code == RESULTADO_SIN_DESTINATARIOS:
+            return self._cerrar_sin_destinatarios(aviso, resultado=resultado, attempt_count=attempt_count)
+        return self._cerrar_fallo(
+            aviso,
+            resultado=resultado,
+            attempt_count=attempt_count,
+            config=config,
+            recipients_snapshot=recipients_snapshot,
+            recipient_count=recipient_count,
+        )
 
     def reenviar(self, notification_id: str, *, actor_user_id: int) -> str:
         """
@@ -481,7 +534,15 @@ class MotorAvisos:
 
     # --- Cierres de la transicion -----------------------------------------
 
-    def _cerrar_entrega(self, aviso: "AvisoCorreoEntity", *, resultado: ResultadoEntrega, attempt_count: int) -> str:
+    def _cerrar_entrega(
+        self,
+        aviso: "AvisoCorreoEntity",
+        *,
+        resultado: ResultadoEntrega,
+        attempt_count: int,
+        recipients_snapshot: str | None = None,
+        recipient_count: int = DESTINATARIOS_POR_AVISO,
+    ) -> str:
         """
         Persiste la entrega aceptada: intento `SENT` y transicion a `ENVIADO` en la misma transaccion.
 
@@ -489,6 +550,10 @@ class MotorAvisos:
         `ck_aviso_correo_enviado`). Si un transporte devolviese `entregado=True` sin el,
         `marcar_enviado` lanza `ErrorMotorAvisos` y la transaccion revierte tambien el intento: no
         queda ninguna traza incoherente.
+
+        `recipients_snapshot` y `recipient_count` llegan informados solo en la entrega colectiva, que
+        es la unica que conoce a quien se escribio de verdad (REQ-135); sus valores por defecto son
+        los del aviso de un unico destinatario, de modo que el resto de tipos no cambia de conducta.
         """
 
         with transaction.atomic():
@@ -496,7 +561,8 @@ class MotorAvisos:
                 aviso,
                 result_code=RESULTADO_ENVIADO,
                 smtp_response_code=resultado.smtp_response_code,
-                recipient_count=DESTINATARIOS_POR_AVISO,
+                recipients_snapshot=recipients_snapshot,
+                recipient_count=recipient_count,
                 message_id=resultado.message_id,
             )
             self.repositorio.marcar_enviado(aviso, message_id=resultado.message_id, sent_at=utc_now())
@@ -517,6 +583,8 @@ class MotorAvisos:
         resultado: ResultadoEntrega,
         attempt_count: int,
         config: ConfiguracionMotorAvisos,
+        recipients_snapshot: str | None = None,
+        recipient_count: int = DESTINATARIOS_POR_AVISO,
     ) -> str:
         """
         Aplica la politica de reintentos al intento fallido y persiste su desenlace (REQ-134, REQ-141).
@@ -524,6 +592,10 @@ class MotorAvisos:
         La decision (reintentar y cuando, o cerrar como `FALLIDO` o `DESCARTADO`) NO se toma aqui:
         se delega integra en `apps.avisos.motor.reintentos.decidir`, que es quien conoce el backoff
         y la clasificacion del fallo. Este metodo solo escribe lo decidido, en una sola transaccion.
+
+        La foto de destinatarios tambien se escribe en el intento FALLIDO: REQ-135 pide saber a quien
+        se habria escrito, y sin ella la auditoria de un fallo no diria nada. Por defecto queda a nulo,
+        que es exactamente lo que escribian hasta ahora los avisos de un unico destinatario.
         """
 
         result_code = self._resultado_de_intento(resultado.error_code)
@@ -550,7 +622,8 @@ class MotorAvisos:
                 smtp_response_code=resultado.smtp_response_code,
                 error_code=resultado.error_code,
                 error_message=mensaje_error,
-                recipient_count=DESTINATARIOS_POR_AVISO,
+                recipients_snapshot=recipients_snapshot,
+                recipient_count=recipient_count,
             )
             if decision.estado_destino is EstadoAviso.PENDIENTE:
                 self.repositorio.devolver_a_pendiente(
@@ -572,6 +645,32 @@ class MotorAvisos:
             smtp_response_code=resultado.smtp_response_code,
         )
         return desenlace
+
+    def _cerrar_sin_destinatarios(self, aviso: "AvisoCorreoEntity", *, resultado: ResultadoEntrega, attempt_count: int) -> str:
+        """
+        Cierra en FALLIDO un aviso cuyo colectivo de destinatarios quedo vacio (REQ-133, AC-SMTP-03).
+
+        NO pasa por `reintentos.decidir` a proposito: ese clasificador trata `NO_RECIPIENTS` como un
+        fallo PERMANENTE y lo mandaria a `DESCARTADO`, mientras que el DoD exige `FALLIDO` con motivo
+        `NO_RECIPIENTS` para que el ADMINISTRADOR lo vea y pueda reenviarlo cuando vuelva a haber
+        tecnicos activos. Tampoco se SUPRIME: la supresion es terminal y esconderia el aviso.
+        `recipient_count = 0` exige exactamente `NO_RECIPIENTS` como resultado del intento (CHECK
+        `ck_aviso_intento_sin_dest`). La arista `ENVIANDO -> FALLIDO` esta declarada en `estados.py`.
+        """
+
+        mensaje_error = resultado.error_message or SIN_DESTINATARIO_RESOLUBLE
+        with transaction.atomic():
+            self.repositorio.registrar_intento(
+                aviso,
+                result_code=RESULTADO_SIN_DESTINATARIOS,
+                error_code=resultado.error_code,
+                error_message=mensaje_error,
+                recipient_count=SIN_DESTINATARIOS,
+            )
+            self.repositorio.marcar_fallido(aviso, last_error_code=RESULTADO_SIN_DESTINATARIOS, last_error_message=mensaje_error)
+
+        self._trazar(aviso, outcome=DESENLACE_FALLIDO, result_code=RESULTADO_SIN_DESTINATARIOS, attempt_count=attempt_count)
+        return DESENLACE_FALLIDO
 
     def _suprimir(
         self,
@@ -682,6 +781,7 @@ __all__ = [
     "SIN_DESTINATARIO_RESOLUBLE",
     "SIN_TRANSPORTE_ACTIVO",
     "CompositorAviso",
+    "EntregaColectivaAvisos",
     "MotorAvisos",
     "ResumenCiclo",
 ]
