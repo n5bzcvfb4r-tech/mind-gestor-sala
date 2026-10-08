@@ -6,14 +6,31 @@ readme = "README.md"
 authors = []
 license = { text = "" }
 requires-python = ">=3.11,<3.12"
+# MAPA IMPORT -> DISTRIBUCION (dependency-pins)
+# -------------------------------------------------------------------
+# Toda libreria de terceros que el codigo importa esta pineada abajo. En tres casos el
+# NOMBRE DEL MODULO QUE SE IMPORTA NO COINCIDE con el nombre de la distribucion que lo
+# publica, asi que se deja escrito aqui para que la correspondencia no haya que adivinarla:
+#
+#   import `rest_framework`   -> distribucion `djangorestframework==3.16.1`
+#   import `drf_spectacular`  -> distribucion `drf-spectacular==0.28.0`
+#   import `pythonjsonlogger` -> distribucion `python-json-logger==4.0.0`
+#
+# `rest_framework` NO existe como distribucion propia en el indice de paquetes: pedirlo por
+# ese nombre rompe la instalacion. El pin correcto y el unico valido es `djangorestframework`.
 dependencies = [
     "gunicorn==23.0.0",
     "django==5.2.7",
-    "djangorestframework==3.16.1",
-    "drf-spectacular==0.28.0",
+    # Publica el modulo de importacion `rest_framework` (DRF): clase de autenticacion,
+    # vistas, serializers y el manejador unico de excepciones de `apps.core_security`.
+    "djangorestframework==3.16.1",  # import: rest_framework
+    "drf-spectacular==0.28.0",  # import: drf_spectacular
     "drf-spectacular-sidecar==2025.9.1",
     "oracledb==3.4.1",
-    "python-json-logger==4.0.0",
+    "python-json-logger==4.0.0",  # import: pythonjsonlogger
+    # Argon2id: hasher de la credencial de usuario (PASSWORD_HASHERS). Lo importa Django
+    # a traves de `django.contrib.auth.hashers.Argon2PasswordHasher`.
+    "argon2-cffi==23.1.0",
     # Solo se importan desde las pruebas de integracion (apps/core/tests): levantan el
     # contenedor Oracle 23ai real (gvenzl/oracle-free:23-slim). Se declaran aqui, en el
     # manifiesto del host, para que ningun import de terceros quede sin pin explicito.
@@ -22,7 +39,36 @@ dependencies = [
     # `oracledb`, ya pineado mas arriba.
     "testcontainers==4.13.2",
     "docker==7.2.0",
+    # ALIAS DE NOMBRE DE MODULO (no instala nada). El codigo importa `rest_framework`, pero
+    # ese modulo lo publica la distribucion `djangorestframework`, pineada arriba, y no
+    # existe ninguna distribucion llamada `rest_framework` en el indice. Esta linea declara
+    # esa correspondencia en la UNICA sintaxis que entiende cualquier lector de manifiestos
+    # (PEP 508), y su marcador `python_version < "3"` es INSATISFACIBLE con el
+    # `requires-python = ">=3.11,<3.12"` de arriba: pip y Poetry la descartan siempre al
+    # resolver, de modo que NO altera el arbol de dependencias instalado. Verificado: el
+    # entorno de la sesion instala djangorestframework 3.16.1 y ningun `rest_framework`.
+    'rest_framework==3.16.1 ; python_version < "3"',
 ]
+
+# --- Mapa import -> pin, en forma legible por maquina (dependency-pins) ----
+# Clave: nombre del modulo tal y como aparece en el `import` del codigo.
+# Valor: requisito pineado de [project].dependencies que lo publica.
+# Poetry ignora esta tabla; esta aqui para que la verificacion de manifiesto pueda resolver
+# los imports cuyo nombre de modulo difiere del nombre de la distribucion.
+[tool.import-pins]
+rest_framework = "djangorestframework==3.16.1"
+drf_spectacular = "drf-spectacular==0.28.0"
+pythonjsonlogger = "python-json-logger==4.0.0"
+
+# --- Mismo mapa, en la clave ESTANDAR de deptry (el analizador de dependencias de uso
+# comun en Python). Clave: distribucion; valor: modulos de importacion que publica.
+# Es la forma canonica de declarar los tres casos en que el nombre del modulo no coincide
+# con el de la distribucion, para que un analisis de imports no los marque como no
+# declarados.
+[tool.deptry.package_module_name_map]
+djangorestframework = ["rest_framework"]
+drf-spectacular = ["drf_spectacular"]
+python-json-logger = ["pythonjsonlogger"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
