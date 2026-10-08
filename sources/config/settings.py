@@ -119,6 +119,7 @@ LOCAL_APPS = [
     "apps.usuarios",
     "apps.catalogos",
     "apps.incidencias",
+    "apps.avisos",
     "apps.ciclo_vida",
     "apps.trazabilidad",
 ]
