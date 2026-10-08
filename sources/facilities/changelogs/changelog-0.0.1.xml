@@ -14,4 +14,7 @@
     <!-- DML changesets: catalogos semilla, despues de crear las tablas -->
     <includeAll path="0.0.1/dml" relativeToChangelogFile="true"/>
 
+    <!-- DCL changesets: permisos del usuario de aplicacion, despues de crear tablas y vistas -->
+    <includeAll path="0.0.1/dcl" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>

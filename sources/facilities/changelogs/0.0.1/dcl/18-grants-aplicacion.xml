@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!--
+        Valores POR DEFECTO del entorno local de desarrollo: son los mismos que levanta
+        local/docker-compose.yml (contrasenia entornodev), de modo que un arranque limpio en
+        local funciona sin pasar ningun parametro.
+
+        Cualquier entorno real (integracion, preproduccion, produccion) los SOBRESCRIBE en la
+        invocacion de Liquibase con -Dapp.user=... -Dapp.password=...; la credencial real NUNCA
+        se versiona en este repositorio.
+    -->
+    <property name="app.user" value="facilities_app" dbms="oracle"/>
+    <property name="app.password" value="entornodev" dbms="oracle"/>
+
+    <changeSet id="dcl-0.0.1-18-01" author="MIND">
+        <comment>Alta del usuario de aplicacion ${app.user} con CREATE SESSION: sin cuota de tablespace y sin rol RESOURCE</comment>
+        <preConditions onFail="MARK_RAN" onFailMessage="El usuario de aplicacion ya existe o la cuenta que despliega no tiene el privilegio CREATE USER: el alta se omite y se asume provisionada por el DBA">
+            <and>
+                <sqlCheck expectedResult="1">SELECT COUNT(*) FROM session_privs WHERE privilege = 'CREATE USER'</sqlCheck>
+                <sqlCheck expectedResult="0">SELECT COUNT(*) FROM all_users WHERE username = UPPER('${app.user}')</sqlCheck>
+            </and>
+        </preConditions>
+        <!--
+            La precondicion con onFail="MARK_RAN" evita que el despliegue se rompa en los dos
+            escenarios reales: la cuenta que despliega no tiene el privilegio CREATE USER (es el
+            caso habitual en una instancia gestionada), o el DBA ya ha provisionado la cuenta. En
+            ambos el changeset se marca como ejecutado y los permisos siguientes se aplican sobre
+            el usuario existente.
+
+            El usuario de aplicacion NO recibe cuota en ningun tablespace ni el rol RESOURCE: no es
+            dueño de ningun objeto, no crea tablas ni indices, solo OPERA sobre los objetos del
+            esquema a traves de los permisos que conceden los changesets 02..05. Sin cuota, un
+            CREATE TABLE suyo fallaria aunque alguien le concediese el privilegio por error.
+        -->
+        <sql>CREATE USER ${app.user} IDENTIFIED BY "${app.password}"</sql>
+        <sql>GRANT CREATE SESSION TO ${app.user}</sql>
+        <rollback>
+            <!--
+                Rollback defensivo: si el usuario ya no existe (ORA-01918) el deshacer no debe
+                fallar, cualquier otro error si se propaga.
+            -->
+            <sql splitStatements="false" stripComments="false"><![CDATA[BEGIN
+    EXECUTE IMMEDIATE 'DROP USER ${app.user}';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE <> -1918 THEN
+            RAISE;
+        END IF;
+END;]]></sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dcl-0.0.1-18-02" author="MIND">
+        <comment>Tablas transaccionales: SELECT, INSERT y UPDATE para ${app.user}, nunca DELETE</comment>
+        <preConditions onFail="MARK_RAN" onFailMessage="El usuario de aplicacion ${app.user} no existe en esta instancia: los permisos se omiten">
+            <sqlCheck expectedResult="1">SELECT COUNT(*) FROM all_users WHERE username = UPPER('${app.user}')</sqlCheck>
+        </preConditions>
+        <!--
+            La baja es SIEMPRE logica (REQ-047): ninguna fila de negocio se borra jamas de la base
+            de datos. Por eso NO se concede DELETE sobre ninguna de estas seis tablas. El estado de
+            baja se escribe con UPDATE sobre las columnas de estado (status / is_active), que es
+            exactamente el privilegio que si se concede aqui.
+
+            Un DELETE emitido por el usuario de aplicacion recibe ORA-01031 del propio motor, sin
+            depender de que la capa de aplicacion se comporte bien.
+        -->
+        <sql>GRANT SELECT, INSERT, UPDATE ON usuario TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT, UPDATE ON sesion_usuario TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT, UPDATE ON incidencia TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT, UPDATE ON incidencia_adjunto TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT, UPDATE ON aviso_correo TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT, UPDATE ON configuracion_smtp TO ${app.user}</sql>
+        <rollback>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON configuracion_smtp FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON aviso_correo FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON incidencia_adjunto FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON incidencia FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON sesion_usuario FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON usuario FROM ${app.user}</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dcl-0.0.1-18-03" author="MIND">
+        <comment>Tablas de historico: solo SELECT e INSERT para ${app.user}, append-only sin UPDATE ni DELETE</comment>
+        <preConditions onFail="MARK_RAN" onFailMessage="El usuario de aplicacion ${app.user} no existe en esta instancia: los permisos se omiten">
+            <sqlCheck expectedResult="1">SELECT COUNT(*) FROM all_users WHERE username = UPPER('${app.user}')</sqlCheck>
+        </preConditions>
+        <!--
+            Estas seis tablas son APPEND-ONLY (REQ-015, REQ-065, REQ-077): una fila escrita no se
+            modifica ni se borra nunca.
+
+            Defensa en profundidad, dos barreras:
+
+            1) La AUSENCIA del privilegio UPDATE y del privilegio DELETE en este GRANT es la PRIMERA
+               barrera: el usuario de aplicacion recibe ORA-01031 del motor antes incluso de llegar
+               al motor de reglas, porque el privilegio no existe.
+
+            2) Los triggers de inmutabilidad trg_usuario_historico_inmutable,
+               trg_auditoria_acceso_inmutable, trg_incidencia_historico_inmutable (ORA-20002),
+               trg_aviso_correo_intento_inmutable y trg_resolucion_dest_inmutable son la SEGUNDA
+               barrera, la que protege TAMBIEN al dueño del esquema, que si tiene todos los
+               privilegios sobre sus propias tablas y por tanto no choca con la primera.
+        -->
+        <sql>GRANT SELECT, INSERT ON usuario_historico TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON usuario_password_historico TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON auditoria_acceso TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON incidencia_historico TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON aviso_correo_intento TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON resolucion_destinatario_log TO ${app.user}</sql>
+        <rollback>
+            <sql>REVOKE SELECT, INSERT ON resolucion_destinatario_log FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT ON aviso_correo_intento FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT ON incidencia_historico FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT ON auditoria_acceso FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT ON usuario_password_historico FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT ON usuario_historico FROM ${app.user}</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dcl-0.0.1-18-04" author="MIND">
+        <comment>Informes de verificacion de integridad (REQ-152): UPDATE solo en integridad_informe para el sellado, hallazgos append-only</comment>
+        <preConditions onFail="MARK_RAN" onFailMessage="El usuario de aplicacion ${app.user} no existe en esta instancia: los permisos se omiten">
+            <sqlCheck expectedResult="1">SELECT COUNT(*) FROM all_users WHERE username = UPPER('${app.user}')</sqlCheck>
+        </preConditions>
+        <!--
+            integridad_informe necesita UPDATE por UNA UNICA razon: el SELLADO de la ejecucion, es
+            decir el paso de status EN_CURSO a COMPLETADO o FALLIDO junto con sus contadores. El
+            trigger trg_integridad_informe_append acota ese UPDATE a ese unico cambio y a una sola
+            vez, de modo que el privilegio no abre la puerta a reescribir un informe ya cerrado.
+
+            integridad_hallazgo es estrictamente append-only: se escribe mientras la verificacion
+            corre y no se toca despues.
+
+            NINGUNA de las dos concede DELETE: los informes se conservan con la misma retencion e
+            inmutabilidad que el resto del historico (REQ-152 RN-09).
+
+            Las dos tablas las crea el changelog ddl 18-integridad-retencion.xml. Los changelogs de
+            0.0.1/ddl se aplican antes que los de 0.0.1/dcl, asi que al llegar aqui ya existen.
+        -->
+        <sql>GRANT SELECT, INSERT, UPDATE ON integridad_informe TO ${app.user}</sql>
+        <sql>GRANT SELECT, INSERT ON integridad_hallazgo TO ${app.user}</sql>
+        <rollback>
+            <sql>REVOKE SELECT, INSERT ON integridad_hallazgo FROM ${app.user}</sql>
+            <sql>REVOKE SELECT, INSERT, UPDATE ON integridad_informe FROM ${app.user}</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="dcl-0.0.1-18-05" author="MIND">
+        <comment>Catalogos y vistas de consulta: SELECT en solo lectura para ${app.user}</comment>
+        <preConditions onFail="MARK_RAN" onFailMessage="El usuario de aplicacion ${app.user} no existe en esta instancia: los permisos se omiten">
+            <sqlCheck expectedResult="1">SELECT COUNT(*) FROM all_users WHERE username = UPPER('${app.user}')</sqlCheck>
+        </preConditions>
+        <!--
+            Los catalogos se conceden en SOLO LECTURA. El mantenimiento de catalogo por el
+            ADMINISTRADOR (alta de salas, alta de categorias) recibira su permiso de escritura en la
+            tarea que implemente esa operacion; esta tarea NO lo anticipa.
+
+            Las cuatro vistas v_chk_* son las invariantes de integridad que consume el informe de
+            REQ-152 y las crea el changelog ddl 18. Las vistas v_filtro_* y v_recuento_incidencias
+            son de TSK-060 (changelog ddl 17).
+        -->
+        <sql>GRANT SELECT ON cat_rol TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_operacion TO ${app.user}</sql>
+        <sql>GRANT SELECT ON permiso_rol_operacion TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_oficina TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_sala TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_categoria_incidencia TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_estado_incidencia TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_transicion_incidencia TO ${app.user}</sql>
+        <sql>GRANT SELECT ON cat_motivo_desactivacion TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_filtro_sala TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_filtro_oficina TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_filtro_categoria TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_recuento_incidencias TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_chk_incidencia_sin_alta TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_chk_estado_desalineado TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_chk_cadena_hash TO ${app.user}</sql>
+        <sql>GRANT SELECT ON v_chk_cierre_1a1 TO ${app.user}</sql>
+        <rollback>
+            <sql>REVOKE SELECT ON v_chk_cierre_1a1 FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_chk_cadena_hash FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_chk_estado_desalineado FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_chk_incidencia_sin_alta FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_recuento_incidencias FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_filtro_categoria FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_filtro_oficina FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON v_filtro_sala FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_motivo_desactivacion FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_transicion_incidencia FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_estado_incidencia FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_categoria_incidencia FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_sala FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_oficina FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON permiso_rol_operacion FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_operacion FROM ${app.user}</sql>
+            <sql>REVOKE SELECT ON cat_rol FROM ${app.user}</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
