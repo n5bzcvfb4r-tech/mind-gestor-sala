@@ -1385,8 +1385,34 @@ components:
       x-mind-placeholder: true
     EffectivePermissions:
       type: object
-      description: Respuesta EffectivePermissions
-      x-mind-placeholder: true
+      description: >-
+        Permisos efectivos del rol VIGENTE del usuario de la sesión (EP-004, REQ-020).
+        Proyección de la matriz `permiso_rol_operacion` acotada al rol propio: nunca
+        incluye permisos de terceros ni la matriz completa del sistema (AC-ROL-04).
+      required:
+      - roleCode
+      - allowedOperations
+      - dataScope
+      properties:
+        roleCode:
+          type: string
+          readOnly: true
+          description: Código de rol vigente del usuario de la sesión (`cat_rol`).
+        allowedOperations:
+          type: array
+          readOnly: true
+          description: >-
+            Códigos de `cat_operacion` que la matriz autoriza a ese rol, en orden
+            alfabético estable. Vacío si el rol no tiene ninguna entrada.
+          items:
+            type: string
+        dataScope:
+          type: string
+          readOnly: true
+          enum:
+          - OWN
+          - ALL
+          description: Alcance de datos del rol; nunca ambos valores a la vez.
     IncidentActivityPage:
       type: object
       description: Respuesta IncidentActivityPage
