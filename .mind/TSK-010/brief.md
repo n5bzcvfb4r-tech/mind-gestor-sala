@@ -2240,3 +2240,28 @@ Comprueba `.mind/TSK-010/env.json`: si su `status` es `unavailable` o `degraded`
 
 ## REWORK — feedback del revisor (atiéndelo TODO)
 - (mind-platform) MIND (plataforma): este PR tiene **conflictos de merge** con `main` (`mergeable_state=dirty`). Suele pasar al mergear otro PR en paralelo que tocÃ³ ficheros compartidos (routers, `__init__`, depsâ€¦). Haz rebase o merge de `main` en tu rama, resuelve los conflictos sin cambiar el alcance de la tarea, deja build/tests verdes y vuelve a empujar. Preferible mergear PRs en orden del DAG (uno a uno) para reducir este caso.
+
+## Código ya presente en la zona (zone-extend) — OBLIGATORIO
+
+En el tip actual del workspace YA hay código bajo tus `zone_paths` (típicamente de una TSK predecesora mergeada). **Léelo antes de escribir.**
+
+Ficheros presentes (muestra):
+- `sources/apps/avisos/motor/__init__.py`
+- `sources/apps/avisos/motor/calendario.py`
+- `sources/apps/avisos/motor/claves.py`
+- `sources/apps/avisos/motor/configuracion.py`
+- `sources/apps/avisos/motor/despachador.py`
+- `sources/apps/avisos/motor/errores.py`
+- `sources/apps/avisos/motor/estados.py`
+- `sources/apps/avisos/motor/outbox.py`
+- `sources/apps/avisos/motor/planificador.py`
+- `sources/apps/avisos/motor/reintentos.py`
+- `sources/apps/avisos/motor/repositorio.py`
+- `sources/apps/avisos/motor/transporte.py`
+- `sources/apps/avisos/apps.py`
+- `sources/config/settings.py`
+
+Disciplina:
+1. **EDIT/EXTIENDE** símbolos existentes (`class`/`def`/exports) — **PROHIBIDO** una segunda declaración con el mismo nombre en el mismo fichero.
+2. Añade routers/handlers nuevos en ficheros dedicados o ampliando el existente sin redefinir tipos ya presentes.
+3. Si el DoD pide API pública sobre el mismo dominio, reutiliza servicios/modelos del CRUD previo; no copies otra `MembershipPlanService`.
