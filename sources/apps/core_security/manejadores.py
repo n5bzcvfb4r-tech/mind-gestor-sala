@@ -33,6 +33,7 @@ from rest_framework.views import exception_handler as manejador_por_defecto_drf
 from apps.core import mensajes as mensajes_core
 from apps.core.errores import ErrorDominio
 from apps.core_security import mensajes
+from apps.core_security.auditoria import OUTCOME_DENEGADO_401, OUTCOME_DENEGADO_403, registrar_intento_denegado
 from apps.core_security.respuestas import cuerpo_error, nuevo_trace_id
 
 
@@ -51,6 +52,14 @@ CODIGO_INESPERADO = "SYS_UNEXPECTED"
 
 # Nombre de campo para los errores de validacion que no cuelgan de ningun campo concreto.
 CAMPO_SIN_CAMPO = "non_field_errors"
+
+# Unicos status que REQ-044 considera INTENTO DENEGADO. Se mapean al `outcome` observable de la
+# traza. El resto (400, 404, 405, 429, 500...) son otra clase de fallo y no entran: mezclarlos
+# haria inservible la muestra auditada, porque «hay fila» dejaria de significar «hubo denegacion».
+OUTCOMES_POR_STATUS: dict[int, str] = {
+    status.HTTP_401_UNAUTHORIZED: OUTCOME_DENEGADO_401,
+    status.HTTP_403_FORBIDDEN: OUTCOME_DENEGADO_403,
+}
 
 # Codigo y mensaje genericos por `status_code` para las `APIException` sin traduccion propia.
 CODIGOS_POR_STATUS: dict[int, str] = {
@@ -176,6 +185,33 @@ def _registrar(trace_id: str, codigo: str, http_status: int, context: dict[str, 
     )
 
 
+def _registrar_denegacion(http_status: int, context: dict[str, Any] | None) -> None:
+    """
+    Deja la fila de `auditoria_acceso` de los intentos denegados (REQ-044 RN-04, AC-ROL-06).
+
+    Solo registra el 401 (`AUTH_SESSION_INVALID`, `NotAuthenticated`/`AuthenticationFailed`) y el
+    403 (`PermisoDenegadoError` de la matriz o de la guardia de ADMINISTRADOR, `PermissionDenied`
+    de DRF). Cualquier otro status se ignora en silencio: un 404, un 422 o un 500 no son intentos
+    denegados y ensuciarian la traza de accesos.
+
+    DISJUNTO DE `SesionRequeridaMiddleware._componer_denegacion`. El guardia de sesion deniega POR
+    DELANTE de DRF y devuelve su respuesta sin entrar en el ciclo, de modo que lo que el middleware
+    registra NUNCA vuelve a pasar por aqui: un mismo intento denegado produce UNA fila, no dos.
+
+    La escritura es best-effort (`registrar_intento_denegado` no propaga) y se hace sobre la
+    respuesta YA compuesta: ni el status, ni el cuerpo canonico, ni el `traceId` que ve el cliente
+    cambian por lo que ocurra aqui.
+    """
+
+    outcome = OUTCOMES_POR_STATUS.get(http_status)
+    if outcome is None:
+        return
+
+    # Si el contexto no trae peticion se registra igual con `request=None`: `auditoria` anotara
+    # `operation="DESCONOCIDA"` antes que perder la fila, y el acuerdo es el 100% de los intentos.
+    registrar_intento_denegado(request=(context or {}).get("request"), outcome=outcome)
+
+
 def manejador_excepciones(exc: Exception, context: dict[str, Any] | None) -> Response | None:
     """
     Manejador de excepciones de DRF del servicio (`REST_FRAMEWORK["EXCEPTION_HANDLER"]`).
@@ -201,6 +237,10 @@ def manejador_excepciones(exc: Exception, context: dict[str, Any] | None) -> Res
         # se haya construido con un mensaje propio: el motivo real solo viaja por la traza.
         mensaje = mensajes.SESION_REQUERIDA if codigo == CODIGO_SESION_INVALIDA else str(exc.mensaje)
         _registrar(trace_id, codigo, http_status, context, tipo)
+        # Aqui salen `SesionInvalidaError` (401) y `PermisoDenegadoError`/`RolNoResolubleError`
+        # (403). Esta rama hace `return`, asi que no puede solaparse con la del manejador por
+        # defecto de DRF de mas abajo: cada intento denegado se contabiliza una sola vez.
+        _registrar_denegacion(http_status, context)
         return Response(cuerpo_error(codigo, mensaje, trace_id=trace_id), status=http_status)
 
     # El manejador por defecto resuelve el status y, sobre todo, las cabeceras de la respuesta
@@ -227,4 +267,8 @@ def manejador_excepciones(exc: Exception, context: dict[str, Any] | None) -> Res
     respuesta.data = cuerpo_error(codigo, mensaje, details, trace_id)
     respuesta.status_code = http_status
     _registrar(trace_id, codigo, http_status, context, tipo)
+    # Denegaciones que no son `ErrorDominio`: el 401 `AUTH_SESSION_INVALID` y el 403 `PERM_DENIED`
+    # que `_traducir` acaba de resolver. Se registra DESPUES de componer la respuesta para que un
+    # fallo de la traza no pueda alterarla, y sobre el `http_status` ya traducido (no el de DRF).
+    _registrar_denegacion(http_status, context)
     return respuesta

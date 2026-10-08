@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-005",
+  "attempt": 1,
+  "at": "2026-10-08T15:14:04.842762+00:00",
+  "construction_id": "952fd5c8-e55f-46a7-afa4-5d74b4c2f724",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-005 — Restricción al rol ADMINISTRADOR y traza de intentos denegados (ARC-012, zona `sources/apps/core_security/`).\n\nArquetipo real del repo: `container-python` = **Django 5.2 + DRF + Oracle (modelos `managed=False`, DDL por Liquibase)**. Se ha extendido la zona de TSK-004 sin redeclarar ningún símbolo base.\n\n## Código entregado\n\n**1. Guardia de ADMINISTRADOR — `core_security/permisos.py` (EXTENDIDO, +139)**\n- `PermisoAdministrador(PermisoOperacion)` y la fábrica `requiere_administrador(oper",
+  "model": "claude-opus-5",
+  "input_tokens": 8877723,
+  "output_tokens": 56244,
+  "llm_calls": 272,
+  "cost_usd": 12.261905249999998,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "2cf9a4bf4716823e6df28d156bc3d23cb5b0d9b5",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}

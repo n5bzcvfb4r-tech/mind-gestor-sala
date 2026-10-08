@@ -12,6 +12,7 @@ from collections.abc import Callable
 from django.http import HttpRequest, HttpResponse
 
 from apps.core_security import mensajes
+from apps.core_security.auditoria import OUTCOME_DENEGADO_401, OUTCOME_DENEGADO_403, registrar_intento_denegado
 from apps.core_security.errores import RolNoResolubleError, SesionInvalidaError
 from apps.core_security.respuestas import nuevo_trace_id, respuesta_error_json
 from apps.core_security.rutas_publicas import es_ruta_exenta
@@ -28,6 +29,12 @@ ESQUEMA_AUTORIZACION = "bearer"
 PARAMETROS_CREDENCIAL_PROHIBIDOS: tuple[str, ...] = ("session_id", "sessionId", "access_token", "token")
 
 MOTIVO_CREDENCIAL_EN_URL = "credencial_en_url"
+
+# Traduccion del status de la denegacion al `outcome` observable de REQ-044. Se deriva del
+# `http_status` que ya compone la respuesta y no de una bandera aparte, para que la traza no
+# pueda decir una cosa distinta de la que el cliente recibe. Cualquier otro status no es un
+# intento denegado y no entra en la traza de accesos.
+OUTCOMES_POR_STATUS: dict[int, str] = {401: OUTCOME_DENEGADO_401, 403: OUTCOME_DENEGADO_403}
 
 
 def credencial_de_la_peticion(request: HttpRequest) -> str | None:
@@ -154,10 +161,15 @@ class SesionRequeridaMiddleware:
         http_status: int,
     ) -> HttpResponse:
         """
-        Compone el cuerpo canonico de error y deja UNA linea de traza con el motivo interno.
+        Compone el cuerpo canonico de error, deja UNA linea de traza con el motivo interno y
+        registra el intento denegado en `auditoria_acceso` (REQ-044 RN-04, AC-ROL-06).
 
         El motivo real viaja SOLO al log, nunca a la respuesta. Ni la credencial ni el
         `session_id` se registran jamas (REQ-063, REQ-076).
+
+        PUNTO UNICO. Las DOS denegaciones del guardia (el 401 de sesion invalida y el 403
+        FAIL-CLOSED de rol no resoluble) pasan por aqui, asi que basta con registrar en este
+        metodo para cubrir el 100% de los intentos que deniega el middleware.
         """
 
         trace_id = nuevo_trace_id()
@@ -172,4 +184,26 @@ class SesionRequeridaMiddleware:
                 }
             },
         )
+
+        # TRAZA DE ACCESOS DENEGADOS (REQ-044 RN-04, AC-ROL-06).
+        #
+        # DISJUNTO DE `manejadores.manejador_excepciones`. Si el guardia deniega aqui, devuelve la
+        # respuesta y la peticion NUNCA entra en el ciclo de DRF, de modo que el manejador de
+        # excepciones no llega a verla: un mismo intento produce UNA fila, no dos. Quien audite la
+        # traza no tiene que deduplicar nada.
+        #
+        # El `outcome` se deriva del `http_status` que ya se va a responder. Si algun dia llegase
+        # otro status (hoy solo se compone 401 y 403), NO se registra y no se lanza: este metodo es
+        # el camino de la respuesta al usuario y una traza nunca puede cambiarla.
+        #
+        # No se informa `session_id` a proposito: el motivo mismo de la denegacion es que no hay
+        # sesion valida. El `user_id` lo resuelve `auditoria` desde el servidor (sera nulo en el
+        # 401, y en el 403 de rol no resoluble lo sera o no segun se haya publicado el contexto);
+        # forzarlo desde aqui solo podria empeorar lo que el modulo ya sabe.
+        outcome = OUTCOMES_POR_STATUS.get(http_status)
+        if outcome is not None:
+            # `registrar_intento_denegado` es best-effort y nunca lanza con un `outcome` valido:
+            # un fallo de la escritura no altera el status, el cuerpo ni el `traceId` de abajo.
+            registrar_intento_denegado(request=request, outcome=outcome)
+
         return respuesta_error_json(codigo, mensaje, http_status, trace_id)
