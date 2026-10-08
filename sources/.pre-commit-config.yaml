@@ -1,0 +1,44 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+exclude: "docs|migrations|.git|.tox"
+default_install_hook_types:
+  - pre-commit
+default_stages:
+  - pre-commit
+fail_fast: true
+
+repos:
+  # general checks (see here: https://pre-commit.com/hooks.html)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+
+  # ruff - linting & formatting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.7
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
+
+  # pyupgrade - upgrade syntax for newer versions
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.21.2
+    hooks:
+      - id: pyupgrade
+        description: Automatically upgrade syntax for newer versions.
+        args: ["--py311-plus"]
+
+  # local hooks
+  - repo: local
+    hooks:
+      # pytest - testing
+      - id: pytest
+        name: pytests (local)
+        entry: bash -c "poetry -C sources/ run pytest; err=$? ; if (( $err != 5 )) ; then exit $err ; fi"
+        language: system
+        pass_filenames: false
+        always_run: true
