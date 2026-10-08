@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-18-01" author="MIND">
+        <comment>Informe de verificacion de integridad del historico (REQ-152): cabecera de cada ejecucion, inmutable y sin descripcion de incidencia</comment>
+        <!--
+            executed_by es NULLABLE a proposito: la verificacion de integridad tambien se lanza de
+            forma PROGRAMADA (REQ-152) y entonces no hay actor humano al que imputar la ejecucion.
+            La columna queda nula en ese caso y apunta al usuario solicitante cuando la verificacion
+            se dispara a peticion.
+
+            El alcance scope_date_from / scope_date_to es OPCIONAL: si no se acota ninguno de los dos
+            extremos, la verificacion recorre toda la ventana de retencion.
+
+            status modela el ciclo de vida de la ejecucion (EN_CURSO -&gt; COMPLETADO o FALLIDO) y es
+            lo que permite detectar que ya hay una verificacion EN_CURSO; sobre esa misma columna se
+            apoya el cerrojo ux_integridad_informe_en_curso del changeset 18-04.
+
+            La tabla NO tiene ninguna columna de descripcion de la incidencia ni de comentario de
+            resolucion: REQ-152 RN-08 obliga a que el informe exponga unicamente identificadores y
+            reglas incumplidas, de modo que aqui no existe siquiera donde guardarlos.
+        -->
+        <sql>CREATE TABLE integridad_informe (
+    integrity_report_id NUMBER GENERATED ALWAYS AS IDENTITY,
+    executed_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    executed_by         NUMBER,
+    scope_date_from     DATE,
+    scope_date_to       DATE,
+    checked_count       NUMBER DEFAULT 0 NOT NULL,
+    inconsistency_count NUMBER DEFAULT 0 NOT NULL,
+    status              VARCHAR2(20 CHAR) DEFAULT 'EN_CURSO' NOT NULL,
+    CONSTRAINT pk_integridad_informe PRIMARY KEY (integrity_report_id),
+    CONSTRAINT fk_integridad_informe_ejecutor FOREIGN KEY (executed_by) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="integridad_informe"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-02" author="MIND">
+        <comment>Reglas de coherencia del informe de integridad (REQ-152): enumerado de estado, rango de fechas ordenado y ventana maxima de 24 meses</comment>
+        <!--
+            Estas restricciones materializan en la BASE DE DATOS las dos validaciones de alcance que
+            fija REQ-152: "scope_date_from &lt;= scope_date_to" (ck_integridad_informe_rango) y "rango
+            maximo de 24 meses, que coincide con la ventana de retencion del historico"
+            (ck_integridad_informe_ventana). El error 400 "Rango de fechas no valido" que publica la
+            API tiene aqui su respaldo: aunque la capa de servicio no lo comprobara, un alcance
+            invalido seria rechazado por el motor.
+
+            Las dos CHECK admiten el caso en que alguno de los extremos sea nulo, porque el alcance
+            es opcional y "sin acotar" significa toda la ventana de retencion.
+
+            ck_integridad_informe_checked y ck_integridad_informe_hallazgos impiden contadores
+            negativos: un informe cuenta incidencias verificadas y hallazgos, nunca menos de cero.
+        -->
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_status CHECK (status IN ('EN_CURSO','COMPLETADO','FALLIDO'))</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_rango CHECK (scope_date_from IS NULL OR scope_date_to IS NULL OR scope_date_from &lt;= scope_date_to)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_ventana CHECK (scope_date_from IS NULL OR scope_date_to IS NULL OR MONTHS_BETWEEN(scope_date_to, scope_date_from) &lt;= 24)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_checked CHECK (checked_count &gt;= 0)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_hallazgos CHECK (inconsistency_count &gt;= 0)</sql>
+        <rollback>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_hallazgos</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_checked</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_ventana</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_rango</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_status</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-03" author="MIND">
+        <comment>Hallazgo de un informe de integridad (REQ-152): incidencia afectada y regla incumplida, nunca su descripcion</comment>
+        <!--
+            Los cuatro valores admitidos de rule_code van en MINUSCULAS porque son literalmente los
+            que fija REQ-152 y los que publica la API: sin_alta, secuencia_rota, estado_desalineado y
+            hash_alterado. La CHECK los congela como enumerado cerrado.
+
+            finding_detail es un texto de diagnostico de 500 caracteres que solo puede contener
+            IDENTIFICADORES, marcas temporales y codigos de estado: NUNCA la description de la
+            incidencia ni su resolution_comment (REQ-152 RN-08). La tabla no declara ninguna columna
+            para ellos, de modo que no existe siquiera donde guardarlos.
+
+            Un hallazgo apunta siempre a su informe y a la incidencia afectada; ambas claves ajenas
+            son obligatorias porque un hallazgo huerfano no significa nada.
+        -->
+        <sql>CREATE TABLE integridad_hallazgo (
+    finding_id          NUMBER GENERATED ALWAYS AS IDENTITY,
+    integrity_report_id NUMBER NOT NULL,
+    incident_id         NUMBER NOT NULL,
+    rule_code           VARCHAR2(30 CHAR) NOT NULL,
+    finding_detail      VARCHAR2(500 CHAR),
+    CONSTRAINT pk_integridad_hallazgo PRIMARY KEY (finding_id),
+    CONSTRAINT ck_integridad_hallazgo_rule CHECK (rule_code IN ('sin_alta','secuencia_rota','estado_desalineado','hash_alterado')),
+    CONSTRAINT fk_integridad_hallazgo_informe FOREIGN KEY (integrity_report_id) REFERENCES integridad_informe (integrity_report_id),
+    CONSTRAINT fk_integridad_hallazgo_incidencia FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="integridad_hallazgo"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-04" author="MIND">
+        <comment>Indices de consulta del informe de integridad y cerrojo de ejecucion unica (AC-HIST-07)</comment>
+        <!--
+            ix_integridad_informe_executed_at sirve el listado de informes en orden cronologico
+            descendente; los dos indices de integridad_hallazgo sirven el detalle de un informe y la
+            busqueda de hallazgos por incidencia afectada.
+
+            ux_integridad_informe_en_curso es un indice UNICO BASADO EN FUNCION y es el cerrojo de
+            ejecucion unica. La expresion indexada vale 1 cuando el informe esta EN_CURSO y NULL en
+            cualquier otro estado. Oracle NO almacena en un indice de una sola columna las entradas
+            cuya clave es nula, de modo que el indice contiene EXCLUSIVAMENTE las ejecuciones en
+            curso y su unicidad garantiza que no puede haber mas de una a la vez: los informes ya
+            sellados (COMPLETADO o FALLIDO) ni siquiera aparecen en el, por muchos que sean.
+
+            Un segundo intento concurrente de arrancar una verificacion choca contra ORA-00001, y es
+            exactamente lo que la API traduce al 409 "Ya hay una verificacion en curso" de AC-HIST-07.
+
+            El cerrojo vive en la BASE DE DATOS y no en el proceso: dos instancias de la aplicacion
+            corriendo en paralelo, o una ejecucion programada solapandose con otra a peticion, siguen
+            sin poder arrancar dos verificaciones simultaneas.
+        -->
+        <sql>CREATE INDEX ix_integridad_informe_executed_at ON integridad_informe (executed_at DESC)</sql>
+        <sql>CREATE INDEX ix_integridad_hallazgo_informe ON integridad_hallazgo (integrity_report_id)</sql>
+        <sql>CREATE INDEX ix_integridad_hallazgo_incidencia ON integridad_hallazgo (incident_id)</sql>
+        <sql>CREATE UNIQUE INDEX ux_integridad_informe_en_curso ON integridad_informe (CASE WHEN status = 'EN_CURSO' THEN 1 END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_integridad_informe_en_curso</sql>
+            <sql>DROP INDEX ix_integridad_hallazgo_incidencia</sql>
+            <sql>DROP INDEX ix_integridad_hallazgo_informe</sql>
+            <sql>DROP INDEX ix_integridad_informe_executed_at</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-05" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad append-only del informe de integridad y de sus hallazgos (REQ-152 RN-09, REQ-015, REQ-065): ORA-20006 y ORA-20007</comment>
+        <!--
+            Las dos tablas son append-only, pero con una asimetria deliberada.
+
+            integridad_hallazgo es append-only PURO: una vez escrito un hallazgo, ni se corrige ni se
+            borra. Su trigger es de SENTENCIA (sin FOR EACH ROW), igual que trg_resolucion_dest_inmutable,
+            de modo que rechaza el UPDATE o el DELETE incluso cuando la sentencia no afecta a ninguna
+            fila.
+
+            integridad_informe necesita exactamente UNA transicion: el SELLADO de la ejecucion que
+            acaba de terminar. La fila nace EN_CURSO (es la que ocupa el cerrojo
+            ux_integridad_informe_en_curso) y al terminar se cierra a COMPLETADO o FALLIDO fijando
+            checked_count e inconsistency_count. El trigger acota ese UPDATE a ese unico cambio, lo
+            deja pasar UNA SOLA VEZ (porque exige que el estado de partida sea EN_CURSO, condicion
+            que el propio sellado destruye) y congela el ejecutor, el instante de ejecucion y el
+            alcance. A partir del sellado, el informe es tan inmutable como el resto del historico.
+            El DELETE esta prohibido siempre: un informe se conserva con la misma retencion que el
+            historico que verifica.
+
+            Ademas, la verificacion de integridad es SOLO DIAGNOSTICA: no repara, no borra y no
+            modifica ninguna entrada del historico. Estos triggers impiden que un futuro "arreglo"
+            pueda, siquiera, reescribir su propio informe o sus propios hallazgos para disimular lo
+            que encontro.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_integridad_hallazgo_append
+BEFORE UPDATE OR DELETE ON integridad_hallazgo
+BEGIN
+    RAISE_APPLICATION_ERROR(-20006, 'Un hallazgo de un informe de integridad es inmutable');
+END;]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_integridad_informe_append
+BEFORE UPDATE OR DELETE ON integridad_informe
+FOR EACH ROW
+BEGIN
+    IF DELETING THEN
+        RAISE_APPLICATION_ERROR(-20007, 'Un informe de integridad no se borra: se conserva con la misma retencion que el resto del historico');
+    END IF;
+
+    IF :OLD.status <> 'EN_CURSO' THEN
+        RAISE_APPLICATION_ERROR(-20007, 'El informe de integridad ya esta sellado y es inmutable');
+    END IF;
+
+    IF :NEW.status NOT IN ('COMPLETADO', 'FALLIDO') THEN
+        RAISE_APPLICATION_ERROR(-20007, 'La unica modificacion admitida sobre un informe en curso es su sellado a COMPLETADO o FALLIDO');
+    END IF;
+
+    IF :NEW.executed_at <> :OLD.executed_at
+       OR NVL(:NEW.executed_by, -1) <> NVL(:OLD.executed_by, -1)
+       OR NVL(:NEW.scope_date_from, DATE '0001-01-01') <> NVL(:OLD.scope_date_from, DATE '0001-01-01')
+       OR NVL(:NEW.scope_date_to, DATE '0001-01-01') <> NVL(:OLD.scope_date_to, DATE '0001-01-01') THEN
+        RAISE_APPLICATION_ERROR(-20007, 'El sellado de un informe de integridad no puede alterar su ejecutor, su instante ni su alcance');
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_integridad_informe_append</sql>
+            <sql>DROP TRIGGER trg_integridad_hallazgo_append</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
