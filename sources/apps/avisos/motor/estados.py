@@ -51,9 +51,19 @@ ESTADOS_TERMINALES: frozenset[EstadoAviso] = frozenset({EstadoAviso.ENVIADO, Est
 #: ENVIANDO -> PENDIENTE o ENVIANDO -> FALLIDO». A eso se suma ENVIANDO -> DESCARTADO (REQ-141,
 #: AC-SMTP-04: rechazo permanente 5xx) y PENDIENTE -> SUPRIMIDO (REQ-140 / ARC-115: aviso no
 #: entregable, sin destinatario o con composicion incompleta).
+#:
+#: `ENVIANDO -> SUPRIMIDO` esta admitida por el mismo REQ-140 / ARC-115: el despachador descubre que
+#: un aviso no es entregable (sin destinatario resoluble o con la composicion incompleta, motivos
+#: `NO_RECIPIENTS` y `COMPOSICION_INCOMPLETA` de `ck_aviso_correo_motivo_sup`) cuando YA lo ha tomado
+#: y la solicitud esta en `ENVIANDO`, de modo que ese es el camino que el motor recorre de verdad.
+#: Forzar el paso intermedio por `PENDIENTE` solo para suprimirla era un rodeo artificial. La base de
+#: datos no lo impide: la unica transicion que veta es salir de `ENVIADO` (trigger
+#: `trg_aviso_correo_estado_final`).
 TRANSICIONES_AUTOMATICAS: dict[EstadoAviso, frozenset[EstadoAviso]] = {
     EstadoAviso.PENDIENTE: frozenset({EstadoAviso.ENVIANDO, EstadoAviso.SUPRIMIDO}),
-    EstadoAviso.ENVIANDO: frozenset({EstadoAviso.ENVIADO, EstadoAviso.PENDIENTE, EstadoAviso.FALLIDO, EstadoAviso.DESCARTADO}),
+    EstadoAviso.ENVIANDO: frozenset(
+        {EstadoAviso.ENVIADO, EstadoAviso.PENDIENTE, EstadoAviso.FALLIDO, EstadoAviso.DESCARTADO, EstadoAviso.SUPRIMIDO}
+    ),
     EstadoAviso.ENVIADO: frozenset(),  # terminal, NO reactivable (REQ-142 regla 2)
     EstadoAviso.FALLIDO: frozenset(),  # sin reintento automatico (REQ-134 regla 5)
     EstadoAviso.DESCARTADO: frozenset(),  # sin reintento automatico (REQ-142 regla 4)

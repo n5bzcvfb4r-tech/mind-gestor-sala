@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -297,6 +298,23 @@ AVISOS_MOTOR = {
 
 # LOGGING
 # -------------------------------------------------------------
+class DatosPorDefectoLogFilter(logging.Filter):
+    """
+    Garantiza que todo registro de log lleve el campo `data` que exige el formateador `verbose`.
+
+    El formateador del proyecto incluye `%(data)s`, que solo esta presente cuando quien loguea
+    pasa `extra={"data": {...}}`. El codigo propio lo hace siempre, pero las librerias de
+    terceros (APScheduler, urllib3, oracledb...) no conocen esa convencion: sin este filtro,
+    cada linea que emiten provoca un `ValueError: Formatting field not found in record: 'data'`
+    y un volcado de `--- Logging error ---` a stderr que ensucia la salida del contenedor.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "data"):
+            record.data = {}
+        return True
+
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -306,10 +324,16 @@ LOGGING = {
             "()": "pythonjsonlogger.json.JsonFormatter",
         },
     },
+    "filters": {
+        # Rellena `data` en los registros que no lo traen, para que el formateador `verbose` no
+        # falle con las trazas de las librerias de terceros.
+        "datos_por_defecto": {"()": DatosPorDefectoLogFilter},
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose" if LOCAL_ENVIRONMENT else "json",
+            "filters": ["datos_por_defecto"],
         },
         'null': {'class': 'logging.NullHandler'},
     },
@@ -336,6 +360,14 @@ LOGGING = {
         "django.utils.autoreload": {
             "handlers": ["console" if DEBUG else "null"],
             "level": os.getenv("LOGGER_LEVEL", "DEBUG" if DEBUG else "INFO"),
+            "propagate": False,
+        },
+        # Planificador en proceso del motor de avisos (apps/avisos/motor/planificador.py). Se fija
+        # a INFO para que el detalle por tick ("Running job...") no inunde el log en DEBUG; el
+        # resultado de cada ciclo lo traza el propio motor con su formato estructurado.
+        "apscheduler": {
+            "handlers": ["console"],
+            "level": "INFO",
             "propagate": False,
         },
     },
