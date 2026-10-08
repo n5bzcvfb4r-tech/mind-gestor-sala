@@ -34,10 +34,10 @@ from __future__ import annotations
 import pytest
 from django.db import transaction
 
-from apps.avisos.alta.disparo import publicar_alta_incidencia
+from apps.avisos.alta.disparo import aviso_solicitado, publicar_alta_incidencia
 from apps.avisos.motor.claves import clave_aviso_alta
 from apps.avisos.motor.estados import EstadoAviso
-from apps.avisos.motor.outbox import TIPO_ALTA
+from apps.avisos.motor.outbox import TIPO_ALTA, TIPO_CAMBIO_ESTADO
 from apps.core.contexto import ContextoSesion, contexto_de_sesion
 from apps.core.models import (
     AvisoCorreoEntity,
@@ -332,4 +332,120 @@ def test_un_alta_revertida_no_deja_ninguna_solicitud_de_aviso(
     assert IncidenciaEntity.objects.filter(pk=incidencia.pk).exists(), (
         "la incidencia de apoyo se sembro FUERA del atomic revertido y debe seguir en Oracle: si no "
         "estuviera, el recuento de avisos valdria cero por el motivo equivocado"
+    )
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db(transaction=True)
+def test_AC_AVI_02_los_cambios_de_estado_posteriores_no_generan_una_nueva_solicitud(
+    esquema_aplicado: bool,
+) -> None:
+    """
+    [AC-AVI-02] «cambios de estado posteriores (en curso/resuelta/cerrada) no generan una nueva solicitud».
+
+    Una incidencia no se queda quieta en ABIERTA: recorre EN_CURSO, RESUELTA y CERRADA, y cada
+    transicion publica su propio evento por el MISMO canal interno `aviso_solicitado`, esta vez con
+    `notification_type = STATUS_CHANGE_ALERT`. Lo que se pone a prueba aqui es si el consumidor del
+    alta sabe quedarse al margen de esos eventos. Si no lo hiciera, cada paso del ciclo de vida
+    encolaria OTRO `NEW_INCIDENT_ALERT` de la misma incidencia: el equipo de mantenimiento recibiria
+    cuatro correos anunciando un alta que ocurrio una sola vez, y la promesa de AC-AVI-01
+    («exactamente una solicitud por incidencia») quedaria rota por la puerta de atras.
+
+    Los tres eventos se publican enviando la señal directamente, que es la cara de publicacion
+    generica del canal: `publicar_alta_incidencia` solo sabe publicar altas (fija `TIPO_ALTA` y
+    `history_entry_id=None`), de modo que no sirve para hacer de productor de los cambios de estado.
+    Cada transicion viaja con su propio `history_entry_id`, como haria el asiento de historico real.
+
+    Oraculo: la tabla `aviso_correo` del Oracle del contenedor, RELEIDA despues de los tres eventos.
+    No basta con mirar el `ResultadoDisparo` devuelto -un consumidor roto podria devolver
+    `ignorado=True` y haber insertado igualmente-, por eso se comprueba contra la base que (a) sigue
+    habiendo UNA sola fila `NEW_INCIDENT_ALERT`, y que es LA MISMA de antes (misma `notification_key`
+    y mismo `notification_id`: ni se duplico ni se reemplazo), y (b) hay CERO filas
+    `STATUS_CHANGE_ALERT`, porque esas las encola `encolar_aviso_cambio_estado` con su propia clave
+    por asiento de historial y no este consumidor.
+    """
+
+    assert esquema_aplicado
+
+    actor = _sembrar_actor("ac-avi-02")
+    with contexto_de_sesion(_contexto_de(actor, "77777777-7777-4777-8777-777777777777")):
+        incidencia = _sembrar_incidencia("INC-DISPARO-ALTA-03")
+
+    clave_esperada = clave_aviso_alta(incidencia.incident_id)
+
+    # --- Precondicion: el alta ya esta publicada y consumida -----------------------
+    respuestas_alta = publicar_alta_incidencia(incident_id=incidencia.incident_id)
+    resultado_alta = respuestas_alta[0][1]
+    assert resultado_alta.creado is True, (
+        f"la precondicion exige que el alta deje su solicitud encolada; creado={resultado_alta.creado} "
+        f"con motivo {resultado_alta.motivo!r}"
+    )
+
+    alta_encolada = AvisoCorreoEntity.objects.get(notification_key=clave_esperada)
+    notification_id_original = alta_encolada.notification_id
+
+    # --- Las transiciones posteriores publican por el MISMO canal ------------------
+    transiciones = (
+        ("ABIERTA->EN_CURSO", 9001),
+        ("EN_CURSO->RESUELTA", 9002),
+        ("RESUELTA->CERRADA", 9003),
+    )
+    for etiqueta, history_entry_id in transiciones:
+        respuestas = aviso_solicitado.send(
+            sender=None,
+            notification_type=TIPO_CAMBIO_ESTADO,
+            incident_id=incidencia.incident_id,
+            history_entry_id=history_entry_id,
+        )
+        assert len(respuestas) == 1, (
+            f"el evento de la transicion {etiqueta} debe entregarse a UN unico receptor; respondieron {len(respuestas)}"
+        )
+
+        resultado = respuestas[0][1]
+        assert resultado.ignorado is True, (
+            f"el consumidor de alta debe IGNORAR el evento {TIPO_CAMBIO_ESTADO} de la transicion {etiqueta}; "
+            f"devolvio ignorado={resultado.ignorado}"
+        )
+        assert resultado.creado is False, (
+            f"la transicion {etiqueta} no puede crear ninguna solicitud de alta; creado={resultado.creado}"
+        )
+        assert resultado.notification_key is None, (
+            f"un evento ignorado no lleva clave de aviso asociada; en {etiqueta} llego {resultado.notification_key!r}"
+        )
+        assert resultado.motivo, (
+            f"el consumidor debe explicar POR QUE ignora el evento de la transicion {etiqueta}; "
+            f"motivo={resultado.motivo!r}"
+        )
+
+    # --- Oraculo: lo que quedo en Oracle tras las tres transiciones ----------------
+    altas = AvisoCorreoEntity.objects.filter(
+        incident_id=incidencia.incident_id,
+        notification_type=TIPO_ALTA,
+    ).count()
+    assert altas == 1, (
+        "tras las tres transiciones de estado debe seguir habiendo EXACTAMENTE una solicitud "
+        f"{TIPO_ALTA} en aviso_correo para esa incidencia (AC-AVI-02); en Oracle hay {altas}"
+    )
+
+    alta_releida = AvisoCorreoEntity.objects.get(
+        incident_id=incidencia.incident_id,
+        notification_type=TIPO_ALTA,
+    )
+    assert alta_releida.notification_key == clave_esperada, (
+        f"la unica solicitud de alta debe conservar la clave {clave_esperada!r}; en Oracle vale "
+        f"{alta_releida.notification_key!r}"
+    )
+    assert alta_releida.notification_id == notification_id_original, (
+        "los cambios de estado no pueden reemplazar la solicitud de alta: se encolo con "
+        f"notification_id={notification_id_original} y ahora en Oracle vale {alta_releida.notification_id}"
+    )
+
+    cambios_de_estado = AvisoCorreoEntity.objects.filter(
+        incident_id=incidencia.incident_id,
+        notification_type=TIPO_CAMBIO_ESTADO,
+    ).count()
+    assert cambios_de_estado == 0, (
+        f"el consumidor del alta no encola nada por los eventos {TIPO_CAMBIO_ESTADO} (de eso se ocupa "
+        f"encolar_aviso_cambio_estado con su clave por asiento de historial); en Oracle hay "
+        f"{cambios_de_estado} filas"
     )
