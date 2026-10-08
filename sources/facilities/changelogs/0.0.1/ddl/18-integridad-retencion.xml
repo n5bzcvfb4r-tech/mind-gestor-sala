@@ -961,4 +961,379 @@ END;]]></sql>
         <rollback><!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir --></rollback>
     </changeSet>
 
+    <changeSet id="ddl-0.0.1-18-09" author="MIND">
+        <comment>Oraculo AC-G-07 / AC-G-09 / AC-TRZ-04: registros de 23 meses intactos y consultables, sin job de purga y sin borrado fisico</comment>
+        <!--
+            Este changeset es el ORACULO DE COMPORTAMIENTO de la ventana de retencion. No crea ni
+            altera ningun objeto: siembra un juego COMPLETO de registros fechados 23 MESES ATRAS en
+            las seis tablas de historico del esquema (incidencia_historico, usuario_historico,
+            usuario_password_historico, auditoria_acceso, aviso_correo_intento y
+            resolucion_destinatario_log) y demuestra, contra el motor Oracle real y durante el propio
+            despliegue, que siguen INTACTOS y CONSULTABLES dentro de la ventana de retencion de 2
+            anios que exigen REQ-015, REQ-065 y REQ-077. Si algo hubiera desaparecido o se hubiera
+            alterado, el bloque lanza RAISE_APPLICATION_ERROR y el despliegue entero falla.
+
+            POR QUE ADD_MONTHS Y NO INTERVAL '23' MONTH
+            ===========================================
+            La antiguedad se calcula con ADD_MONTHS y NO con aritmetica de intervalos. Restar
+            INTERVAL '23' MONTH falla con ORA-01839 ("date not valid for month specified") cuando el
+            dia de origen no existe en el mes destino: basta con desplegar un dia 31 para que el
+            oraculo reviente por una razon ajena a lo que pretende comprobar. ADD_MONTHS, en cambio,
+            ajusta al ULTIMO DIA del mes destino y es siempre valido, cualquiera que sea el dia en
+            que se ejecute el despliegue.
+
+            UNA EXCEPCION HONESTA: auditoria_acceso
+            =======================================
+            auditoria_acceso NO admite una marca temporal del cliente, porque
+            trg_auditoria_acceso_servidor sella occurred_at con la HORA DEL SERVIDOR en cada INSERT.
+            Es una decision deliberada de REQ-065 (la marca temporal la fija el servidor, nunca el
+            cliente) y por eso una entrada de auditoria de 23 meses de antiguedad sencillamente NO SE
+            PUEDE FABRICAR desde aqui: el trigger la sobreescribiria. Lo que el oraculo demuestra
+            sobre esa tabla es lo equivalente y comprobable: que la fila es consultable, que su
+            retention_until derivada cubre mas de 23 meses POR DELANTE, y que es inmutable.
+
+            LA UNICA ELIMINACION AUTOMATICA DEL ESQUEMA NO ES UNA PURGA POR ANTIGUEDAD
+            =========================================================================
+            En todo el esquema solo existe una eliminacion automatica de filas: la de
+            trg_usuario_pwd_hist_purga, que acota a TRES las contrasenias anteriores guardadas por
+            usuario para impedir su reutilizacion. NO es una purga por antiguedad: no mira fechas,
+            solo cuantas contrasenias previas conserva cada cuenta. El oraculo lo demuestra
+            comprobando al FINAL del escenario que la entrada de 23 meses de usuario_password_historico
+            sigue ahi.
+
+            AC-G-09: NINGUN JOB PROGRAMADO
+            ==============================
+            El oraculo comprueba que user_scheduler_jobs esta VACIA: el esquema no declara ningun job
+            programado, de modo que no existe ninguna purga automatica de datos (AC-G-09).
+
+            EL BORRADO FISICO ESTA CERRADO EN LAS DOS DIRECCIONES
+            ====================================================
+            Por un lado, los triggers de inmutabilidad rechazan el DELETE sobre las tablas de
+            historico incluso cuando quien lo intenta es el DUENO DEL ESQUEMA, que es precisamente
+            quien ejecuta este bloque: ORA-20001 a ORA-20005 segun la tabla. Por otro, las claves
+            ajenas impiden borrar al usuario del que cuelga ese historico (ORA-02292). La tercera
+            barrera, el ORA-01031 que recibe el usuario de aplicacion por no tener concedido el
+            privilegio DELETE, la demuestra el oraculo dcl-0.0.1-18-06 del changelog dcl, que es
+            donde vive ese usuario.
+
+            NI UNA FILA RESIDUAL Y NI UNA SENTENCIA DDL
+            ==========================================
+            El bloque DESHACE SUS PROPIOS DATOS con un ROLLBACK final, y el manejador WHEN OTHERS lo
+            repite antes de relanzar el error para que tampoco un fallo deje basura detras. El bloque
+            entero viaja como una UNICA sentencia JDBC (de ahi splitStatements="false") y NO contiene
+            NINGUNA sentencia DDL: cualquier DDL provocaria un COMMIT IMPLICITO, el ROLLBACK final ya
+            no tendria nada que deshacer y los datos del oraculo quedarian grabados de forma
+            permanente. Los catalogos de clave fija se siembran por MERGE (o por un SELECT que cae a
+            INSERT si no existen) porque los changelogs dml se aplican DESPUES de los ddl: cuando
+            este oraculo corre, los catalogos pueden estar todavia vacios.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin      NUMBER;
+    v_usuario    NUMBER;
+    v_oficina    NUMBER;
+    v_sala       NUMBER;
+    v_categoria  NUMBER;
+    v_inc        NUMBER;
+    v_aviso      VARCHAR2(36 CHAR);
+    v_audit      VARCHAR2(36 CHAR);
+    v_hash       VARCHAR2(64 CHAR);
+    v_leido      VARCHAR2(64 CHAR);
+    v_n          NUMBER;
+    v_sqlcode    NUMBER;
+    v_viejo      TIMESTAMP;
+    v_corte      TIMESTAMP;
+
+    c_admin_nom   CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Retencion Administrador';
+    c_usuario_nom CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Retencion Empleado';
+    c_descripcion CONSTANT VARCHAR2(500 CHAR) := 'Incidencia del oraculo TSK-061 fechada 23 meses atras para verificar la ventana de retencion';
+    c_pwd_hash    CONSTANT VARCHAR2(255 CHAR) := 'hash-oraculo-tsk061-retencion-anterior';
+
+    FUNCTION uuid RETURN VARCHAR2 IS
+        l_uuid VARCHAR2(36 CHAR);
+    BEGIN
+        SELECT LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5'))
+          INTO l_uuid FROM dual;
+        RETURN l_uuid;
+    END uuid;
+
+    FUNCTION huella(p_semilla VARCHAR2) RETURN VARCHAR2 IS
+        l_hash VARCHAR2(64 CHAR);
+    BEGIN
+        SELECT RAWTOHEX(STANDARD_HASH(p_semilla, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA61';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA61', 'Oficina del oraculo TSK-061', 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA61-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA61-SALA-01', 'Sala del oraculo TSK-061', p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', 'Climatizacion oraculo TSK-061', 961, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    PROCEDURE exigir_una(p_filas NUMBER, p_codigo NUMBER, p_tabla VARCHAR2) IS
+    BEGIN
+        IF p_filas <> 1 THEN
+            RAISE_APPLICATION_ERROR(p_codigo, 'ORACULO AC-G-07 / AC-TRZ-04: la tabla ' || p_tabla ||
+                ' deberia conservar 1 registro de 23 meses de antiguedad intacto y consultable, y devuelve ' || p_filas);
+        END IF;
+    END exigir_una;
+
+    PROCEDURE exigir_sqlcode(p_obtenido NUMBER, p_esperado NUMBER, p_codigo NUMBER, p_caso VARCHAR2) IS
+    BEGIN
+        IF p_obtenido <> p_esperado THEN
+            RAISE_APPLICATION_ERROR(p_codigo, 'ORACULO REQ-047: ' || p_caso || ' deberia fallar con SQLCODE ' ||
+                p_esperado || ' y el obtenido ha sido ' || p_obtenido);
+        END IF;
+    END exigir_sqlcode;
+BEGIN
+    v_viejo := CAST(ADD_MONTHS(CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE), -23) AS TIMESTAMP);
+    v_corte := CAST(ADD_MONTHS(CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE), -22) AS TIMESTAMP);
+
+    sembrar_rol('EMPLEADO', 'Empleado', 911);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 913);
+    sembrar_estado('ABIERTA', 'Abierta', 1, 'N');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk061.retencion.admin@example.invalid',
+                 'oraculo.tsk061.retencion.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk061-retencion-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_usuario_nom, 'oraculo.tsk061.retencion@example.invalid',
+                 'oraculo.tsk061.retencion', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk061-retencion', 'argon2id', v_viejo, v_admin)
+      RETURNING user_id INTO v_usuario;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at, status_changed_at)
+         VALUES ('INC-ORA61-000021', v_sala, v_categoria,
+                 'Sala del oraculo TSK-061', 'Oficina del oraculo TSK-061', 'Climatizacion oraculo TSK-061',
+                 c_descripcion, 'ABIERTA', v_usuario, v_viejo, v_viejo)
+      RETURNING incident_id INTO v_inc;
+
+    -- (1) incidencia_historico: asiento de alta de hace 23 meses.
+    v_hash := huella('ORA61|RETENCION|0');
+    INSERT INTO incidencia_historico (incident_id, entry_type, from_status, to_status,
+                                      actor_user_id, actor_display_name, changed_at,
+                                      previous_entry_hash, entry_hash)
+         VALUES (v_inc, 'CREACION', NULL, 'ABIERTA',
+                 v_usuario, c_usuario_nom, v_viejo,
+                 NULL, v_hash);
+
+    -- (2) usuario_historico: asiento de alta de la cuenta, de hace 23 meses.
+    INSERT INTO usuario_historico (user_id, change_type, new_status, changed_by, valid_from, changed_at)
+         VALUES (v_usuario, 'ESTADO', 'ACTIVO', v_admin, v_viejo, v_viejo);
+
+    -- (3) usuario_password_historico: contrasenia anterior retirada hace 23 meses.
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+         VALUES (v_usuario, c_pwd_hash, v_viejo);
+
+    -- (4) auditoria_acceso: trg_auditoria_acceso_servidor sella occurred_at con la hora del
+    --     servidor, de modo que esta entrada NO puede fecharse 23 meses atras. Lo que se verifica
+    --     mas abajo es su ventana de retencion declarada y su inmutabilidad.
+    INSERT INTO auditoria_acceso (user_id, event_type, outcome, operation)
+         VALUES (v_usuario, 'login_ok', 'OK', 'ORACULO-TSK-061')
+      RETURNING audit_id INTO v_audit;
+
+    -- (5) aviso_correo y (6) aviso_correo_intento: entrega registrada hace 23 meses.
+    v_aviso := uuid;
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, status, created_at)
+         VALUES (v_aviso, 'ORACULO-TSK-061-RETENCION-' || v_usuario, 'CREDENTIAL_ISSUED',
+                 v_usuario, 'oraculo.tsk061.retencion@example.invalid',
+                 'Credenciales de acceso', 'PENDIENTE', v_viejo);
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, attempt_number, attempted_at,
+                                      result_code, recipient_count, message_id)
+         VALUES (uuid, v_aviso, 1, v_viejo,
+                 'SENT', 1, 'oraculo-tsk061-retencion@example.invalid');
+
+    -- (7) resolucion_destinatario_log: resolucion de destinatarios de hace 23 meses.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id,
+                                             resolved_user_ids, recipient_count, is_fallback_used,
+                                             outcome, resolved_at)
+         VALUES ('INDIVIDUAL', 'ORACULO-TSK-061', v_usuario,
+                 '[' || v_usuario || ']', 1, 'N',
+                 'OK', v_viejo);
+
+    -- ------------------------------------------------------------------------------
+    -- AC-G-07 / AC-TRZ-04: los registros de 23 meses siguen ahi, intactos y legibles
+    -- ------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_n FROM incidencia
+     WHERE incident_id = v_inc AND created_at <= v_corte;
+    exigir_una(v_n, -20720, 'incidencia');
+
+    SELECT COUNT(*) INTO v_n FROM incidencia_historico
+     WHERE incident_id = v_inc AND changed_at <= v_corte;
+    exigir_una(v_n, -20721, 'incidencia_historico');
+
+    SELECT COUNT(*) INTO v_n FROM usuario_historico
+     WHERE user_id = v_usuario AND changed_at <= v_corte;
+    exigir_una(v_n, -20722, 'usuario_historico');
+
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND created_at <= v_corte;
+    exigir_una(v_n, -20723, 'usuario_password_historico');
+
+    SELECT COUNT(*) INTO v_n FROM aviso_correo_intento
+     WHERE notification_id = v_aviso AND attempted_at <= v_corte;
+    exigir_una(v_n, -20724, 'aviso_correo_intento');
+
+    SELECT COUNT(*) INTO v_n FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_usuario AND resolved_at <= v_corte;
+    exigir_una(v_n, -20725, 'resolucion_destinatario_log');
+
+    -- auditoria_acceso: entrada consultable y con una ventana de retencion que cubre 23 meses.
+    SELECT COUNT(*) INTO v_n FROM auditoria_acceso
+     WHERE audit_id = v_audit AND retention_until >= ADD_MONTHS(TRUNC(SYSDATE), 23);
+    exigir_una(v_n, -20726, 'auditoria_acceso');
+
+    -- El contenido no ha sido alterado: la huella almacenada es la que se escribio.
+    SELECT entry_hash INTO v_leido FROM incidencia_historico WHERE incident_id = v_inc;
+    IF v_leido <> v_hash THEN
+        RAISE_APPLICATION_ERROR(-20727, 'ORACULO AC-TRZ-04: el entry_hash del asiento de 23 meses ha cambiado');
+    END IF;
+
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND password_hash = c_pwd_hash;
+    exigir_una(v_n, -20728, 'usuario_password_historico (contenido intacto)');
+
+    -- ------------------------------------------------------------------
+    -- AC-G-09: el esquema no declara ningun job programado de purga
+    -- ------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_n FROM user_scheduler_jobs;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20730, 'ORACULO AC-G-09: el esquema declara ' || v_n ||
+            ' jobs programados y no debe existir ninguna purga automatica de datos');
+    END IF;
+
+    -- ------------------------------------------------------------------
+    -- REQ-047: sin borrado fisico, ni siquiera para el dueno del esquema
+    -- ------------------------------------------------------------------
+    BEGIN
+        DELETE FROM incidencia_historico WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20002, -20731, 'borrar una entrada de incidencia_historico');
+
+    BEGIN
+        DELETE FROM auditoria_acceso WHERE audit_id = v_audit;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20003, -20732, 'borrar una entrada de auditoria_acceso');
+
+    BEGIN
+        DELETE FROM usuario_historico WHERE user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20001, -20733, 'borrar una entrada de usuario_historico');
+
+    BEGIN
+        DELETE FROM aviso_correo_intento WHERE notification_id = v_aviso;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20004, -20734, 'borrar una entrada de aviso_correo_intento');
+
+    BEGIN
+        DELETE FROM resolucion_destinatario_log WHERE subject_user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20005, -20735, 'borrar una entrada de resolucion_destinatario_log');
+
+    BEGIN
+        DELETE FROM usuario WHERE user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -2292, -20736, 'borrar fisicamente un usuario con historico');
+
+    -- La unica eliminacion automatica del esquema acota a tres las contrasenias anteriores por
+    -- usuario (reutilizacion), no purga por antiguedad: la entrada de 23 meses sigue ahi.
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND created_at <= v_corte;
+    exigir_una(v_n, -20737, 'usuario_password_historico (supervivencia final)');
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback><!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir --></rollback>
+    </changeSet>
+
 </databaseChangeLog>
