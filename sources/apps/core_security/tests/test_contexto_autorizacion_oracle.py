@@ -23,11 +23,21 @@ from uuid import uuid4
 
 import pytest
 from django.contrib.auth.hashers import make_password
+from django.db import connections
 from django.http import HttpResponse
 from django.test import RequestFactory
 
 from apps.core.contexto import ContextoSesion, utc_now
-from apps.core.models import RolEntity, SesionUsuarioEntity, UsuarioEntity
+from apps.core.middleware import ContextoSesionMiddleware
+from apps.core.models import (
+    CategoriaIncidenciaEntity,
+    EstadoIncidenciaEntity,
+    IncidenciaEntity,
+    RolEntity,
+    SalaEntity,
+    SesionUsuarioEntity,
+    UsuarioEntity,
+)
 from apps.core_security.errores import PermisoDenegadoError
 from apps.core_security.middleware import SesionRequeridaMiddleware
 from apps.core_security.servicios.contexto import identidad_suministrada_por_el_cliente
@@ -119,6 +129,34 @@ def resolver_por_http(credencial, *, parametros=None, cuerpo=None, cabeceras=Non
     middleware = SesionRequeridaMiddleware(lambda _peticion: HttpResponse(status=204))
     respuesta = middleware(request)
     return request, respuesta
+
+
+def ejecutar_con_contexto_publicado(credencial: str, accion, *, cuerpo=None):
+    """Ejecuta `accion()` dentro de la cadena REAL de middlewares, con el contexto publicado.
+
+    El orden es el de `settings.MIDDLEWARE`: `SesionRequeridaMiddleware` resuelve la sesion y
+    el rol, y `ContextoSesionMiddleware` publica el contexto en el `ContextVar` del nucleo,
+    que es de donde lo lee `AtribucionMixin`. Devuelve `(request, respuesta, resultado)`.
+    """
+
+    capturado: dict = {}
+
+    def _responder(peticion):
+        capturado["request"] = peticion
+        capturado["resultado"] = accion()
+        return HttpResponse(status=204)
+
+    interno = ContextoSesionMiddleware(_responder)
+    guardia = SesionRequeridaMiddleware(interno)
+
+    request = RequestFactory().post(
+        RUTA_PROTEGIDA,
+        data=json.dumps(cuerpo or {}),
+        content_type="application/json",
+        **cabecera_bearer(credencial),
+    )
+    respuesta = guardia(request)
+    return capturado.get("request", request), respuesta, capturado.get("resultado")
 
 
 def test_los_literales_de_catalogo_de_esta_suite_no_estan_vacios() -> None:
@@ -286,3 +324,90 @@ def test_AC_PERM_05_el_cambio_de_rol_surte_efecto_en_la_siguiente_peticion_sin_r
         ServicioPermisos().alcance_de(contexto_3, OPERACION_LISTADO_COMPLETO)
     assert excinfo.value.codigo == CODIGO_PERMISO_DENEGADO, "sin ventana de privilegio residual tras la degradacion"
     assert excinfo.value.http_status == 403, "sin ventana de privilegio residual tras la degradacion"
+
+
+@SALTAR_SIN_DOCKER
+def test_AC_TRZ_01_la_atribucion_sale_del_usuario_de_la_sesion_y_no_del_user_id_del_cuerpo(
+    usuario_activo: UsuarioEntity, sesion_vigente: SesionUsuarioEntity
+) -> None:
+    """
+    [AC-TRZ-01] Una incidencia dada de alta con un reported_by ajeno en el cuerpo se persiste en
+    Oracle atribuida al usuario de la SESION.
+
+    Complementa la prueba unitaria del mixin en `apps/core/tests/test_atribucion.py` ejercitando
+    la cadena completa: resolucion del contexto desde BASE DE DATOS (`SesionRequeridaMiddleware`),
+    publicacion en el `ContextVar` del nucleo (`ContextoSesionMiddleware`) y escritura real. El
+    oraculo NO es un objeto en memoria: es la fila releida de `incidencia` con SQL crudo.
+    """
+
+    # --- Arrange ---
+    ajeno = sembrar_usuario(ROL_TECNICO, "trz-ajeno")
+    assert ajeno.user_id != usuario_activo.user_id, "el usuario ajeno debe ser otra fila real de la base"
+
+    # Prerrequisitos de catalogo SEMBRADOS por Liquibase (ARC-016): se LEEN de la base, no se
+    # inventan. Si faltasen, la prueba falla a proposito: seria un defecto real de las semillas.
+    sala = SalaEntity.objects.filter(is_active="Y").select_related("office").first()
+    assert sala is not None, "cat_sala no tiene ninguna sala activa sembrada"
+    categoria = CategoriaIncidenciaEntity.objects.filter(is_active="Y").first()
+    assert categoria is not None, "cat_categoria_incidencia no tiene ninguna categoria activa sembrada"
+    estado_abierta = EstadoIncidenciaEntity.objects.get(pk="ABIERTA")
+
+    referencia = f"INC-TRZ01-{uuid4().hex[:6].upper()}"
+
+    # El cuerpo que envia el cliente, con la identidad suplantada.
+    cuerpo = {"user_id": ajeno.user_id, "reported_by": ajeno.user_id, "role": ROL_TECNICO}
+
+    # --- Act ---
+    def dar_de_alta() -> IncidenciaEntity:
+        incidencia = IncidenciaEntity(
+            reference_code=referencia,
+            room=sala,
+            category=categoria,
+            room_name_snapshot=sala.room_name,
+            office_name_snapshot=sala.office.office_name,
+            category_name_snapshot=categoria.category_name,
+            description="Proyector sin senal durante la prueba de trazabilidad AC-TRZ-01",
+            status=estado_abierta,
+            # El cliente intenta imponer el reportante: `AtribucionMixin.aplicar_atribucion()`
+            # SOBRESCRIBE este valor con el actor del contexto de sesion (REQ-064).
+            reported_by_id=ajeno.user_id,
+        )
+        incidencia.save()
+        return incidencia
+
+    request, respuesta, incidencia = ejecutar_con_contexto_publicado(
+        sesion_vigente.session_id, dar_de_alta, cuerpo=cuerpo
+    )
+
+    # --- Assert ---
+    assert respuesta.status_code == 204, (
+        f"la accion registrable debe atenderse con normalidad y no responder {respuesta.status_code}"
+    )
+    assert request.contexto_sesion.user_id == usuario_activo.user_id, (
+        "la identidad del contexto sale de la fila de sesion, nunca del cuerpo (REQ-064)"
+    )
+
+    assert incidencia.incident_id is not None, "incident_id es IDENTITY: lo genera Oracle, no el test"
+
+    # Oraculo: la FILA persistida, releida con SQL crudo, sin pasar por el ORM ni por sus caches.
+    with connections["default"].cursor() as cursor:
+        cursor.execute("SELECT reported_by FROM incidencia WHERE incident_id = %s", [incidencia.incident_id])
+        fila = cursor.fetchone()
+
+    assert fila is not None, f"la incidencia {referencia} no se ha persistido en Oracle"
+    assert fila[0] == usuario_activo.user_id, (
+        "el reportante persistido es el usuario de la SESION (REQ-064, AC-TRZ-01)"
+    )
+    assert fila[0] != ajeno.user_id, "el user_id del cuerpo no llega jamas a la columna de atribucion"
+
+    # Relectura por el ORM: el dato de dominio coincide con el de la columna fisica.
+    incidencia_releida = IncidenciaEntity.objects.get(pk=incidencia.incident_id)
+    assert incidencia_releida.reported_by_id == usuario_activo.user_id, (
+        "la incidencia queda atribuida al usuario identificado en la sesion"
+    )
+    assert incidencia_releida.reference_code == referencia
+
+    # El contexto que decidio la atribucion traia el rol LEIDO de base, no el enviado en el cuerpo.
+    assert request.contexto_sesion.role_code == usuario_activo.role_code_id, (
+        "el rol del contexto se relee de la tabla usuario; el role del cuerpo se descarta (REQ-018)"
+    )
