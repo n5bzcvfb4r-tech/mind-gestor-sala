@@ -68,6 +68,20 @@ class AvisosConfig(AppConfig):
     verbose_name = "Avisos por correo"
 
     def ready(self) -> None:
+        # COMPOSITION ROOT del consumidor del evento de alta (ARC-014, canal
+        # `facilities.avisos.solicitado.v1`). Se conecta SIEMPRE, tambien bajo pytest y bajo los
+        # comandos de gestion, y a proposito: el consumidor no es un hilo de fondo, es parte del
+        # camino sincrono del alta de incidencia. Si solo se conectase en el proceso servidor, un
+        # alta ejecutada desde un comando o desde una prueba se confirmaria SIN su solicitud de
+        # aviso, que es justo el fallo que el patron outbox existe para impedir. Conectar es
+        # ademas idempotente: `conectar_disparo_alta` registra el receptor con `dispatch_uid`.
+        #
+        # Import PEREZOSO, por el mismo motivo que el del planificador: a nivel de modulo, `apps.py`
+        # se importa antes de que el registro de apps este listo.
+        from apps.avisos.alta.disparo import conectar_disparo_alta
+
+        conectar_disparo_alta()
+
         if not _es_proceso_servidor():
             logger.info(TRAZA_OMITIDO, extra={"data": {"argv": sys.argv[1:2]}})
             return
