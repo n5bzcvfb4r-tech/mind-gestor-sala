@@ -133,7 +133,9 @@ class UsuarioHistoricoEntity(AtribucionMixin, RegistroInmutableMixin, models.Mod
         db_column="changed_by",
         related_name="historicos_rol_estado_registrados",
     )
-    changed_at = models.DateTimeField(db_column="changed_at")
+    # El DDL trae DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), pero Oracle solo lo aplica si la columna
+    # se omite de la sentencia: Django siempre la nombra, asi que el sello va tambien en Python.
+    changed_at = models.DateTimeField(db_column="changed_at", default=utc_now)
 
     # Columnas VIRTUALES del DDL (solo lectura, fuera del INSERT).
     event_type = models.GeneratedField(
@@ -328,7 +330,9 @@ class IncidenciaHistoricoEntity(AtribucionMixin, RegistroInmutableMixin, models.
     )
     # Instantanea del nombre: conserva la atribucion aunque el actor se desactive despues.
     actor_display_name = models.CharField(max_length=150, db_column="actor_display_name")
-    changed_at = models.DateTimeField(db_column="changed_at")
+    # El DDL trae DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP), pero Oracle solo lo aplica si la columna
+    # se omite de la sentencia: Django siempre la nombra, asi que el sello va tambien en Python.
+    changed_at = models.DateTimeField(db_column="changed_at", default=utc_now)
     entry_comment = models.CharField(max_length=500, db_column="entry_comment", null=True, blank=True)
     resolution_comment_ref = models.ForeignKey(
         "core.IncidenciaEntity",

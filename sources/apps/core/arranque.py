@@ -11,7 +11,7 @@ import logging
 from django.conf import settings
 
 from apps.core.catalogos import CATALOGOS_OBLIGATORIOS, catalogos_vacios
-from apps.core.errores import CatalogosVaciosError
+from apps.core.errores import CatalogosVaciosError, VerificacionCatalogosError
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ def verificar_catalogos_al_arranque(*, forzar: bool = False) -> None:
 
     Raises:
         CatalogosVaciosError: si alguno de los catalogos obligatorios no tiene ninguna fila.
+        VerificacionCatalogosError: si la base de datos no responde y no se puede verificar.
     """
 
     if not settings.VERIFICAR_CATALOGOS_AL_ARRANQUE and not forzar:
@@ -36,7 +37,15 @@ def verificar_catalogos_al_arranque(*, forzar: bool = False) -> None:
         )
         return
 
-    vacios = catalogos_vacios()
+    try:
+        vacios = catalogos_vacios()
+    except Exception as error:  # BBDD inalcanzable, esquema ausente o configuracion incompleta
+        logger.error(
+            "Arranque abortado: no se ha podido consultar el estado de los catalogos maestros.",
+            extra={"data": {"detalle": str(error)}},
+        )
+        raise VerificacionCatalogosError(str(error)) from error
+
     if vacios:
         logger.error(
             "Arranque abortado: hay catalogos maestros sin semillas.",

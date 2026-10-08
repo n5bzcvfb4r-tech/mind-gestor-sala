@@ -37,6 +37,19 @@ class ContextoSesionNoDisponibleError(ErrorDominio):
         super().__init__(mensaje)
 
 
+class VerificacionCatalogosError(ErrorDominio):
+    """
+    La verificacion de catalogos no se ha podido completar (BBDD inalcanzable, esquema ausente...).
+
+    Es distinta de `CatalogosVaciosError`: alli los catalogos se leyeron y estaban vacios; aqui ni
+    siquiera se pudieron leer. En ambos casos el proceso servidor aborta el arranque.
+    """
+
+    def __init__(self, detalle: str) -> None:
+        self.detalle = detalle
+        super().__init__(mensajes.ERROR_VERIFICANDO_CATALOGOS.format(detalle=detalle))
+
+
 class CatalogosVaciosError(ErrorDominio):
     """Faltan semillas de catalogos maestros: el proceso servidor no debe arrancar."""
 

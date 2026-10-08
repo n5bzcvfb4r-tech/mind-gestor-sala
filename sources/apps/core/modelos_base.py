@@ -113,9 +113,25 @@ class AtribucionMixin(models.Model):
         """
         Sobrescribe los campos de atribucion con el actor del contexto y la hora del servidor.
 
-        En alta se informan actor y fecha de alta; los campos de modificacion solo se refrescan
-        si el modelo los declara y ya venian informados (no se inventan en el INSERT).
-        En modificacion se informan actor y fecha de modificacion, y NO se tocan los de alta.
+        La atribucion sale SIEMPRE del contexto de sesion (REQ-048, REQ-064) y NUNCA del
+        payload: el `user_id` que llegue en los datos de entrada se ignora, y las marcas
+        temporales se toman de `utc_now()`.
+
+        En ALTA:
+
+        * si el modelo declara el campo de actor de alta, se fija con el actor de sesion;
+        * si NO lo declara pero si declara el de actor de modificacion, se fija ESTE ultimo
+          con el actor de sesion: esa columna es la unica atribucion que la tabla tiene y en
+          un alta debe quedar sellada (hay tablas, como `configuracion_smtp`, cuyo
+          `updated_by` es NOT NULL y que no tienen `created_by`, asi que dejarlo vacio
+          reventaria el INSERT);
+        * si el campo de actor de modificacion esta declarado y ya venia informado, se
+          refresca igualmente.
+
+        La misma regla, termino a termino, se aplica a la pareja de fechas (alta y
+        modificacion). Los campos que el modelo no declara se ignoran sin error.
+
+        En MODIFICACION se informan actor y fecha de modificacion, y NO se tocan los de alta.
         """
 
         contexto = contexto_requerido()
@@ -127,9 +143,11 @@ class AtribucionMixin(models.Model):
         if alta:
             self._fijar_campo(self.CAMPO_ACTOR_ALTA, actor, nombres)
             self._fijar_campo(self.CAMPO_FECHA_ALTA, ahora, nombres)
-            if self._valor_actual(self.CAMPO_ACTOR_MODIFICACION, nombres) is not None:
+            sin_actor_de_alta = not {self.CAMPO_ACTOR_ALTA, f"{self.CAMPO_ACTOR_ALTA}_id"} & nombres
+            sin_fecha_de_alta = not {self.CAMPO_FECHA_ALTA, f"{self.CAMPO_FECHA_ALTA}_id"} & nombres
+            if sin_actor_de_alta or self._valor_actual(self.CAMPO_ACTOR_MODIFICACION, nombres) is not None:
                 self._fijar_campo(self.CAMPO_ACTOR_MODIFICACION, actor, nombres)
-            if self._valor_actual(self.CAMPO_FECHA_MODIFICACION, nombres) is not None:
+            if sin_fecha_de_alta or self._valor_actual(self.CAMPO_FECHA_MODIFICACION, nombres) is not None:
                 self._fijar_campo(self.CAMPO_FECHA_MODIFICACION, ahora, nombres)
             return
 
