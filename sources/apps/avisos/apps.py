@@ -65,7 +65,7 @@ def _es_proceso_servidor() -> bool:
 
 class AvisosConfig(AppConfig):
     name = "apps.avisos"
-    verbose_name = "Motor de avisos por correo"
+    verbose_name = "Avisos por correo"
 
     def ready(self) -> None:
         if not _es_proceso_servidor():

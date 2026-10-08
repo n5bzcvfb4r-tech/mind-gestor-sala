@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 from pathlib import Path
 
@@ -116,12 +115,13 @@ THIRD_PARTY_APPS = [
 
 LOCAL_APPS = [
     "apps.core",
+    "apps.core_security",
     "apps.identidad",
     "apps.usuarios",
     "apps.catalogos",
     "apps.incidencias",
-    "apps.ciclo_vida",
     "apps.avisos",
+    "apps.ciclo_vida",
     "apps.trazabilidad",
 ]
 
@@ -135,6 +135,9 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Guardia de sesion (ARC-012): protegido por defecto. Va ANTES del publicador de
+    # contexto porque es quien resuelve la sesion y deja `request.contexto_sesion`.
+    "apps.core_security.middleware.SesionRequeridaMiddleware",
     "apps.core.middleware.ContextoSesionMiddleware",
 ]
 
@@ -182,10 +185,27 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ("rest_framework.renderers.JSONRenderer",),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     # El proyecto usa sesion opaca en servidor (tabla sesion_usuario), NUNCA JWT autocontenido:
-    # la clase de autenticacion la aporta la tarea duena de identidad (EP-001..EP-004).
-    "DEFAULT_AUTHENTICATION_CLASSES": (),
-    "EXCEPTION_HANDLER": "rest_framework.views.exception_handler",
+    # el rol vigente se relee de la base en cada peticion y la revocacion es inmediata (REQ-057).
+    "DEFAULT_AUTHENTICATION_CLASSES": ("apps.core_security.autenticacion.AutenticacionSesionOpaca",),
+    # Envolvente UNICA de error: todo fallo atendido por DRF sale con el mismo cuerpo
+    # (`code`, `message`, `details`, `traceId`) que devuelve el guardia de sesion.
+    "EXCEPTION_HANDLER": "apps.core_security.manejadores.manejador_excepciones",
 }
+
+# SESION DE USUARIO (ARC-012)
+# -------------------------------------------------------------
+# Sesion OPACA server-side: el identificador uuid de `sesion_usuario` viaja en la cabecera
+# `Authorization: Bearer <session_id>` (nunca en la URL, REQ-056) y todo su estado vive en
+# Oracle. Las dos ventanas de vigencia son independientes y parametrizables por entorno.
+SESION_INACTIVIDAD_MINUTOS = int(os.environ.get("SESION_INACTIVIDAD_MINUTOS", "30"))
+SESION_VIGENCIA_ABSOLUTA_HORAS = int(os.environ.get("SESION_VIGENCIA_ABSOLUTA_HORAS", "12"))
+
+# Argon2id es el algoritmo adaptativo del proyecto y el unico que admite el CHECK
+# `ck_usuario_pwd_algorithm` junto con bcrypt. La contrasenia se guarda SOLO como hash.
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.BCryptSHA256PasswordHasher",
+]
 
 # DATABASE CONFIGURATION
 # -------------------------------------------------------------
@@ -298,42 +318,28 @@ AVISOS_MOTOR = {
 
 # LOGGING
 # -------------------------------------------------------------
-class DatosPorDefectoLogFilter(logging.Filter):
-    """
-    Garantiza que todo registro de log lleve el campo `data` que exige el formateador `verbose`.
-
-    El formateador del proyecto incluye `%(data)s`, que solo esta presente cuando quien loguea
-    pasa `extra={"data": {...}}`. El codigo propio lo hace siempre, pero las librerias de
-    terceros (APScheduler, urllib3, oracledb...) no conocen esa convencion: sin este filtro,
-    cada linea que emiten provoca un `ValueError: Formatting field not found in record: 'data'`
-    y un volcado de `--- Logging error ---` a stderr que ensucia la salida del contenedor.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not hasattr(record, "data"):
-            record.data = {}
-        return True
-
-
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    # El patron `verbose` incluye `%(data)s`: sin este filtro, cualquier registro ajeno al
+    # servicio (`django.request` al responder un 401, las librerias de terceros...) rompe el
+    # formateo y se pierde la linea. El filtro rellena `data` cuando falta.
+    "filters": {
+        "datos_estructurados": {
+            "()": "apps.core_security.trazas.DatosEstructuradosFilter",
+        },
+    },
     "formatters": {
         "verbose": {"format": "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s %(data)s"},
         "json": {
             "()": "pythonjsonlogger.json.JsonFormatter",
         },
     },
-    "filters": {
-        # Rellena `data` en los registros que no lo traen, para que el formateador `verbose` no
-        # falle con las trazas de las librerias de terceros.
-        "datos_por_defecto": {"()": DatosPorDefectoLogFilter},
-    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose" if LOCAL_ENVIRONMENT else "json",
-            "filters": ["datos_por_defecto"],
+            "filters": ["datos_estructurados"],
         },
         'null': {'class': 'logging.NullHandler'},
     },
