@@ -93,3 +93,31 @@ class PermisoDenegadoError(ErrorDominio):
         self.operation_code = operation_code
         self.role_code = role_code
         super().__init__(mensaje)
+
+
+class RecursoFueraDeAlcanceError(ErrorDominio):
+    """
+    El recurso pedido no esta dentro del alcance de datos del solicitante (REQ-023, REQ-031).
+
+    UNA SOLA RESPUESTA PARA TRES MOTIVOS. Los tres motivos reales -`ajeno` (la incidencia
+    existe pero pertenece a otro usuario), `inexistente` (no hay fila con ese identificador) e
+    `identificador_invalido` (el identificador ni siquiera es un numero valido)- producen
+    EXACTAMENTE la misma respuesta: mismo codigo, mismo estado y mismo texto
+    (`mensajes.RECURSO_NO_ENCONTRADO`). `motivo` es traza interna para el log tecnico y NUNCA
+    se serializa en el cuerpo (AC-PERM-04): si viajara, el cliente podria distinguir "no es
+    tuya" de "no existe" y enumerar incidencias ajenas probando identificadores.
+
+    404 Y NO 403, POR DECISION EXPLICITA DE REQ-023. Un 403 seria tecnicamente mas descriptivo
+    -"existe, pero no puedes"- y justo por eso esta prohibido aqui: confirmaria la EXISTENCIA
+    del recurso. Fuera de alcance equivale a inexistente para quien pregunta.
+
+    SIN EFECTO LATERAL (REQ-031): lanzar esta excepcion no escribe en base, no muta el contexto
+    de sesion y no emite eventos.
+    """
+
+    codigo = "INC_NOT_FOUND"
+    http_status = 404
+
+    def __init__(self, mensaje: str = mensajes.RECURSO_NO_ENCONTRADO, *, motivo: str = "desconocido") -> None:
+        self.motivo: str = motivo
+        super().__init__(mensaje)
