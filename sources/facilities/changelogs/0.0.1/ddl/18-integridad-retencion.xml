@@ -1,0 +1,1339 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="ddl-0.0.1-18-01" author="MIND">
+        <comment>Informe de verificacion de integridad del historico (REQ-152): cabecera de cada ejecucion, inmutable y sin descripcion de incidencia</comment>
+        <!--
+            executed_by es NULLABLE a proposito: la verificacion de integridad tambien se lanza de
+            forma PROGRAMADA (REQ-152) y entonces no hay actor humano al que imputar la ejecucion.
+            La columna queda nula en ese caso y apunta al usuario solicitante cuando la verificacion
+            se dispara a peticion.
+
+            El alcance scope_date_from / scope_date_to es OPCIONAL: si no se acota ninguno de los dos
+            extremos, la verificacion recorre toda la ventana de retencion.
+
+            status modela el ciclo de vida de la ejecucion (EN_CURSO -&gt; COMPLETADO o FALLIDO) y es
+            lo que permite detectar que ya hay una verificacion EN_CURSO; sobre esa misma columna se
+            apoya el cerrojo ux_integridad_informe_en_curso del changeset 18-04.
+
+            La tabla NO tiene ninguna columna de descripcion de la incidencia ni de comentario de
+            resolucion: REQ-152 RN-08 obliga a que el informe exponga unicamente identificadores y
+            reglas incumplidas, de modo que aqui no existe siquiera donde guardarlos.
+        -->
+        <sql>CREATE TABLE integridad_informe (
+    integrity_report_id NUMBER GENERATED ALWAYS AS IDENTITY,
+    executed_at         TIMESTAMP(6) DEFAULT SYS_EXTRACT_UTC(SYSTIMESTAMP) NOT NULL,
+    executed_by         NUMBER,
+    scope_date_from     DATE,
+    scope_date_to       DATE,
+    checked_count       NUMBER DEFAULT 0 NOT NULL,
+    inconsistency_count NUMBER DEFAULT 0 NOT NULL,
+    status              VARCHAR2(20 CHAR) DEFAULT 'EN_CURSO' NOT NULL,
+    CONSTRAINT pk_integridad_informe PRIMARY KEY (integrity_report_id),
+    CONSTRAINT fk_integridad_informe_ejecutor FOREIGN KEY (executed_by) REFERENCES usuario (user_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="integridad_informe"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-02" author="MIND">
+        <comment>Reglas de coherencia del informe de integridad (REQ-152): enumerado de estado, rango de fechas ordenado y ventana maxima de 24 meses</comment>
+        <!--
+            Estas restricciones materializan en la BASE DE DATOS las dos validaciones de alcance que
+            fija REQ-152: "scope_date_from &lt;= scope_date_to" (ck_integridad_informe_rango) y "rango
+            maximo de 24 meses, que coincide con la ventana de retencion del historico"
+            (ck_integridad_informe_ventana). El error 400 "Rango de fechas no valido" que publica la
+            API tiene aqui su respaldo: aunque la capa de servicio no lo comprobara, un alcance
+            invalido seria rechazado por el motor.
+
+            Las dos CHECK admiten el caso en que alguno de los extremos sea nulo, porque el alcance
+            es opcional y "sin acotar" significa toda la ventana de retencion.
+
+            ck_integridad_informe_checked y ck_integridad_informe_hallazgos impiden contadores
+            negativos: un informe cuenta incidencias verificadas y hallazgos, nunca menos de cero.
+        -->
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_status CHECK (status IN ('EN_CURSO','COMPLETADO','FALLIDO'))</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_rango CHECK (scope_date_from IS NULL OR scope_date_to IS NULL OR scope_date_from &lt;= scope_date_to)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_ventana CHECK (scope_date_from IS NULL OR scope_date_to IS NULL OR MONTHS_BETWEEN(scope_date_to, scope_date_from) &lt;= 24)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_checked CHECK (checked_count &gt;= 0)</sql>
+        <sql>ALTER TABLE integridad_informe ADD CONSTRAINT ck_integridad_informe_hallazgos CHECK (inconsistency_count &gt;= 0)</sql>
+        <rollback>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_hallazgos</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_checked</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_ventana</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_rango</sql>
+            <sql>ALTER TABLE integridad_informe DROP CONSTRAINT ck_integridad_informe_status</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-03" author="MIND">
+        <comment>Hallazgo de un informe de integridad (REQ-152): incidencia afectada y regla incumplida, nunca su descripcion</comment>
+        <!--
+            Los cuatro valores admitidos de rule_code van en MINUSCULAS porque son literalmente los
+            que fija REQ-152 y los que publica la API: sin_alta, secuencia_rota, estado_desalineado y
+            hash_alterado. La CHECK los congela como enumerado cerrado.
+
+            finding_detail es un texto de diagnostico de 500 caracteres que solo puede contener
+            IDENTIFICADORES, marcas temporales y codigos de estado: NUNCA la description de la
+            incidencia ni su resolution_comment (REQ-152 RN-08). La tabla no declara ninguna columna
+            para ellos, de modo que no existe siquiera donde guardarlos.
+
+            Un hallazgo apunta siempre a su informe y a la incidencia afectada; ambas claves ajenas
+            son obligatorias porque un hallazgo huerfano no significa nada.
+        -->
+        <sql>CREATE TABLE integridad_hallazgo (
+    finding_id          NUMBER GENERATED ALWAYS AS IDENTITY,
+    integrity_report_id NUMBER NOT NULL,
+    incident_id         NUMBER NOT NULL,
+    rule_code           VARCHAR2(30 CHAR) NOT NULL,
+    finding_detail      VARCHAR2(500 CHAR),
+    CONSTRAINT pk_integridad_hallazgo PRIMARY KEY (finding_id),
+    CONSTRAINT ck_integridad_hallazgo_rule CHECK (rule_code IN ('sin_alta','secuencia_rota','estado_desalineado','hash_alterado')),
+    CONSTRAINT fk_integridad_hallazgo_informe FOREIGN KEY (integrity_report_id) REFERENCES integridad_informe (integrity_report_id),
+    CONSTRAINT fk_integridad_hallazgo_incidencia FOREIGN KEY (incident_id) REFERENCES incidencia (incident_id)
+)</sql>
+        <rollback>
+            <dropTable tableName="integridad_hallazgo"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-04" author="MIND">
+        <comment>Indices de consulta del informe de integridad y cerrojo de ejecucion unica (AC-HIST-07)</comment>
+        <!--
+            ix_integridad_informe_executed_at sirve el listado de informes en orden cronologico
+            descendente; los dos indices de integridad_hallazgo sirven el detalle de un informe y la
+            busqueda de hallazgos por incidencia afectada.
+
+            ux_integridad_informe_en_curso es un indice UNICO BASADO EN FUNCION y es el cerrojo de
+            ejecucion unica. La expresion indexada vale 1 cuando el informe esta EN_CURSO y NULL en
+            cualquier otro estado. Oracle NO almacena en un indice de una sola columna las entradas
+            cuya clave es nula, de modo que el indice contiene EXCLUSIVAMENTE las ejecuciones en
+            curso y su unicidad garantiza que no puede haber mas de una a la vez: los informes ya
+            sellados (COMPLETADO o FALLIDO) ni siquiera aparecen en el, por muchos que sean.
+
+            Un segundo intento concurrente de arrancar una verificacion choca contra ORA-00001, y es
+            exactamente lo que la API traduce al 409 "Ya hay una verificacion en curso" de AC-HIST-07.
+
+            El cerrojo vive en la BASE DE DATOS y no en el proceso: dos instancias de la aplicacion
+            corriendo en paralelo, o una ejecucion programada solapandose con otra a peticion, siguen
+            sin poder arrancar dos verificaciones simultaneas.
+        -->
+        <sql>CREATE INDEX ix_integridad_informe_executed_at ON integridad_informe (executed_at DESC)</sql>
+        <sql>CREATE INDEX ix_integridad_hallazgo_informe ON integridad_hallazgo (integrity_report_id)</sql>
+        <sql>CREATE INDEX ix_integridad_hallazgo_incidencia ON integridad_hallazgo (incident_id)</sql>
+        <sql>CREATE UNIQUE INDEX ux_integridad_informe_en_curso ON integridad_informe (CASE WHEN status = 'EN_CURSO' THEN 1 END)</sql>
+        <rollback>
+            <sql>DROP INDEX ux_integridad_informe_en_curso</sql>
+            <sql>DROP INDEX ix_integridad_hallazgo_incidencia</sql>
+            <sql>DROP INDEX ix_integridad_hallazgo_informe</sql>
+            <sql>DROP INDEX ix_integridad_informe_executed_at</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-05" author="MIND" runOnChange="true">
+        <comment>Inmutabilidad append-only del informe de integridad y de sus hallazgos (REQ-152 RN-09, REQ-015, REQ-065): ORA-20006 y ORA-20007</comment>
+        <!--
+            Las dos tablas son append-only, pero con una asimetria deliberada.
+
+            integridad_hallazgo es append-only PURO: una vez escrito un hallazgo, ni se corrige ni se
+            borra. Su trigger es de SENTENCIA (sin FOR EACH ROW), igual que trg_resolucion_dest_inmutable,
+            de modo que rechaza el UPDATE o el DELETE incluso cuando la sentencia no afecta a ninguna
+            fila.
+
+            integridad_informe necesita exactamente UNA transicion: el SELLADO de la ejecucion que
+            acaba de terminar. La fila nace EN_CURSO (es la que ocupa el cerrojo
+            ux_integridad_informe_en_curso) y al terminar se cierra a COMPLETADO o FALLIDO fijando
+            checked_count e inconsistency_count. El trigger acota ese UPDATE a ese unico cambio, lo
+            deja pasar UNA SOLA VEZ (porque exige que el estado de partida sea EN_CURSO, condicion
+            que el propio sellado destruye) y congela el ejecutor, el instante de ejecucion y el
+            alcance. A partir del sellado, el informe es tan inmutable como el resto del historico.
+            El DELETE esta prohibido siempre: un informe se conserva con la misma retencion que el
+            historico que verifica.
+
+            Ademas, la verificacion de integridad es SOLO DIAGNOSTICA: no repara, no borra y no
+            modifica ninguna entrada del historico. Estos triggers impiden que un futuro "arreglo"
+            pueda, siquiera, reescribir su propio informe o sus propios hallazgos para disimular lo
+            que encontro.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_integridad_hallazgo_append
+BEFORE UPDATE OR DELETE ON integridad_hallazgo
+BEGIN
+    RAISE_APPLICATION_ERROR(-20006, 'Un hallazgo de un informe de integridad es inmutable');
+END;]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE TRIGGER trg_integridad_informe_append
+BEFORE UPDATE OR DELETE ON integridad_informe
+FOR EACH ROW
+BEGIN
+    IF DELETING THEN
+        RAISE_APPLICATION_ERROR(-20007, 'Un informe de integridad no se borra: se conserva con la misma retencion que el resto del historico');
+    END IF;
+
+    IF :OLD.status <> 'EN_CURSO' THEN
+        RAISE_APPLICATION_ERROR(-20007, 'El informe de integridad ya esta sellado y es inmutable');
+    END IF;
+
+    IF :NEW.status NOT IN ('COMPLETADO', 'FALLIDO') THEN
+        RAISE_APPLICATION_ERROR(-20007, 'La unica modificacion admitida sobre un informe en curso es su sellado a COMPLETADO o FALLIDO');
+    END IF;
+
+    IF :NEW.executed_at <> :OLD.executed_at
+       OR NVL(:NEW.executed_by, -1) <> NVL(:OLD.executed_by, -1)
+       OR NVL(:NEW.scope_date_from, DATE '0001-01-01') <> NVL(:OLD.scope_date_from, DATE '0001-01-01')
+       OR NVL(:NEW.scope_date_to, DATE '0001-01-01') <> NVL(:OLD.scope_date_to, DATE '0001-01-01') THEN
+        RAISE_APPLICATION_ERROR(-20007, 'El sellado de un informe de integridad no puede alterar su ejecutor, su instante ni su alcance');
+    END IF;
+END;]]></sql>
+        <rollback>
+            <sql>DROP TRIGGER trg_integridad_informe_append</sql>
+            <sql>DROP TRIGGER trg_integridad_hallazgo_append</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-06" author="MIND" runOnChange="true">
+        <comment>Vistas de invariante del historico (REQ-152): alta, alineacion de estado, cadena de huellas y cierre uno a uno</comment>
+        <!--
+            Estas cuatro vistas son el MOTOR de la verificacion de integridad de REQ-152: cada una
+            materializa una de las cuatro reglas del requisito. (a) toda incidencia tiene entrada de
+            alta (v_chk_incidencia_sin_alta), (b) la secuencia de transiciones es contigua
+            (v_chk_cierre_1a1), (c) el estado vigente coincide con la ultima entrada de cambio de
+            estado (v_chk_estado_desalineado) y (d) ninguna entrada ha sido alterada segun la cadena
+            de huellas (v_chk_cadena_hash).
+
+            FIRMA COMUN DE TRES COLUMNAS
+            ============================
+            Las cuatro publican EXACTAMENTE la misma firma de tres columnas: incident_id, rule_code
+            y finding_detail. Asi el servicio de verificacion puede volcarlas a integridad_hallazgo
+            sin transformar nada. rule_code lleva ya el valor exacto del enumerado de
+            ck_integridad_hallazgo_rule (sin_alta, estado_desalineado, hash_alterado y
+            secuencia_rota), de modo que la CHECK de la tabla de destino no puede rechazar lo que la
+            vista produce.
+
+            finding_detail SOLO contiene identificadores, codigos de estado, huellas y marcas
+            temporales. NUNCA la description de la incidencia ni su resolution_comment (REQ-152
+            RN-08): un informe de integridad no puede convertirse en una puerta trasera para leer el
+            contenido de incidencias ajenas. El SUBSTR a 500 caracteres respeta ademas la cota de la
+            columna finding_detail.
+
+            La verificacion es SOLO DIAGNOSTICA (REQ-152 RN-01): esto son VISTAS de lectura. No
+            reparan, no borran y no modifican ninguna entrada del historico; se limitan a senalar
+            donde esta la inconsistencia.
+
+            v_chk_estado_desalineado
+            ========================
+            Compara el estado vigente de la incidencia contra la ULTIMA entrada que MUEVE el estado
+            (CREACION o CAMBIO_ESTADO), desempatando por history_id cuando dos asientos comparten
+            changed_at. Las entradas ASIGNACION, RECLASIFICACION y COMENTARIO_RESOLUCION quedan FUERA
+            a proposito: no mueven el estado (de hecho ck_inc_hist_asignacion obliga a
+            from_status = to_status) y tomarlas como referencia daria FALSOS NEGATIVOS, porque una
+            asignacion posterior a un cambio de estado taparia el desajuste real.
+
+            v_chk_cadena_hash
+            =================
+            Devuelve UNA FILA POR ENTRADA cuyo eslabon no encaja, no una por incidencia: el
+            finding_detail identifica el history_id exacto donde se rompe la cadena. El centinela
+            '@' hace que el PRIMER asiento de cada incidencia (sin anterior y con
+            previous_entry_hash nulo, que es lo que exige ck_inc_hist_previous_hash) cuente como
+            cadena intacta, y que en cambio un previous_entry_hash nulo CON asiento anterior cuente
+            como ruptura.
+
+            v_chk_cierre_1a1
+            ================
+            Comprueba la correspondencia en los DOS sentidos: una incidencia CERRADA sin su asiento
+            RESUELTA -&gt; CERRADA, y un asiento de cierre sobre una incidencia que no esta cerrada.
+            El tercer caso teorico, dos asientos de cierre para la misma incidencia, ya lo impide el
+            indice unico ux_inc_hist_cierre de TSK-056, pero la vista lo contempla igualmente porque
+            el contador &lt;&gt; 1 lo cubre sin coste.
+
+            VENTANA DE RETENCION
+            ====================
+            Las vistas NO filtran por ventana de retencion: el acotado temporal opcional
+            (scope_date_from / scope_date_to del informe) lo aplica el servicio de verificacion
+            sobre incidencia.created_at, de modo que las vistas siguen siendo DETERMINISTAS y
+            auditables en cualquier instante.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_incidencia_sin_alta AS
+SELECT i.incident_id                                AS incident_id,
+       CAST('sin_alta' AS VARCHAR2(30 CHAR))        AS rule_code,
+       SUBSTR('La incidencia ' || i.reference_code ||
+              ' creada el ' || TO_CHAR(i.created_at, 'YYYY-MM-DD HH24:MI:SS') ||
+              ' no tiene entrada de historico de tipo CREACION', 1, 500) AS finding_detail
+  FROM incidencia i
+ WHERE NOT EXISTS (SELECT 1
+                     FROM incidencia_historico h
+                    WHERE h.incident_id = i.incident_id
+                      AND h.entry_type  = 'CREACION')]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_estado_desalineado AS
+SELECT i.incident_id                                         AS incident_id,
+       CAST('estado_desalineado' AS VARCHAR2(30 CHAR))       AS rule_code,
+       SUBSTR('El estado vigente ' || i.status ||
+              ' de la incidencia ' || i.reference_code ||
+              ' no coincide con el to_status ' || u.to_status ||
+              ' de su ultima entrada de historico (history_id ' || u.history_id || ')', 1, 500) AS finding_detail
+  FROM incidencia i
+  JOIN (SELECT incident_id,
+               history_id,
+               to_status,
+               ROW_NUMBER() OVER (PARTITION BY incident_id
+                                      ORDER BY changed_at DESC, history_id DESC) AS rn
+          FROM incidencia_historico
+         WHERE entry_type IN ('CREACION', 'CAMBIO_ESTADO')) u
+    ON u.incident_id = i.incident_id
+   AND u.rn          = 1
+ WHERE i.status <> u.to_status]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_cadena_hash AS
+SELECT c.incident_id                                   AS incident_id,
+       CAST('hash_alterado' AS VARCHAR2(30 CHAR))      AS rule_code,
+       SUBSTR('La entrada de historico ' || c.history_id ||
+              ' de la incidencia ' || c.incident_id ||
+              ' rompe la cadena de huellas: su previous_entry_hash ' || NVL(c.previous_entry_hash, '(nulo)') ||
+              ' no coincide con el entry_hash ' || NVL(c.huella_anterior, '(nulo)') ||
+              ' de la entrada anterior ' || NVL(TO_CHAR(c.history_id_anterior), '(ninguna)'), 1, 500) AS finding_detail
+  FROM (SELECT incident_id,
+               history_id,
+               previous_entry_hash,
+               LAG(entry_hash) OVER (PARTITION BY incident_id
+                                         ORDER BY changed_at, history_id) AS huella_anterior,
+               LAG(history_id) OVER (PARTITION BY incident_id
+                                         ORDER BY changed_at, history_id) AS history_id_anterior
+          FROM incidencia_historico) c
+ WHERE NVL(c.previous_entry_hash, '@') <> NVL(c.huella_anterior, '@')]]></sql>
+        <sql splitStatements="false" stripComments="false"><![CDATA[CREATE OR REPLACE VIEW v_chk_cierre_1a1 AS
+SELECT i.incident_id                                    AS incident_id,
+       CAST('secuencia_rota' AS VARCHAR2(30 CHAR))      AS rule_code,
+       SUBSTR(CASE WHEN i.status = 'CERRADA'
+                   THEN 'La incidencia ' || i.reference_code ||
+                        ' esta CERRADA y tiene ' || NVL(c.cierres, 0) ||
+                        ' entradas de historico RESUELTA -> CERRADA en lugar de exactamente una'
+                   ELSE 'La incidencia ' || i.reference_code ||
+                        ' tiene ' || NVL(c.cierres, 0) ||
+                        ' entradas de historico RESUELTA -> CERRADA pero su estado vigente es ' || i.status
+              END, 1, 500)                              AS finding_detail
+  FROM incidencia i
+  LEFT JOIN (SELECT incident_id, COUNT(*) AS cierres
+               FROM incidencia_historico
+              WHERE from_status = 'RESUELTA'
+                AND to_status   = 'CERRADA'
+              GROUP BY incident_id) c
+    ON c.incident_id = i.incident_id
+ WHERE (i.status =  'CERRADA' AND NVL(c.cierres, 0) <> 1)
+    OR (i.status <> 'CERRADA' AND NVL(c.cierres, 0) <> 0)]]></sql>
+        <rollback>
+            <sql>DROP VIEW v_chk_cierre_1a1</sql>
+            <sql>DROP VIEW v_chk_cadena_hash</sql>
+            <sql>DROP VIEW v_chk_estado_desalineado</sql>
+            <sql>DROP VIEW v_chk_incidencia_sin_alta</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-07" author="MIND">
+        <comment>Oraculo AC-HIST-06: las cuatro vistas de invariante devuelven 0 filas sobre un historico coherente y exactamente 1 fila por cada inconsistencia forzada</comment>
+        <!--
+            Este changeset es el ORACULO DE COMPORTAMIENTO del DoD: no crea ni altera ningun objeto,
+            se limita a EJECUTAR las cuatro vistas del changeset anterior contra el motor Oracle real
+            durante el propio despliegue. Si una invariante no detecta lo que tiene que detectar, o
+            senala lo que no debe, el bloque lanza RAISE_APPLICATION_ERROR y el despliegue entero
+            falla. La verificacion no depende de ningun entorno de pruebas aparte.
+
+            CUATRO ESCENARIOS Y NI UNA FILA RESIDUAL
+            ========================================
+            El bloque monta cuatro escenarios: el A es un historico COHERENTE de ciclo completo y los
+            otros tres introducen UNA sola inconsistencia cada uno (B estado desalineado, C cadena de
+            huellas rota, D incidencia sin entrada de alta). Al terminar, un ROLLBACK final DESHACE
+            todos los datos que el propio oraculo ha sembrado, de modo que no deja ni una fila en la
+            base. El manejador WHEN OTHERS repite ese ROLLBACK antes de relanzar el error, para que
+            tampoco un fallo deje basura detras.
+
+            POR QUE AQUI NO HAY NI UNA SENTENCIA DDL
+            ========================================
+            El bloque entero viaja como una UNICA sentencia JDBC (de ahi splitStatements="false") y
+            por eso NO contiene ni una sola sentencia DDL. Cualquier DDL provocaria un COMMIT
+            IMPLICITO, el ROLLBACK final ya no tendria nada que deshacer y los datos del oraculo
+            quedarian grabados en la base de forma permanente. Todo lo que el oraculo necesita se
+            consigue con DML.
+
+            SIEMBRA DE CATALOGOS DE CLAVE FIJA
+            ==================================
+            Los roles y los estados de incidencia se siembran por MERGE, y la oficina, la sala y la
+            categoria se obtienen con un SELECT que cae a INSERT si no existen. El motivo es el orden
+            de aplicacion: los changelogs dml se aplican DESPUES de los ddl, asi que cuando este
+            oraculo corre los catalogos pueden estar todavia vacios. El MERGE deja la fila si falta y
+            la respeta si ya esta, y como todo cuelga del mismo ROLLBACK tampoco esa siembra
+            sobrevive.
+
+            MARCAS TEMPORALES SIEMPRE PASADAS
+            =================================
+            Todas las marcas temporales se calculan restando horas al instante actual en UTC, es
+            decir, son PASADAS. El motivo es que trg_incidencia_ciclo_vida rechaza con ORA-20053
+            cualquier marca futura, de modo que un changed_at por delante del reloj haria fallar al
+            oraculo por una razon ajena a lo que pretende comprobar.
+
+            DETERMINISMO
+            ============
+            Todas las comprobaciones se acotan al incident_id del escenario que toca (la rutina
+            exigir filtra siempre por esa columna). Asi el oraculo da el mismo resultado aunque la
+            base ya contenga otras incidencias, coherentes o no: nunca cuenta filas de datos ajenos.
+
+            LO QUE ESTE ORACULO NO COMPRUEBA
+            ===============================
+            El oraculo NO recalcula la huella canonica de cada asiento: de eso ya se encarga el
+            oraculo ddl-0.0.1-13-05 de TSK-056. Lo que v_chk_cadena_hash verifica es el ESLABON entre
+            asientos consecutivos, esto es, que el previous_entry_hash de una entrada sea el
+            entry_hash de la anterior; por eso aqui basta con huellas sinteticas encadenadas y con
+            romper deliberadamente un eslabon en el escenario C.
+
+            SOLO DIAGNOSTICA
+            ================
+            La verificacion de integridad es SOLO DIAGNOSTICA (REQ-152 RN-01). El escenario B lo
+            demuestra: despues de consultar las cuatro vistas vuelve a leer el dato y exige que sigan
+            estando los dos asientos y que el estado siga siendo ABIERTA. Consultar las vistas no
+            repara, no borra y no modifica absolutamente nada.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_empleado  NUMBER;
+    v_tecnico   NUMBER;
+    v_oficina   NUMBER;
+    v_sala      NUMBER;
+    v_categoria NUMBER;
+    v_inc_a     NUMBER;
+    v_inc_b     NUMBER;
+    v_inc_c     NUMBER;
+    v_inc_d     NUMBER;
+    v_now       TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+    v_t0        TIMESTAMP;
+    v_t1        TIMESTAMP;
+    v_t2        TIMESTAMP;
+    v_t3        TIMESTAMP;
+    v_t4        TIMESTAMP;
+    v_h0        VARCHAR2(64 CHAR);
+    v_h1        VARCHAR2(64 CHAR);
+    v_h2        VARCHAR2(64 CHAR);
+    v_h3        VARCHAR2(64 CHAR);
+    v_h4        VARCHAR2(64 CHAR);
+    v_falsa     VARCHAR2(64 CHAR);
+    v_asientos  NUMBER;
+    v_estado    VARCHAR2(20 CHAR);
+
+    c_admin_nom    CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Administrador';
+    c_empleado_nom CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Empleado';
+    c_tecnico_nom  CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Tecnico';
+    c_resolucion   CONSTANT VARCHAR2(500 CHAR) := 'Comentario de resolucion del oraculo TSK-061: se reparo la averia reportada';
+    c_descripcion  CONSTANT VARCHAR2(500 CHAR) := 'Incidencia del oraculo TSK-061 para verificar las invariantes de integridad del historico';
+
+    FUNCTION huella(p_semilla VARCHAR2) RETURN VARCHAR2 IS
+        l_hash VARCHAR2(64 CHAR);
+    BEGIN
+        SELECT RAWTOHEX(STANDARD_HASH(p_semilla, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA61';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA61', 'Oficina del oraculo TSK-061', 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA61-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA61-SALA-01', 'Sala del oraculo TSK-061', p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', 'Climatizacion oraculo TSK-061', 961, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    FUNCTION alta_incidencia(p_ref VARCHAR2, p_reporter NUMBER, p_created TIMESTAMP) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        INSERT INTO incidencia (reference_code, room_id, category_id,
+                                room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                                description, status, reported_by, created_at, status_changed_at)
+             VALUES (p_ref, v_sala, v_categoria,
+                     'Sala del oraculo TSK-061', 'Oficina del oraculo TSK-061', 'Climatizacion oraculo TSK-061',
+                     c_descripcion, 'ABIERTA', p_reporter, p_created, p_created)
+          RETURNING incident_id INTO l_id;
+        RETURN l_id;
+    END alta_incidencia;
+
+    PROCEDURE asentar(p_inc NUMBER, p_entry_type VARCHAR2, p_from VARCHAR2, p_to VARCHAR2,
+                      p_tech NUMBER, p_tech_name VARCHAR2,
+                      p_actor NUMBER, p_actor_name VARCHAR2, p_changed_at TIMESTAMP,
+                      p_res_ref NUMBER, p_prev_hash VARCHAR2, p_hash VARCHAR2) IS
+    BEGIN
+        INSERT INTO incidencia_historico (incident_id, entry_type, from_status, to_status,
+                                          assigned_technician_id, assigned_technician_name,
+                                          actor_user_id, actor_display_name, changed_at,
+                                          resolution_comment_ref, previous_entry_hash, entry_hash)
+             VALUES (p_inc, p_entry_type, p_from, p_to,
+                     p_tech, p_tech_name,
+                     p_actor, p_actor_name, p_changed_at,
+                     p_res_ref, p_prev_hash, p_hash);
+    END asentar;
+
+    PROCEDURE exigir(p_vista VARCHAR2, p_inc NUMBER, p_esperadas NUMBER, p_codigo NUMBER, p_caso VARCHAR2) IS
+        l_n NUMBER;
+    BEGIN
+        EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ' || p_vista || ' WHERE incident_id = :1' INTO l_n USING p_inc;
+        IF l_n <> p_esperadas THEN
+            RAISE_APPLICATION_ERROR(p_codigo, 'ORACULO AC-HIST-06 ' || p_caso || ': la vista ' || p_vista ||
+                ' devuelve ' || l_n || ' filas para la incidencia ' || p_inc || ' y se esperaban ' || p_esperadas);
+        END IF;
+    END exigir;
+BEGIN
+    v_t0 := v_now - INTERVAL '5' HOUR;
+    v_t1 := v_now - INTERVAL '4' HOUR;
+    v_t2 := v_now - INTERVAL '3' HOUR;
+    v_t3 := v_now - INTERVAL '2' HOUR;
+    v_t4 := v_now - INTERVAL '1' HOUR;
+
+    sembrar_rol('EMPLEADO', 'Empleado', 911);
+    sembrar_rol('TECNICO_MANTENIMIENTO', 'Tecnico de mantenimiento', 912);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 913);
+
+    sembrar_estado('ABIERTA',  'Abierta',  1, 'N');
+    sembrar_estado('EN_CURSO', 'En curso', 2, 'N');
+    sembrar_estado('RESUELTA', 'Resuelta', 3, 'N');
+    sembrar_estado('CERRADA',  'Cerrada',  4, 'Y');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk061.admin@example.invalid',
+                 'oraculo.tsk061.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk061-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_empleado_nom, 'oraculo.tsk061.empleado@example.invalid',
+                 'oraculo.tsk061.empleado', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk061-empleado', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_empleado;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_tecnico_nom, 'oraculo.tsk061.tecnico@example.invalid',
+                 'oraculo.tsk061.tecnico', 'TECNICO_MANTENIMIENTO', 'ACTIVO',
+                 'hash-oraculo-tsk061-tecnico', 'argon2id', v_t0, v_admin)
+      RETURNING user_id INTO v_tecnico;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    -- ESCENARIO A: historico COHERENTE, ciclo completo ABIERTA, EN_CURSO, RESUELTA, CERRADA.
+    v_inc_a := alta_incidencia('INC-ORA61-000001', v_empleado, v_t0);
+
+    v_h0 := huella('ORA61|A|0');
+    asentar(v_inc_a, 'CREACION', NULL, 'ABIERTA', NULL, NULL,
+            v_empleado, c_empleado_nom, v_t0, NULL, NULL, v_h0);
+
+    UPDATE incidencia
+       SET assigned_technician_id = v_tecnico, assigned_at = v_t1, updated_at = v_t1
+     WHERE incident_id = v_inc_a;
+    v_h1 := huella('ORA61|A|1');
+    asentar(v_inc_a, 'ASIGNACION', 'ABIERTA', 'ABIERTA', v_tecnico, c_tecnico_nom,
+            v_admin, c_admin_nom, v_t1, NULL, v_h0, v_h1);
+
+    UPDATE incidencia
+       SET status = 'EN_CURSO', in_progress_at = v_t2,
+           status_changed_at = v_t2, status_changed_by = v_tecnico, updated_at = v_t2
+     WHERE incident_id = v_inc_a;
+    v_h2 := huella('ORA61|A|2');
+    asentar(v_inc_a, 'CAMBIO_ESTADO', 'ABIERTA', 'EN_CURSO', NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t2, NULL, v_h1, v_h2);
+
+    UPDATE incidencia
+       SET status = 'RESUELTA', resolved_at = v_t3,
+           status_changed_at = v_t3, status_changed_by = v_tecnico, updated_at = v_t3
+     WHERE incident_id = v_inc_a;
+    v_h3 := huella('ORA61|A|3');
+    asentar(v_inc_a, 'CAMBIO_ESTADO', 'EN_CURSO', 'RESUELTA', NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t3, NULL, v_h2, v_h3);
+
+    UPDATE incidencia
+       SET status = 'CERRADA', closed_at = v_t4, closed_by = v_admin,
+           resolution_comment = c_resolucion,
+           status_changed_at = v_t4, status_changed_by = v_admin, updated_at = v_t4
+     WHERE incident_id = v_inc_a;
+    v_h4 := huella('ORA61|A|4');
+    asentar(v_inc_a, 'CAMBIO_ESTADO', 'RESUELTA', 'CERRADA', NULL, NULL,
+            v_admin, c_admin_nom, v_t4, v_inc_a, v_h3, v_h4);
+
+    exigir('v_chk_incidencia_sin_alta',  v_inc_a, 0, -20700, 'escenario A coherente');
+    exigir('v_chk_estado_desalineado',   v_inc_a, 0, -20700, 'escenario A coherente');
+    exigir('v_chk_cadena_hash',          v_inc_a, 0, -20700, 'escenario A coherente');
+    exigir('v_chk_cierre_1a1',           v_inc_a, 0, -20700, 'escenario A coherente');
+
+    -- ESCENARIO B: el historico avanza a EN_CURSO pero la incidencia se queda en ABIERTA.
+    v_inc_b := alta_incidencia('INC-ORA61-000002', v_empleado, v_t0);
+
+    v_h0 := huella('ORA61|B|0');
+    asentar(v_inc_b, 'CREACION', NULL, 'ABIERTA', NULL, NULL,
+            v_empleado, c_empleado_nom, v_t0, NULL, NULL, v_h0);
+
+    v_h1 := huella('ORA61|B|1');
+    asentar(v_inc_b, 'CAMBIO_ESTADO', 'ABIERTA', 'EN_CURSO', NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t1, NULL, v_h0, v_h1);
+
+    exigir('v_chk_estado_desalineado',   v_inc_b, 1, -20701, 'escenario B desalineado');
+    exigir('v_chk_incidencia_sin_alta',  v_inc_b, 0, -20701, 'escenario B desalineado');
+    exigir('v_chk_cadena_hash',          v_inc_b, 0, -20701, 'escenario B desalineado');
+    exigir('v_chk_cierre_1a1',           v_inc_b, 0, -20701, 'escenario B desalineado');
+
+    -- La verificacion es SOLO DIAGNOSTICA: consultar las vistas no ha tocado ni un dato.
+    SELECT COUNT(*) INTO v_asientos FROM incidencia_historico WHERE incident_id = v_inc_b;
+    SELECT status   INTO v_estado   FROM incidencia           WHERE incident_id = v_inc_b;
+    IF v_asientos <> 2 OR v_estado <> 'ABIERTA' THEN
+        RAISE_APPLICATION_ERROR(-20704, 'ORACULO REQ-152 RN-01: la verificacion ha alterado el historico; quedan ' ||
+            v_asientos || ' asientos y el estado es ' || v_estado);
+    END IF;
+
+    -- ESCENARIO C: cadena de huellas rota, con el estado alineado para aislar la regla.
+    v_inc_c := alta_incidencia('INC-ORA61-000003', v_empleado, v_t0);
+
+    v_h0 := huella('ORA61|C|0');
+    asentar(v_inc_c, 'CREACION', NULL, 'ABIERTA', NULL, NULL,
+            v_empleado, c_empleado_nom, v_t0, NULL, NULL, v_h0);
+
+    UPDATE incidencia
+       SET status = 'EN_CURSO', in_progress_at = v_t1,
+           status_changed_at = v_t1, status_changed_by = v_tecnico, updated_at = v_t1
+     WHERE incident_id = v_inc_c;
+
+    v_falsa := huella('ORA61|C|huella-manipulada');
+    v_h1    := huella('ORA61|C|1');
+    asentar(v_inc_c, 'CAMBIO_ESTADO', 'ABIERTA', 'EN_CURSO', NULL, NULL,
+            v_tecnico, c_tecnico_nom, v_t1, NULL, v_falsa, v_h1);
+
+    exigir('v_chk_cadena_hash',          v_inc_c, 1, -20702, 'escenario C cadena rota');
+    exigir('v_chk_incidencia_sin_alta',  v_inc_c, 0, -20702, 'escenario C cadena rota');
+    exigir('v_chk_estado_desalineado',   v_inc_c, 0, -20702, 'escenario C cadena rota');
+    exigir('v_chk_cierre_1a1',           v_inc_c, 0, -20702, 'escenario C cadena rota');
+
+    -- ESCENARIO D: incidencia sin entrada de alta en el historico.
+    v_inc_d := alta_incidencia('INC-ORA61-000004', v_empleado, v_t0);
+
+    exigir('v_chk_incidencia_sin_alta',  v_inc_d, 1, -20703, 'escenario D sin alta');
+    exigir('v_chk_estado_desalineado',   v_inc_d, 0, -20703, 'escenario D sin alta');
+    exigir('v_chk_cadena_hash',          v_inc_d, 0, -20703, 'escenario D sin alta');
+    exigir('v_chk_cierre_1a1',           v_inc_d, 0, -20703, 'escenario D sin alta');
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback><!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir --></rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-08" author="MIND">
+        <comment>Oraculo AC-HIST-07 y REQ-152: una sola verificacion en curso, sellado unico del informe e inmutabilidad de informes y hallazgos</comment>
+        <!--
+            Este changeset es el ORACULO DE COMPORTAMIENTO de las reglas de REQ-152 que NO son
+            comprobables leyendo el DDL. Que exista un indice unico o un trigger se ve en el fichero;
+            lo que solo se demuestra contra el MOTOR REAL es que el motor rechace de verdad lo que
+            tiene que rechazar, con el codigo de error exacto que la capa de servicio traduce. Por eso
+            el bloque ejecuta cada caso durante el propio despliegue y exige el SQLCODE concreto.
+
+            CERROJO DE EJECUCION UNICA, QUE NO ES UNA COMPROBACION DEL PROCESO
+            =================================================================
+            El paso (2) demuestra que lo que impide una segunda verificacion simultanea NO es un
+            "si ya hay una en curso, no arranques" escrito en el codigo de la aplicacion, sino el
+            indice unico ux_integridad_informe_en_curso del changeset 18-04. El segundo INSERT con
+            estado EN_CURSO choca contra ORA-00001, y ese ORA-00001 es exactamente lo que la API
+            traduce al 409 "Ya hay una verificacion en curso" de AC-HIST-07. Al vivir el cerrojo en la
+            BASE DE DATOS, dos instancias de la aplicacion en paralelo, o una ejecucion programada
+            solapandose con otra a peticion, siguen sin poder arrancar dos verificaciones a la vez.
+
+            SELLADO UNICO E INMUTABILIDAD
+            =============================
+            Los pasos (6), (7) y (8) demuestran la asimetria del informe: el sellado de la ejecucion
+            en curso se admite UNA SOLA VEZ, pasando de EN_CURSO a COMPLETADO con sus contadores, y
+            esa misma transicion destruye la condicion que la hacia posible. Sellada la primera, el
+            cerrojo queda libre y ya cabe una nueva ejecucion, que ademas nace sin actor porque la
+            verificacion tambien se lanza de forma PROGRAMADA. A partir del sellado, el informe es tan
+            inmutable como el resto del historico: cualquier UPDATE posterior y cualquier DELETE
+            fallan con ORA-20007.
+
+            UN HALLAZGO NO SE CORRIGE NI SE BORRA JAMAS
+            ==========================================
+            Los pasos (4) y (5) demuestran que integridad_hallazgo es append-only PURO: un rule_code
+            fuera del enumerado de REQ-152 lo rechaza la CHECK con ORA-02290, y tanto modificar como
+            borrar un hallazgo ya escrito fallan con ORA-20006. Un hallazgo no se corrige ni se borra
+            jamas, de modo que nadie puede reescribir a posteriori lo que la verificacion encontro.
+
+            LAS DOS VALIDACIONES DE ALCANCE TIENEN RESPALDO EN LA BASE DE DATOS
+            ==================================================================
+            El paso (9) demuestra que las dos validaciones de alcance de REQ-152, el orden de las
+            fechas y la ventana maxima de 24 meses, NO viven solo en la capa de servicio: aunque esta
+            no las comprobara, el motor rechaza con ORA-02290 tanto un rango con la fecha inicial
+            posterior a la final (ck_integridad_informe_rango) como un rango de 36 meses
+            (ck_integridad_informe_ventana).
+
+            NI UNA FILA RESIDUAL Y NI UNA SENTENCIA DDL
+            ==========================================
+            El bloque DESHACE SUS PROPIOS DATOS con un ROLLBACK final, y el manejador WHEN OTHERS lo
+            repite antes de relanzar el error para que tampoco un fallo deje basura detras. El bloque
+            entero viaja como una UNICA sentencia JDBC (de ahi splitStatements="false") y NO contiene
+            ninguna sentencia DDL: cualquier DDL provocaria un COMMIT IMPLICITO y los datos del
+            oraculo quedarian grabados de forma permanente.
+
+            SIEMBRA DE CATALOGOS DE CLAVE FIJA
+            ==================================
+            El rol, el estado de incidencia, la oficina, la sala y la categoria se siembran por MERGE
+            (o por un SELECT que cae a INSERT si no existen) porque los changelogs dml se aplican
+            DESPUES de los ddl: cuando este oraculo corre, los catalogos pueden estar todavia vacios.
+            El MERGE deja la fila si falta y la respeta si ya esta, y como todo cuelga del mismo
+            ROLLBACK tampoco esa siembra sobrevive.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin     NUMBER;
+    v_oficina   NUMBER;
+    v_sala      NUMBER;
+    v_categoria NUMBER;
+    v_inc       NUMBER;
+    v_rep1      NUMBER;
+    v_rep2      NUMBER;
+    v_hallazgo  NUMBER;
+    v_sqlcode   NUMBER;
+    v_estado    VARCHAR2(20 CHAR);
+    v_now       TIMESTAMP := SYS_EXTRACT_UTC(SYSTIMESTAMP);
+
+    c_admin_nom   CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Integridad Administrador';
+    c_descripcion CONSTANT VARCHAR2(500 CHAR) := 'Incidencia del oraculo TSK-061 usada como sujeto de un hallazgo de integridad';
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA61';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA61', 'Oficina del oraculo TSK-061', 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA61-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA61-SALA-01', 'Sala del oraculo TSK-061', p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', 'Climatizacion oraculo TSK-061', 961, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+BEGIN
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 913);
+    sembrar_estado('ABIERTA', 'Abierta', 1, 'N');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk061.integridad@example.invalid',
+                 'oraculo.tsk061.integridad', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk061-integridad', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at, status_changed_at)
+         VALUES ('INC-ORA61-000011', v_sala, v_categoria,
+                 'Sala del oraculo TSK-061', 'Oficina del oraculo TSK-061', 'Climatizacion oraculo TSK-061',
+                 c_descripcion, 'ABIERTA', v_admin, v_now - INTERVAL '1' HOUR, v_now - INTERVAL '1' HOUR)
+      RETURNING incident_id INTO v_inc;
+
+    -- (1) El ADMINISTRADOR lanza una verificacion acotada a los ultimos doce meses.
+    INSERT INTO integridad_informe (executed_by, scope_date_from, scope_date_to, status)
+         VALUES (v_admin, ADD_MONTHS(TRUNC(SYSDATE), -12), TRUNC(SYSDATE), 'EN_CURSO')
+      RETURNING integrity_report_id INTO v_rep1;
+
+    -- (2) AC-HIST-07: una segunda verificacion simultanea choca contra el indice unico.
+    BEGIN
+        INSERT INTO integridad_informe (executed_by, status)
+             VALUES (v_admin, 'EN_CURSO')
+          RETURNING integrity_report_id INTO v_rep2;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -1 THEN
+        RAISE_APPLICATION_ERROR(-20710, 'ORACULO AC-HIST-07: una segunda verificacion simultanea deberia chocar con ORA-00001 y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    -- (3) El informe en curso registra sus hallazgos: solo identificadores y regla incumplida.
+    INSERT INTO integridad_hallazgo (integrity_report_id, incident_id, rule_code, finding_detail)
+         VALUES (v_rep1, v_inc, 'estado_desalineado',
+                 'El estado vigente de la incidencia ' || v_inc || ' no coincide con el to_status de su ultima entrada de historico')
+      RETURNING finding_id INTO v_hallazgo;
+
+    -- (4) Una regla fuera del enumerado de REQ-152 la rechaza la base de datos.
+    BEGIN
+        INSERT INTO integridad_hallazgo (integrity_report_id, incident_id, rule_code)
+             VALUES (v_rep1, v_inc, 'regla_inventada');
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20711, 'ORACULO REQ-152: un rule_code fuera del enumerado deberia violar ck_integridad_hallazgo_rule y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    -- (5) Un hallazgo es append-only puro: ni se corrige ni se borra.
+    BEGIN
+        UPDATE integridad_hallazgo SET rule_code = 'sin_alta' WHERE finding_id = v_hallazgo;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20006 THEN
+        RAISE_APPLICATION_ERROR(-20712, 'ORACULO REQ-152 RN-09: modificar un hallazgo deberia fallar con ORA-20006 y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    BEGIN
+        DELETE FROM integridad_hallazgo WHERE finding_id = v_hallazgo;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20006 THEN
+        RAISE_APPLICATION_ERROR(-20713, 'ORACULO REQ-152 RN-09: borrar un hallazgo deberia fallar con ORA-20006 y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    -- (6) El sellado del informe es el UNICO cambio admitido sobre una ejecucion en curso.
+    UPDATE integridad_informe
+       SET status = 'COMPLETADO', checked_count = 4, inconsistency_count = 1
+     WHERE integrity_report_id = v_rep1;
+
+    SELECT status INTO v_estado FROM integridad_informe WHERE integrity_report_id = v_rep1;
+    IF v_estado <> 'COMPLETADO' THEN
+        RAISE_APPLICATION_ERROR(-20714, 'ORACULO REQ-152: el sellado del informe deberia dejarlo COMPLETADO y ha quedado ' || v_estado);
+    END IF;
+
+    -- (7) Sellada la primera, ya cabe una nueva ejecucion, y esta es PROGRAMADA (sin actor).
+    INSERT INTO integridad_informe (executed_by, status)
+         VALUES (NULL, 'EN_CURSO')
+      RETURNING integrity_report_id INTO v_rep2;
+
+    -- (8) Un informe ya sellado es inmutable, igual que el resto del historico.
+    BEGIN
+        UPDATE integridad_informe SET inconsistency_count = 0 WHERE integrity_report_id = v_rep1;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20007 THEN
+        RAISE_APPLICATION_ERROR(-20715, 'ORACULO REQ-152 RN-09: modificar un informe sellado deberia fallar con ORA-20007 y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    BEGIN
+        DELETE FROM integridad_informe WHERE integrity_report_id = v_rep1;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -20007 THEN
+        RAISE_APPLICATION_ERROR(-20716, 'ORACULO REQ-047: borrar un informe de integridad deberia fallar con ORA-20007 y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    -- (9) Las dos validaciones de alcance de REQ-152 las impone la BASE DE DATOS.
+    BEGIN
+        INSERT INTO integridad_informe (executed_by, scope_date_from, scope_date_to, status)
+             VALUES (v_admin, TRUNC(SYSDATE), ADD_MONTHS(TRUNC(SYSDATE), -1), 'COMPLETADO');
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20717, 'ORACULO REQ-152: un rango con la fecha inicial posterior a la final deberia violar ck_integridad_informe_rango y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    BEGIN
+        INSERT INTO integridad_informe (executed_by, scope_date_from, scope_date_to, status)
+             VALUES (v_admin, ADD_MONTHS(TRUNC(SYSDATE), -36), TRUNC(SYSDATE), 'COMPLETADO');
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    IF v_sqlcode <> -2290 THEN
+        RAISE_APPLICATION_ERROR(-20718, 'ORACULO REQ-152: un rango de 36 meses deberia violar ck_integridad_informe_ventana y el SQLCODE obtenido ha sido ' || v_sqlcode);
+    END IF;
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback><!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir --></rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-18-09" author="MIND">
+        <comment>Oraculo AC-G-07 / AC-G-09 / AC-TRZ-04: registros de 23 meses intactos y consultables, sin job de purga y sin borrado fisico</comment>
+        <!--
+            Este changeset es el ORACULO DE COMPORTAMIENTO de la ventana de retencion. No crea ni
+            altera ningun objeto: siembra un juego COMPLETO de registros fechados 23 MESES ATRAS en
+            las seis tablas de historico del esquema (incidencia_historico, usuario_historico,
+            usuario_password_historico, auditoria_acceso, aviso_correo_intento y
+            resolucion_destinatario_log) y demuestra, contra el motor Oracle real y durante el propio
+            despliegue, que siguen INTACTOS y CONSULTABLES dentro de la ventana de retencion de 2
+            anios que exigen REQ-015, REQ-065 y REQ-077. Si algo hubiera desaparecido o se hubiera
+            alterado, el bloque lanza RAISE_APPLICATION_ERROR y el despliegue entero falla.
+
+            POR QUE ADD_MONTHS Y NO INTERVAL '23' MONTH
+            ===========================================
+            La antiguedad se calcula con ADD_MONTHS y NO con aritmetica de intervalos. Restar
+            INTERVAL '23' MONTH falla con ORA-01839 ("date not valid for month specified") cuando el
+            dia de origen no existe en el mes destino: basta con desplegar un dia 31 para que el
+            oraculo reviente por una razon ajena a lo que pretende comprobar. ADD_MONTHS, en cambio,
+            ajusta al ULTIMO DIA del mes destino y es siempre valido, cualquiera que sea el dia en
+            que se ejecute el despliegue.
+
+            UNA EXCEPCION HONESTA: auditoria_acceso
+            =======================================
+            auditoria_acceso NO admite una marca temporal del cliente, porque
+            trg_auditoria_acceso_servidor sella occurred_at con la HORA DEL SERVIDOR en cada INSERT.
+            Es una decision deliberada de REQ-065 (la marca temporal la fija el servidor, nunca el
+            cliente) y por eso una entrada de auditoria de 23 meses de antiguedad sencillamente NO SE
+            PUEDE FABRICAR desde aqui: el trigger la sobreescribiria. Lo que el oraculo demuestra
+            sobre esa tabla es lo equivalente y comprobable: que la fila es consultable, que su
+            retention_until derivada cubre mas de 23 meses POR DELANTE, y que es inmutable.
+
+            LA UNICA ELIMINACION AUTOMATICA DEL ESQUEMA NO ES UNA PURGA POR ANTIGUEDAD
+            =========================================================================
+            En todo el esquema solo existe una eliminacion automatica de filas: la de
+            trg_usuario_pwd_hist_purga, que acota a TRES las contrasenias anteriores guardadas por
+            usuario para impedir su reutilizacion. NO es una purga por antiguedad: no mira fechas,
+            solo cuantas contrasenias previas conserva cada cuenta. El oraculo lo demuestra
+            comprobando al FINAL del escenario que la entrada de 23 meses de usuario_password_historico
+            sigue ahi.
+
+            AC-G-09: NINGUN JOB PROGRAMADO
+            ==============================
+            El oraculo comprueba que user_scheduler_jobs esta VACIA: el esquema no declara ningun job
+            programado, de modo que no existe ninguna purga automatica de datos (AC-G-09).
+
+            EL BORRADO FISICO ESTA CERRADO EN LAS DOS DIRECCIONES
+            ====================================================
+            Por un lado, los triggers de inmutabilidad rechazan el DELETE sobre las tablas de
+            historico incluso cuando quien lo intenta es el DUENO DEL ESQUEMA, que es precisamente
+            quien ejecuta este bloque: ORA-20001 a ORA-20005 segun la tabla. Por otro, las claves
+            ajenas impiden borrar al usuario del que cuelga ese historico (ORA-02292). La tercera
+            barrera, el ORA-01031 que recibe el usuario de aplicacion por no tener concedido el
+            privilegio DELETE, la demuestra el oraculo dcl-0.0.1-18-06 del changelog dcl, que es
+            donde vive ese usuario.
+
+            NI UNA FILA RESIDUAL Y NI UNA SENTENCIA DDL
+            ==========================================
+            El bloque DESHACE SUS PROPIOS DATOS con un ROLLBACK final, y el manejador WHEN OTHERS lo
+            repite antes de relanzar el error para que tampoco un fallo deje basura detras. El bloque
+            entero viaja como una UNICA sentencia JDBC (de ahi splitStatements="false") y NO contiene
+            NINGUNA sentencia DDL: cualquier DDL provocaria un COMMIT IMPLICITO, el ROLLBACK final ya
+            no tendria nada que deshacer y los datos del oraculo quedarian grabados de forma
+            permanente. Los catalogos de clave fija se siembran por MERGE (o por un SELECT que cae a
+            INSERT si no existen) porque los changelogs dml se aplican DESPUES de los ddl: cuando
+            este oraculo corre, los catalogos pueden estar todavia vacios.
+        -->
+        <sql splitStatements="false" stripComments="false"><![CDATA[DECLARE
+    v_admin      NUMBER;
+    v_usuario    NUMBER;
+    v_oficina    NUMBER;
+    v_sala       NUMBER;
+    v_categoria  NUMBER;
+    v_inc        NUMBER;
+    v_aviso      VARCHAR2(36 CHAR);
+    v_audit      VARCHAR2(36 CHAR);
+    v_hash       VARCHAR2(64 CHAR);
+    v_leido      VARCHAR2(64 CHAR);
+    v_n          NUMBER;
+    v_sqlcode    NUMBER;
+    v_viejo      TIMESTAMP;
+    v_corte      TIMESTAMP;
+
+    c_admin_nom   CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Retencion Administrador';
+    c_usuario_nom CONSTANT VARCHAR2(150 CHAR) := 'Oraculo TSK-061 Retencion Empleado';
+    c_descripcion CONSTANT VARCHAR2(500 CHAR) := 'Incidencia del oraculo TSK-061 fechada 23 meses atras para verificar la ventana de retencion';
+    c_pwd_hash    CONSTANT VARCHAR2(255 CHAR) := 'hash-oraculo-tsk061-retencion-anterior';
+
+    FUNCTION uuid RETURN VARCHAR2 IS
+        l_uuid VARCHAR2(36 CHAR);
+    BEGIN
+        SELECT LOWER(REGEXP_REPLACE(RAWTOHEX(SYS_GUID()), '(.{8})(.{4})(.{4})(.{4})(.{12})', '\1-\2-\3-\4-\5'))
+          INTO l_uuid FROM dual;
+        RETURN l_uuid;
+    END uuid;
+
+    FUNCTION huella(p_semilla VARCHAR2) RETURN VARCHAR2 IS
+        l_hash VARCHAR2(64 CHAR);
+    BEGIN
+        SELECT RAWTOHEX(STANDARD_HASH(p_semilla, 'SHA256')) INTO l_hash FROM dual;
+        RETURN l_hash;
+    END huella;
+
+    PROCEDURE sembrar_rol(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER) IS
+    BEGIN
+        MERGE INTO cat_rol d
+        USING (SELECT p_code AS role_code FROM dual) s
+           ON (d.role_code = s.role_code)
+        WHEN NOT MATCHED THEN
+            INSERT (role_code, role_name, display_order, is_active)
+            VALUES (p_code, p_name, p_order, 'Y');
+    END sembrar_rol;
+
+    PROCEDURE sembrar_estado(p_code VARCHAR2, p_name VARCHAR2, p_order NUMBER, p_terminal VARCHAR2) IS
+    BEGIN
+        MERGE INTO cat_estado_incidencia d
+        USING (SELECT p_code AS status_code FROM dual) s
+           ON (d.status_code = s.status_code)
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, sort_order, is_terminal, is_active)
+            VALUES (p_code, p_name, p_order, p_terminal, 'Y');
+    END sembrar_estado;
+
+    FUNCTION oficina_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT office_id INTO l_id FROM cat_oficina WHERE office_code = 'ORA61';
+        UPDATE cat_oficina SET is_active = 'Y' WHERE office_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_oficina (office_code, office_name, city, is_active)
+                 VALUES ('ORA61', 'Oficina del oraculo TSK-061', 'Madrid', 'Y')
+              RETURNING office_id INTO l_id;
+            RETURN l_id;
+    END oficina_oraculo;
+
+    FUNCTION sala_oraculo(p_office_id NUMBER, p_created_by NUMBER) RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT room_id INTO l_id FROM cat_sala WHERE room_code = 'ORA61-SALA-01';
+        UPDATE cat_sala SET is_active = 'Y' WHERE room_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_sala (room_code, room_name, office_id, is_active, created_by)
+                 VALUES ('ORA61-SALA-01', 'Sala del oraculo TSK-061', p_office_id, 'Y', p_created_by)
+              RETURNING room_id INTO l_id;
+            RETURN l_id;
+    END sala_oraculo;
+
+    FUNCTION categoria_oraculo RETURN NUMBER IS
+        l_id NUMBER;
+    BEGIN
+        SELECT category_id INTO l_id FROM cat_categoria_incidencia WHERE category_code = 'CLIMATIZACION';
+        UPDATE cat_categoria_incidencia SET is_active = 'Y' WHERE category_id = l_id AND is_active <> 'Y';
+        RETURN l_id;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            INSERT INTO cat_categoria_incidencia (category_code, category_name, display_order, is_active)
+                 VALUES ('CLIMATIZACION', 'Climatizacion oraculo TSK-061', 961, 'Y')
+              RETURNING category_id INTO l_id;
+            RETURN l_id;
+    END categoria_oraculo;
+
+    PROCEDURE exigir_una(p_filas NUMBER, p_codigo NUMBER, p_tabla VARCHAR2) IS
+    BEGIN
+        IF p_filas <> 1 THEN
+            RAISE_APPLICATION_ERROR(p_codigo, 'ORACULO AC-G-07 / AC-TRZ-04: la tabla ' || p_tabla ||
+                ' deberia conservar 1 registro de 23 meses de antiguedad intacto y consultable, y devuelve ' || p_filas);
+        END IF;
+    END exigir_una;
+
+    PROCEDURE exigir_sqlcode(p_obtenido NUMBER, p_esperado NUMBER, p_codigo NUMBER, p_caso VARCHAR2) IS
+    BEGIN
+        IF p_obtenido <> p_esperado THEN
+            RAISE_APPLICATION_ERROR(p_codigo, 'ORACULO REQ-047: ' || p_caso || ' deberia fallar con SQLCODE ' ||
+                p_esperado || ' y el obtenido ha sido ' || p_obtenido);
+        END IF;
+    END exigir_sqlcode;
+BEGIN
+    v_viejo := CAST(ADD_MONTHS(CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE), -23) AS TIMESTAMP);
+    v_corte := CAST(ADD_MONTHS(CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE), -22) AS TIMESTAMP);
+
+    sembrar_rol('EMPLEADO', 'Empleado', 911);
+    sembrar_rol('ADMINISTRADOR', 'Administrador', 913);
+    sembrar_estado('ABIERTA', 'Abierta', 1, 'N');
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm)
+         VALUES (c_admin_nom, 'oraculo.tsk061.retencion.admin@example.invalid',
+                 'oraculo.tsk061.retencion.admin', 'ADMINISTRADOR', 'ACTIVO',
+                 'hash-oraculo-tsk061-retencion-admin', 'argon2id')
+      RETURNING user_id INTO v_admin;
+
+    INSERT INTO usuario (full_name, corporate_email, username, role_code, status,
+                         password_hash, password_algorithm, created_at, created_by)
+         VALUES (c_usuario_nom, 'oraculo.tsk061.retencion@example.invalid',
+                 'oraculo.tsk061.retencion', 'EMPLEADO', 'ACTIVO',
+                 'hash-oraculo-tsk061-retencion', 'argon2id', v_viejo, v_admin)
+      RETURNING user_id INTO v_usuario;
+
+    v_oficina   := oficina_oraculo;
+    v_sala      := sala_oraculo(v_oficina, v_admin);
+    v_categoria := categoria_oraculo;
+
+    INSERT INTO incidencia (reference_code, room_id, category_id,
+                            room_name_snapshot, office_name_snapshot, category_name_snapshot,
+                            description, status, reported_by, created_at, status_changed_at)
+         VALUES ('INC-ORA61-000021', v_sala, v_categoria,
+                 'Sala del oraculo TSK-061', 'Oficina del oraculo TSK-061', 'Climatizacion oraculo TSK-061',
+                 c_descripcion, 'ABIERTA', v_usuario, v_viejo, v_viejo)
+      RETURNING incident_id INTO v_inc;
+
+    -- (1) incidencia_historico: asiento de alta de hace 23 meses.
+    v_hash := huella('ORA61|RETENCION|0');
+    INSERT INTO incidencia_historico (incident_id, entry_type, from_status, to_status,
+                                      actor_user_id, actor_display_name, changed_at,
+                                      previous_entry_hash, entry_hash)
+         VALUES (v_inc, 'CREACION', NULL, 'ABIERTA',
+                 v_usuario, c_usuario_nom, v_viejo,
+                 NULL, v_hash);
+
+    -- (2) usuario_historico: asiento de alta de la cuenta, de hace 23 meses.
+    INSERT INTO usuario_historico (user_id, change_type, new_status, changed_by, valid_from, changed_at)
+         VALUES (v_usuario, 'ESTADO', 'ACTIVO', v_admin, v_viejo, v_viejo);
+
+    -- (3) usuario_password_historico: contrasenia anterior retirada hace 23 meses.
+    INSERT INTO usuario_password_historico (user_id, password_hash, created_at)
+         VALUES (v_usuario, c_pwd_hash, v_viejo);
+
+    -- (4) auditoria_acceso: trg_auditoria_acceso_servidor sella occurred_at con la hora del
+    --     servidor, de modo que esta entrada NO puede fecharse 23 meses atras. Lo que se verifica
+    --     mas abajo es su ventana de retencion declarada y su inmutabilidad.
+    INSERT INTO auditoria_acceso (user_id, event_type, outcome, operation)
+         VALUES (v_usuario, 'login_ok', 'OK', 'ORACULO-TSK-061')
+      RETURNING audit_id INTO v_audit;
+
+    -- (5) aviso_correo y (6) aviso_correo_intento: entrega registrada hace 23 meses.
+    v_aviso := uuid;
+    INSERT INTO aviso_correo (notification_id, notification_key, notification_type,
+                              recipient_user_id, recipient_email, subject, status, created_at)
+         VALUES (v_aviso, 'ORACULO-TSK-061-RETENCION-' || v_usuario, 'CREDENTIAL_ISSUED',
+                 v_usuario, 'oraculo.tsk061.retencion@example.invalid',
+                 'Credenciales de acceso', 'PENDIENTE', v_viejo);
+
+    INSERT INTO aviso_correo_intento (attempt_id, notification_id, attempt_number, attempted_at,
+                                      result_code, recipient_count, message_id)
+         VALUES (uuid, v_aviso, 1, v_viejo,
+                 'SENT', 1, 'oraculo-tsk061-retencion@example.invalid');
+
+    -- (7) resolucion_destinatario_log: resolucion de destinatarios de hace 23 meses.
+    INSERT INTO resolucion_destinatario_log (request_type, requested_by_module, subject_user_id,
+                                             resolved_user_ids, recipient_count, is_fallback_used,
+                                             outcome, resolved_at)
+         VALUES ('INDIVIDUAL', 'ORACULO-TSK-061', v_usuario,
+                 '[' || v_usuario || ']', 1, 'N',
+                 'OK', v_viejo);
+
+    -- ------------------------------------------------------------------------------
+    -- AC-G-07 / AC-TRZ-04: los registros de 23 meses siguen ahi, intactos y legibles
+    -- ------------------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_n FROM incidencia
+     WHERE incident_id = v_inc AND created_at <= v_corte;
+    exigir_una(v_n, -20720, 'incidencia');
+
+    SELECT COUNT(*) INTO v_n FROM incidencia_historico
+     WHERE incident_id = v_inc AND changed_at <= v_corte;
+    exigir_una(v_n, -20721, 'incidencia_historico');
+
+    SELECT COUNT(*) INTO v_n FROM usuario_historico
+     WHERE user_id = v_usuario AND changed_at <= v_corte;
+    exigir_una(v_n, -20722, 'usuario_historico');
+
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND created_at <= v_corte;
+    exigir_una(v_n, -20723, 'usuario_password_historico');
+
+    SELECT COUNT(*) INTO v_n FROM aviso_correo_intento
+     WHERE notification_id = v_aviso AND attempted_at <= v_corte;
+    exigir_una(v_n, -20724, 'aviso_correo_intento');
+
+    SELECT COUNT(*) INTO v_n FROM resolucion_destinatario_log
+     WHERE subject_user_id = v_usuario AND resolved_at <= v_corte;
+    exigir_una(v_n, -20725, 'resolucion_destinatario_log');
+
+    -- auditoria_acceso: entrada consultable y con una ventana de retencion que cubre 23 meses.
+    SELECT COUNT(*) INTO v_n FROM auditoria_acceso
+     WHERE audit_id = v_audit AND retention_until >= ADD_MONTHS(TRUNC(SYSDATE), 23);
+    exigir_una(v_n, -20726, 'auditoria_acceso');
+
+    -- El contenido no ha sido alterado: la huella almacenada es la que se escribio.
+    SELECT entry_hash INTO v_leido FROM incidencia_historico WHERE incident_id = v_inc;
+    IF v_leido <> v_hash THEN
+        RAISE_APPLICATION_ERROR(-20727, 'ORACULO AC-TRZ-04: el entry_hash del asiento de 23 meses ha cambiado');
+    END IF;
+
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND password_hash = c_pwd_hash;
+    exigir_una(v_n, -20728, 'usuario_password_historico (contenido intacto)');
+
+    -- ------------------------------------------------------------------
+    -- AC-G-09: el esquema no declara ningun job programado de purga
+    -- ------------------------------------------------------------------
+    SELECT COUNT(*) INTO v_n FROM user_scheduler_jobs;
+    IF v_n <> 0 THEN
+        RAISE_APPLICATION_ERROR(-20730, 'ORACULO AC-G-09: el esquema declara ' || v_n ||
+            ' jobs programados y no debe existir ninguna purga automatica de datos');
+    END IF;
+
+    -- ------------------------------------------------------------------
+    -- REQ-047: sin borrado fisico, ni siquiera para el dueno del esquema
+    -- ------------------------------------------------------------------
+    BEGIN
+        DELETE FROM incidencia_historico WHERE incident_id = v_inc;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20002, -20731, 'borrar una entrada de incidencia_historico');
+
+    BEGIN
+        DELETE FROM auditoria_acceso WHERE audit_id = v_audit;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20003, -20732, 'borrar una entrada de auditoria_acceso');
+
+    BEGIN
+        DELETE FROM usuario_historico WHERE user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20001, -20733, 'borrar una entrada de usuario_historico');
+
+    BEGIN
+        DELETE FROM aviso_correo_intento WHERE notification_id = v_aviso;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20004, -20734, 'borrar una entrada de aviso_correo_intento');
+
+    BEGIN
+        DELETE FROM resolucion_destinatario_log WHERE subject_user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -20005, -20735, 'borrar una entrada de resolucion_destinatario_log');
+
+    BEGIN
+        DELETE FROM usuario WHERE user_id = v_usuario;
+        v_sqlcode := 0;
+    EXCEPTION
+        WHEN OTHERS THEN v_sqlcode := SQLCODE;
+    END;
+    exigir_sqlcode(v_sqlcode, -2292, -20736, 'borrar fisicamente un usuario con historico');
+
+    -- La unica eliminacion automatica del esquema acota a tres las contrasenias anteriores por
+    -- usuario (reutilizacion), no purga por antiguedad: la entrada de 23 meses sigue ahi.
+    SELECT COUNT(*) INTO v_n FROM usuario_password_historico
+     WHERE user_id = v_usuario AND created_at <= v_corte;
+    exigir_una(v_n, -20737, 'usuario_password_historico (supervivencia final)');
+
+    ROLLBACK;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE;
+END;]]></sql>
+        <rollback><!-- Oraculo de solo verificacion: deshace sus propios datos, no hay cambio que revertir --></rollback>
+    </changeSet>
+
+</databaseChangeLog>
