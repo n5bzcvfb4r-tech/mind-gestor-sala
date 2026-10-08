@@ -52,3 +52,44 @@ class CuentaBloqueadaError(ErrorDominio):
 
     def __init__(self, mensaje: str = mensajes.CUENTA_BLOQUEADA) -> None:
         super().__init__(mensaje)
+
+
+class RolNoResolubleError(ErrorDominio):
+    """
+    El rol efectivo del usuario de la sesion no se puede resolver desde la base de datos.
+
+    Ocurre cuando el usuario no tiene `role_code`, cuando su `role_code` no pertenece al
+    catalogo `cat_rol`, o cuando el usuario esta inactivo. El comportamiento es FAIL-CLOSED
+    (REQ-018, AC-ROL-02): se deniega con 403 y NUNCA se degrada a un permiso mas amplio.
+
+    El `motivo` ("sin_rol", "rol_desconocido", "usuario_inactivo") es traza interna y no se
+    serializa en la respuesta: los tres casos comparten el mismo texto para no servir de
+    oraculo sobre el estado del usuario.
+    """
+
+    codigo = "PERM_DENIED"
+    http_status = 403
+
+    def __init__(self, mensaje: str = mensajes.SIN_PERMISOS, *, motivo: str = "desconocido") -> None:
+        self.motivo: str = motivo
+        super().__init__(mensaje)
+
+
+class PermisoDenegadoError(ErrorDominio):
+    """
+    El par (rol vigente, operacion) no tiene fila en `permiso_rol_operacion`.
+
+    Rige DENY BY DEFAULT (REQ-021, REQ-060): la AUSENCIA de fila es denegacion; no hay
+    permisos implicitos escritos en codigo.
+
+    `operation_code` y `role_code` son traza interna para el log, nunca parte del cuerpo de
+    la respuesta.
+    """
+
+    codigo = "PERM_DENIED"
+    http_status = 403
+
+    def __init__(self, mensaje: str = mensajes.SIN_PERMISOS, *, operation_code: str | None = None, role_code: str | None = None) -> None:
+        self.operation_code = operation_code
+        self.role_code = role_code
+        super().__init__(mensaje)

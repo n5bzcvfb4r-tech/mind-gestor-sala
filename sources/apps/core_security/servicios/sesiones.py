@@ -19,6 +19,12 @@ RESPUESTA UNIFORME (AC-SES-04). Todos los fallos de validacion lanzan la MISMA
 `SesionInvalidaError` con el mismo texto; el `motivo` ("ausente", "no_encontrada",
 "revocada", "caducada", "inactividad", "usuario_inactivo") es solo traza interna.
 
+ROL CONGELADO (REQ-011, REQ-018). El `role_code` de `sesion_usuario` es el rol congelado en
+la EMISION de la sesion. Se conserva como EVIDENCIA HISTORICA de con que rol se emitio y como
+base de comparacion para detectar un cambio de rol, pero YA NO ES LA FUENTE DE LA
+AUTORIZACION: el rol efectivo de cada peticion lo relee de la tabla `usuario`
+`ResolutorContextoSesion` (apps.core_security.servicios.contexto), al que `validar()` delega.
+
 SECRETOS (REQ-063, REQ-076). Ni la contrasenia en claro, ni `password_hash`, ni el
 identificador de sesion se escriben jamas en logs, trazas ni mensajes de error.
 """
@@ -27,6 +33,7 @@ from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
+from django.http import HttpRequest
 
 from apps.core.contexto import ContextoSesion, contexto_de_sesion, utc_now
 from apps.core.models.transaccional import SesionUsuarioEntity, UsuarioEntity
@@ -71,17 +78,33 @@ class ServicioSesiones:
 
     # --- Validacion ------------------------------------------------------
 
-    def validar(self, credencial: str | None) -> ContextoSesion:
+    def validar(self, credencial: str | None, *, request: HttpRequest | None = None) -> ContextoSesion:
         """
         Valida la credencial de sesion y devuelve el contexto de la identidad efectiva.
 
         Lanza SIEMPRE `SesionInvalidaError` ante cualquier fallo, con el mismo mensaje y el
         motivo real solo en la traza interna.
 
+        ROL VIGENTE, NO CONGELADO (REQ-011, REQ-018, AC-PERM-05). El `role_code` del contexto
+        devuelto es el VIGENTE EN LA TABLA `usuario`, releido de la base en CADA peticion a
+        partir del `session_user_id`, y NO el que quedo congelado en `sesion_usuario` al emitir
+        la sesion. Por eso un cambio de rol hecho por el ADMINISTRADOR surte efecto en la
+        SIGUIENTE peticion del usuario, sin obligarle a volver a iniciar sesion. Si el rol no se
+        puede resolver, el resolutor deniega FAIL-CLOSED con `RolNoResolubleError` (403).
+
+        Cualquier rol, alcance o `user_id` que venga del cliente (cuerpo, query string o
+        cabecera) se descarta en SILENCIO: no produce error y no participa en ninguna decision
+        (REQ-018). `request` es OPCIONAL y se usa UNICAMENTE para dejar traza a nivel DEBUG de
+        lo que se ha ignorado; la identidad jamas se extrae de ahi.
+
         El `data_scope` del contexto NO se calcula aqui: se deja el valor por defecto del
         dataclass. El alcance efectivo de cada operacion lo resuelve la capa de autorizacion
         contra la matriz `permiso_rol_operacion`, que no es responsabilidad de este servicio.
         """
+
+        # Import local a proposito: `servicios.contexto` importa `ESTADO_USUARIO_ACTIVO` de este
+        # modulo, y un import a nivel de modulo en sentido contrario crearia un ciclo.
+        from apps.core_security.servicios.contexto import ResolutorContextoSesion
 
         if not credencial:
             raise SesionInvalidaError(motivo="ausente")
@@ -112,12 +135,10 @@ class ServicioSesiones:
         sesion.last_activity_at = ahora
         sesion.save(update_fields=["last_activity_at"])
 
-        return ContextoSesion(
-            user_id=sesion.user_id,
-            role_code=sesion.role_code_id,
-            session_id=sesion.session_id,
-            display_name=sesion.user.full_name,
-        )
+        resolutor = ResolutorContextoSesion()
+        if request is not None:
+            return resolutor.resolver_desde_peticion(request, sesion)
+        return resolutor.resolver(sesion)
 
     def _sellar_caducidad(self, sesion: SesionUsuarioEntity, ahora: datetime) -> None:
         """Sella la revocacion por caducidad UNA sola vez; si ya estaba revocada no la reescribe."""
@@ -191,6 +212,9 @@ class ServicioSesiones:
         `session_id` lo genera el default uuid del modelo; `role_code` congela el rol VIGENTE
         en el instante de la emision, leido de la base, y `expires_at` queda siempre posterior
         a `issued_at` (vencimiento ABSOLUTO, REQ-055).
+
+        Ese `role_code` congelado es EVIDENCIA HISTORICA y base de comparacion para detectar un
+        cambio de rol; la autorizacion de cada peticion NO lo usa (REQ-018).
         """
 
         ahora = utc_now()
