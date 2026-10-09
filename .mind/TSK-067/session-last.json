@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-067",
+  "attempt": 2,
+  "at": "2026-10-09T12:29:37.141921+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-067 — Emisión/reposición de credenciales por el ADMINISTRADOR (EP-017) y estado de credencial (EP-019), sobre el arquetipo REAL del repo (Django 5.2 + DRF + Oracle), no sobre las plantillas FastAPI/SQLAlchemy del handbook.\n\n## Lo que traía este intento\nEl intento anterior dejó la funcionalidad construida y el compilador en VERDE. La verificación reportó UN solo defecto, de manifiesto:\n\n  «dependency-manifest: el código importa paquetes no declarados en requirements/pyproject: `aiosmtpd`»\n\nDi",
+  "model": "claude-opus-5",
+  "input_tokens": 1783527,
+  "output_tokens": 13757,
+  "llm_calls": 54,
+  "cost_usd": 2.1464309999999998,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "8253a247c6e16c077f1640011e17fd988090420b",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
