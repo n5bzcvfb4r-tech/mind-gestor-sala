@@ -58,6 +58,11 @@ MOTIVO_DEMASIADO_LARGO = "El motivo del restablecimiento no puede superar los 25
 
 # Literal del 422 de REQ-074: busquedas de uno o dos caracteres devolverian practicamente el
 # censo entero y obligarian a un recorrido completo de tabla sin aportar nada al administrador.
+#: REQ-074 validacion 1 / escenario 2: el filtro de rol debe ser un valor del catalogo
+#: `cat_rol`, que se consulta en la base. No se enumeran aqui los codigos: el catalogo es
+#: su unica fuente de verdad y copiarlos crearia una segunda que se desalinearia.
+ROL_NO_VALIDO = "El rol indicado no pertenece al catálogo de roles"
+
 BUSQUEDA_DEMASIADO_CORTA = "El texto de búsqueda debe tener al menos 3 caracteres"
 
 # Literal informativo de REQ-074 para el listado vacio. NO es un error: acompania a una respuesta
@@ -75,6 +80,7 @@ CREDENCIAL_NO_GENERABLE = "No se ha podido generar la credencial temporal"
 __all__ = [
     "AUTORRESTABLECIMIENTO_NO_PERMITIDO",
     "BUSQUEDA_DEMASIADO_CORTA",
+    "ROL_NO_VALIDO",
     "CREDENCIAL_NO_GENERABLE",
     "CUENTA_INACTIVA",
     "MOTIVO_DEMASIADO_LARGO",
