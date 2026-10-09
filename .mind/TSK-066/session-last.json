@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-066",
+  "attempt": 2,
+  "at": "2026-10-09T11:34:02.662204+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-066 · Bloqueo temporal por intentos fallidos y desbloqueo administrativo (ARC-013). Arquetipo `container-python` = Django 5.2 + DRF sobre Oracle 23ai; todo bajo `sources/`, sin segundo árbol.\n\n## Defecto del intento anterior: ARREGLADO EN SU ORIGEN\n\nEl informe reportaba `dependency-manifest: el código importa paquetes no declarados: 'sigue'`. **No existía tal import.** En `sources/apps/identidad/bloqueo/politica.py` el docstring de `PoliticaBloqueo.__init__` partía la frase «asi el import si",
+  "model": "claude-opus-5",
+  "input_tokens": 2650603,
+  "output_tokens": 15682,
+  "llm_calls": 63,
+  "cost_usd": 2.761263499999999,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "9b5bce2",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
