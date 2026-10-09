@@ -236,12 +236,19 @@ def manejador_excepciones(exc: Exception, context: dict[str, Any] | None) -> Res
         # Un fallo de sesion responde SIEMPRE el mismo texto (AC-SES-04), aunque la excepcion
         # se haya construido con un mensaje propio: el motivo real solo viaja por la traza.
         mensaje = mensajes.SESION_REQUERIDA if codigo == CODIGO_SESION_INVALIDA else str(exc.mensaje)
+        # Algunos errores de dominio traen una LISTA de incumplimientos que es parte de su
+        # contrato: el rechazo por politica de contrasenias (`AUTH_PASSWORD_POLICY`) debe
+        # responder 422 con todas las reglas incumplidas (AC-PWD-03, REQ-069), y `details` es
+        # el unico hueco del cuerpo canonico que puede transportarlas. Se lee con `getattr`
+        # para no acoplar este manejador transversal a una excepcion concreta de identidad: las
+        # `ErrorDominio` que no publican `detalles` siguen saliendo con `details: []`.
+        detalles = getattr(exc, "detalles", None)
         _registrar(trace_id, codigo, http_status, context, tipo)
         # Aqui salen `SesionInvalidaError` (401) y `PermisoDenegadoError`/`RolNoResolubleError`
         # (403). Esta rama hace `return`, asi que no puede solaparse con la del manejador por
         # defecto de DRF de mas abajo: cada intento denegado se contabiliza una sola vez.
         _registrar_denegacion(http_status, context)
-        return Response(cuerpo_error(codigo, mensaje, trace_id=trace_id), status=http_status)
+        return Response(cuerpo_error(codigo, mensaje, detalles, trace_id), status=http_status)
 
     # El manejador por defecto resuelve el status y, sobre todo, las cabeceras de la respuesta
     # (`WWW-Authenticate` en los 401, `Retry-After` en los 429), que hay que preservar.
