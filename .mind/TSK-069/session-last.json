@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-069",
+  "attempt": 1,
+  "at": "2026-10-09T13:14:03.336768+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-069 — Alta de usuario por el ADMINISTRADOR (EP-007 POST /users, 201) y consulta del censo (EP-008 GET /users, 200), sobre el arquetipo real del repo (Django 5.2 + DRF, modelos `managed=False` de `apps.core.models` gobernados por Liquibase, Oracle 23ai).\n\nQUÉ SE HA CONSTRUIDO (todo bajo `sources/apps/usuarios/`, extendiendo la zona existente sin duplicar símbolos)\n\n· `alta/normalizacion.py` — forma canónica del correo (minúsculas, sin espacios) y del nombre (espacios colapsados). El valor com",
+  "model": "claude-opus-5",
+  "input_tokens": 10312207,
+  "output_tokens": 61079,
+  "llm_calls": 283,
+  "cost_usd": 17.23847215,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "849cd376ff6712152b64fe68d6c60d54528b6a25",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
