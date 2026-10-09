@@ -46,6 +46,7 @@ from __future__ import annotations
 import hmac
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -101,6 +102,11 @@ CAMPOS_CREDENCIAL: tuple[str, ...] = (
     "must_change_password",
     "password_expires_at",
 )
+
+#: Columna que SOLO se escribe en una EMISION de credencial temporal (EP-007 alta, EP-017
+#: restablecimiento), nunca en un cambio elegido por el usuario: sella cuando se emitio la
+#: credencial que esta a punto de entregarse, y es lo que invalida la anterior (REQ-038).
+CAMPO_EMISION_CREDENCIAL = "credential_issued_at"
 
 # Separador de los componentes de un hash codificado de Django (`algoritmo$parametros$sal$hash`).
 SEPARADOR_HASH = "$"
@@ -372,7 +378,15 @@ class ServicioCustodiaCredenciales:
 
         return incumplidas
 
-    def establecer(self, usuario: UsuarioEntity, nueva_password: str, *, actor: ContextoSesion | None) -> Verificador:
+    def establecer(
+        self,
+        usuario: UsuarioEntity,
+        nueva_password: str,
+        *,
+        actor: ContextoSesion | None,
+        pendiente_de_cambio: bool = False,
+        expira_en: datetime | None = None,
+    ) -> Verificador:
         """
         Establece la contrasenia del usuario: PUNTO UNICO de los tres flujos (REQ-069).
 
@@ -392,10 +406,30 @@ class ServicioCustodiaCredenciales:
            escrituras falla no queda ni una contrasenia nueva sin historial ni un historial con una
            contrasenia que nunca llego a ser vigente (AC-PWD-04).
 
-        El UPDATE se acota con `update_fields` a las columnas de credencial e incluye
-        `password_updated_at = utc_now()`, `must_change_password = 'N'` -la contrasenia recien
-        establecida ya no esta pendiente de cambio (AC-PWD-01)- y `password_expires_at = None`, que
-        retira la caducidad de una credencial temporal que acaba de ser sustituida por una definitiva.
+        El UPDATE se acota con `update_fields` a las columnas de credencial e incluye siempre
+        `password_updated_at = utc_now()`.
+
+        CONTRASENIA DEFINITIVA O CREDENCIAL TEMPORAL. Por DEFECTO (`pendiente_de_cambio=False`,
+        `expira_en=None`) la contrasenia recien establecida NO queda pendiente de cambio
+        (`must_change_password = 'N'`, AC-PWD-01) y NO caduca (`password_expires_at = None`, que
+        ademas retira la caducidad de una credencial temporal que acaba de ser sustituida). Ese es el
+        caso del cambio propio (EP-005) y del primer acceso forzado (EP-006): el usuario ACABA DE
+        ELEGIR su contrasenia definitiva y no hay nada que exigirle despues.
+
+        EP-017 es el caso contrario: el administrador no elige la contrasenia del usuario, EMITE una
+        credencial TEMPORAL. Por eso pasa `pendiente_de_cambio=True` y un `expira_en`, y la fila queda
+        con `must_change_password = 'Y'` y `password_expires_at` informado (REQ-073 regla 3). Eso es
+        justo lo que obliga al usuario a elegir una contrasenia propia antes de poder operar
+        (AC-RST-01): sin esas dos marcas la credencial temporal seria indistinguible de una definitiva
+        y el usuario podria quedarse con la que le dio el administrador. Cuando se emite, se sella
+        ademas `credential_issued_at` con el MISMO instante que `password_updated_at` (REQ-038): es la
+        marca de emision que invalida la credencial anterior. En un cambio elegido por el usuario esa
+        columna NO se toca, porque no hay emision.
+
+        LA INVALIDACION DE LA CREDENCIAL ANTERIOR NO LA DA ESA MARCA, la da el propio UPDATE de
+        `password_hash` mas el archivado del hash anterior en `usuario_password_historico`, que ya
+        ocurre dentro del mismo `transaction.atomic()` del paso 3: en cuanto la transaccion confirma,
+        el hash viejo ya no esta en la fila y la contrasenia anterior deja de verificar.
 
         EL ACTOR NO SE INVENTA (REQ-064). `UsuarioEntity` hereda de `AtribucionMixin` y su `save()`
         exige contexto de sesion. Si se recibe `actor`, la escritura va dentro de
@@ -413,6 +447,14 @@ class ServicioCustodiaCredenciales:
             nueva_password: contrasenia en claro propuesta. No se registra ni se persiste jamas.
             actor: contexto de sesion con el que atribuir la escritura, o `None` para usar el
                 publicado por el middleware.
+            pendiente_de_cambio: `True` SOLO cuando lo que se persiste es una credencial temporal
+                que el usuario esta obligado a sustituir (EP-017). Deja `must_change_password = 'Y'`
+                y sella `credential_issued_at`. Por defecto `False`: contrasenia definitiva elegida
+                por el propio usuario.
+            expira_en: instante de caducidad de esa credencial temporal, o `None` -el defecto- para
+                que la contrasenia no caduque. Debe ser un `datetime` NAIVE EN UTC, como el que
+                devuelve `utc_now()`: en este proyecto esta PROHIBIDO mezclar `datetime` naive y
+                aware, y pasar uno con `tzinfo` desalinearia la comparacion de caducidad.
 
         Returns:
             Verificador: el material persistido, con el hash enmascarado en su `repr`.
@@ -434,7 +476,13 @@ class ServicioCustodiaCredenciales:
         with transaction.atomic():
             if hash_anterior:
                 self._historico.archivar(user_id=usuario.user_id, password_hash=hash_anterior)
-            self._escribir_credencial(usuario, verificador, actor=actor)
+            self._escribir_credencial(
+                usuario,
+                verificador,
+                actor=actor,
+                pendiente_de_cambio=pendiente_de_cambio,
+                expira_en=expira_en,
+            )
 
         logger.info("Credencial establecida", extra={"data": {"user_id": usuario.user_id}})
         return verificador
@@ -505,36 +553,59 @@ class ServicioCustodiaCredenciales:
 
         return any(self.verificar(password, candidato) for candidato in candidatos)
 
-    def _escribir_credencial(self, usuario: UsuarioEntity, verificador: Verificador, *, actor: ContextoSesion | None) -> None:
+    def _escribir_credencial(
+        self,
+        usuario: UsuarioEntity,
+        verificador: Verificador,
+        *,
+        actor: ContextoSesion | None,
+        pendiente_de_cambio: bool,
+        expira_en: datetime | None,
+    ) -> None:
         """
         Escribe las columnas de credencial de `usuario` con la atribucion del actor.
 
         El UPDATE se acota a `CAMPOS_CREDENCIAL`: esta operacion establece una contrasenia y no
         reinterpreta ninguna otra columna de la fila (ni el estado de la cuenta, ni el contador de
-        intentos fallidos, ni el bloqueo).
+        intentos fallidos, ni el bloqueo). La UNICA columna que se anade a esa lista es
+        `CAMPO_EMISION_CREDENCIAL`, y solo cuando lo que se persiste es una EMISION de credencial
+        temporal (`pendiente_de_cambio=True`): un cambio elegido por el usuario no emite nada y no
+        debe mover la marca de emision.
+
+        El instante se toma UNA SOLA VEZ y se reutiliza en `password_updated_at` y en
+        `credential_issued_at`: llamar dos veces a `utc_now()` dejaria las dos marcas separadas por
+        microsegundos y haria parecer que la emision y la escritura son dos hechos distintos.
         """
+
+        ahora = utc_now()
 
         usuario.password_hash = verificador.password_hash
         usuario.password_salt = verificador.password_salt
         usuario.password_algorithm = verificador.password_algorithm
-        usuario.password_updated_at = utc_now()
-        usuario.must_change_password = INDICADOR_NO
-        usuario.password_expires_at = None
+        usuario.password_updated_at = ahora
+        usuario.must_change_password = INDICADOR_SI if pendiente_de_cambio else INDICADOR_NO
+        usuario.password_expires_at = expira_en
+
+        campos = list(CAMPOS_CREDENCIAL)
+        if pendiente_de_cambio:
+            usuario.credential_issued_at = ahora
+            campos.append(CAMPO_EMISION_CREDENCIAL)
 
         if actor is None:
             # Sin actor explicito se usa el contexto publicado por el middleware; si no hubiera
             # ninguno, `AtribucionMixin.save()` falla cerrado y la transaccion se deshace.
-            usuario.save(update_fields=list(CAMPOS_CREDENCIAL))
+            usuario.save(update_fields=campos)
             return
 
         with contexto_de_sesion(actor):
-            usuario.save(update_fields=list(CAMPOS_CREDENCIAL))
+            usuario.save(update_fields=campos)
 
 
 __all__ = [
     "ALGORITMO_POR_DEFECTO",
     "ALGORITMO_POR_HASHER",
     "CAMPOS_CREDENCIAL",
+    "CAMPO_EMISION_CREDENCIAL",
     "INDICADOR_NO",
     "INDICADOR_SI",
     "ServicioCustodiaCredenciales",
