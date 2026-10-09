@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-063",
+  "attempt": 1,
+  "at": "2026-10-09T08:23:55.549053+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-063 · Autenticación con credenciales propias y ciclo de vida de la sesión (ARC-013, app `apps.identidad`).\n\n## Hallazgo que condicionó el diseño\nEl `core_security` de TSK-001 (ARC-012) YA tenía montado EP-001 (`POST /api/auth/sessions`) y sus tests afirman `reverse(\"core_security:auth-sessions\")`. Redeclarar la ruta en `identidad` habría creado un segundo `path()` sobre el mismo string (Django casa por path: gana el primer `include()`, el de core_security) y habría dejado mi módulo huérfano ",
+  "model": "claude-opus-5",
+  "input_tokens": 9647454,
+  "output_tokens": 55312,
+  "llm_calls": 354,
+  "cost_usd": 13.792957349999998,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "6e488c1cdeb89792792951f755e7340bb881ea55",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
