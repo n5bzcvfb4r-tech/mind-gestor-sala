@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-020",
+  "attempt": 2,
+  "at": "2026-10-09T07:26:39.065800+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-020 — Entrega de avisos de credencial inicial y de restablecimiento vía SMTP (ARC-014, REQ-038 / REQ-073).\n\nZONA: `sources/apps/avisos/credenciales/entrega.py` (único fichero de producto tocado; extendido, sin redeclarar ningún símbolo preexistente).\n\nPUNTO DE PARTIDA. El tip del workspace ya traía de intentos previos de esta misma TSK la FASE 0 (composición en memoria del correo: `DatosCredencial`, `ContenidoCredencial`, `componer_contenido`, `asunto_persistible`) y la FASE 1 (`ServicioEntr",
+  "model": "claude-opus-5",
+  "input_tokens": 5046385,
+  "output_tokens": 33305,
+  "llm_calls": 105,
+  "cost_usd": 6.68124995,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "44b28a01be54d786ffb9b6d8b541b74dbf2f93d4",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
