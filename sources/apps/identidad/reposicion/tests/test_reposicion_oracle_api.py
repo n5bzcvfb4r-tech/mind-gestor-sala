@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from django.contrib.auth.hashers import check_password, make_password
+from django.utils.dateparse import parse_datetime
 
 from apps.core.contexto import utc_now
 from apps.core.models.catalogos import ConfiguracionSmtpEntity, RolEntity
@@ -504,3 +505,207 @@ def test_el_administrador_no_puede_restablecerse_a_si_mismo(cliente_api, smtp_ac
 
     assert releer(admin).password_hash == hash_anterior
     assert len(smtp_aceptando.mensajes) == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# EP-019 - GET /api/users/credential-status (AC-RST-04, AC-RST-05, REQ-074)
+# ---------------------------------------------------------------------------------------------
+# El oraculo de estos casos tampoco es «la vista respondio algo»: es QUE FILAS devuelve la consulta
+# contra el censo REAL de Oracle -con el CASE/WHEN de prioridad, el OFFSET..FETCH NEXT y las
+# comparaciones de `locked_until` resueltas por el motor- y, sobre todo, QUE NO devuelve: ningun
+# material de credencial. Un `dict` en memoria no acreditaria ni el desempate estable de la
+# paginacion ni el criterio de bloqueo vigente.
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+def test_AC_RST_04_el_listado_filtra_por_rol_por_bloqueo_y_por_cambio_pendiente(cliente_api) -> None:
+    """[AC-RST-04] Cada filtro devuelve UNICAMENTE las filas que lo cumplen, con locked_until en el futuro para las bloqueadas."""
+
+    ahora = utc_now()
+    admin = sembrar_usuario(ROL_ADMINISTRADOR, "rst04.admin")
+
+    tecnico_bloqueado = sembrar_usuario(ROL_TECNICO, "rst04.tecnico.bloqueado", locked_until=ahora + timedelta(hours=1))
+    # Bloqueo YA VENCIDO: la columna esta informada, pero la cuenta esta operativa. Es el caso que
+    # distingue «locked_until en el futuro» de «locked_until informado».
+    empleado_bloqueo_vencido = sembrar_usuario(ROL_EMPLEADO, "rst04.empleado.vencido", locked_until=ahora - timedelta(hours=1))
+    empleado_pendiente = sembrar_usuario(ROL_EMPLEADO, "rst04.empleado.pendiente", must_change_password=INDICADOR_SI)
+    empleado_normal = sembrar_usuario(ROL_EMPLEADO, "rst04.empleado.normal", must_change_password=INDICADOR_NO)
+
+    cabecera = abrir_sesion(admin)
+
+    # NO se afirma `totalCount` exacto en ningun punto de esta prueba: el censo trae ademas los
+    # usuarios de las semillas del changelog dml y los que haya sembrado otra prueba de la sesion.
+    # Lo que si es exacto -y es lo que acredita el filtro- es la PERTENENCIA de cada usuario
+    # sembrado aqui y la coherencia de CADA fila devuelta con el predicado pedido.
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"lockStatus": "bloqueado"}, **cabecera)
+    assert respuesta.status_code == 200, respuesta.content
+    bloqueadas = respuesta.json()["items"]
+    identificadores = {fila["userId"] for fila in bloqueadas}
+    assert tecnico_bloqueado.user_id in identificadores
+    assert empleado_bloqueo_vencido.user_id not in identificadores
+    for fila in bloqueadas:
+        assert fila["locked"] is True
+        assert fila["lockedUntil"] is not None
+        assert parse_datetime(fila["lockedUntil"]) > ahora
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"roleCode": ROL_TECNICO}, **cabecera)
+    assert respuesta.status_code == 200, respuesta.content
+    tecnicos = respuesta.json()["items"]
+    assert tecnico_bloqueado.user_id in {fila["userId"] for fila in tecnicos}
+    assert empleado_normal.user_id not in {fila["userId"] for fila in tecnicos}
+    for fila in tecnicos:
+        assert fila["roleCode"] == ROL_TECNICO
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"mustChangePassword": "true"}, **cabecera)
+    assert respuesta.status_code == 200, respuesta.content
+    pendientes = respuesta.json()["items"]
+    assert empleado_pendiente.user_id in {fila["userId"] for fila in pendientes}
+    for fila in pendientes:
+        assert fila["mustChangePassword"] is True
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+def test_AC_RST_04_ninguna_respuesta_del_listado_contiene_password_hash(cliente_api) -> None:
+    """[AC-RST-04] 0 ocurrencias de password_hash ni de ningun material de credencial en la respuesta."""
+
+    admin = sembrar_usuario(ROL_ADMINISTRADOR, "rst04fuga.admin")
+    sembrar_usuario(ROL_EMPLEADO, "rst04fuga.destino", must_change_password=INDICADOR_SI)
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, **abrir_sesion(admin))
+    assert respuesta.status_code == 200, respuesta.content
+
+    cuerpo = respuesta.json()
+
+    # EL ASSERT LITERAL DEL DoD: el cuerpo ENTERO serializado a texto, no una comprobacion por
+    # claves conocidas. Si el material de credencial se colara anidado en cualquier nivel -o con el
+    # nombre fisico del esquema en vez del camelCase del contrato-, aqui aparece.
+    texto = json.dumps(cuerpo)
+    for prohibida in (
+        "password_hash",
+        "passwordHash",
+        "password_salt",
+        "passwordSalt",
+        "password_algorithm",
+        "passwordAlgorithm",
+    ):
+        assert texto.count(prohibida) == 0, f"La respuesta publica {prohibida}"
+
+    # Y la prueba no es vacua: hay filas y sus claves son EXACTAMENTE las diez del contrato. Si
+    # alguien anade un campo al serializer, este assert se entera aunque no se llame `password_*`.
+    assert cuerpo["items"], "El listado vino vacio: la comprobacion de fuga seria vacua"
+    assert set(cuerpo["items"][0]) == {
+        "userId",
+        "fullName",
+        "corporateEmail",
+        "roleCode",
+        "status",
+        "passwordUpdatedAt",
+        "mustChangePassword",
+        "locked",
+        "lockedUntil",
+        "lastLoginAt",
+    }
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+@pytest.mark.parametrize("rol", [ROL_EMPLEADO, ROL_TECNICO])
+def test_AC_RST_05_un_tecnico_o_un_empleado_reciben_403_y_ninguna_fila(cliente_api, rol: str) -> None:
+    """[AC-RST-05] 403 y ninguna fila de datos de otros usuarios."""
+
+    solicitante = sembrar_usuario(rol, "rst05.solicitante")
+    sembrar_usuario(ROL_EMPLEADO, "rst05.otro", must_change_password=INDICADOR_SI)
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, **abrir_sesion(solicitante))
+
+    assert respuesta.status_code == 403, respuesta.content
+
+    # El cuerpo es el de error canonico del servicio (`code`, `message`, `details`, `traceId`): NO
+    # trae `items`, asi que no se filtra ni una fila del censo por el camino de la denegacion.
+    cuerpo = respuesta.json()
+    assert "items" not in cuerpo
+    assert cuerpo["code"] == "PERM_DENIED"
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+def test_el_listado_pagina_de_25_en_25_sin_repetir_ni_omitir_usuarios(cliente_api) -> None:
+    """[REQ-074 regla 2] 25 por pagina, con orden estable: ni filas repetidas ni omitidas entre paginas."""
+
+    admin = sembrar_usuario(ROL_ADMINISTRADOR, "pag.admin")
+    cabecera = abrir_sesion(admin)
+
+    # Primero se MIDE el censo que ya hay (semillas del changelog dml y usuarios de otras pruebas) y
+    # solo despues se siembra lo que falte para superar las dos paginas: fijar un numero a ciegas
+    # haria la prueba dependiente del orden de ejecucion del resto del fichero.
+    inicial = cliente_api.get(RUTA_ESTADO_CREDENCIAL, **cabecera)
+    assert inicial.status_code == 200, inicial.content
+    censo_previo = inicial.json()["totalCount"]
+
+    # Se siembra con `sembrar_usuario` en bucle y NO con un `bulk_create` propio: el helper ya
+    # resuelve el hash real, el sufijo que esquiva los indices unicos CI y los campos obligatorios
+    # del DDL. Es mas lento que un unico `bulk_create`, pero no puede quedarse desalineado con el
+    # esquema el dia que el DDL anada una columna NOT NULL.
+    objetivo = 2 * 25 + 5
+    for indice in range(max(0, objetivo - censo_previo)):
+        sembrar_usuario(ROL_EMPLEADO, f"pag.empleado{indice:03d}")
+
+    vistos: list[int] = []
+    totales: list[int] = []
+    paginas: list[int] = []
+    for numero in (1, 2, 3):
+        respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"page": numero}, **cabecera)
+        assert respuesta.status_code == 200, respuesta.content
+        cuerpo = respuesta.json()
+
+        assert cuerpo["page"] == numero
+        assert cuerpo["pageSize"] == 25
+        assert len(cuerpo["items"]) <= 25
+        if numero in (1, 2):
+            assert len(cuerpo["items"]) == 25, f"La pagina {numero} no vino llena pese a haber mas de 50 usuarios"
+
+        vistos.extend(fila["userId"] for fila in cuerpo["items"])
+        totales.append(cuerpo["totalCount"])
+        paginas.append(cuerpo["totalPages"])
+
+    # ESTE ES EL ASSERT QUE PRUEBA EL DESEMPATE ESTABLE: sin el `user_id` final del `order_by`, dos
+    # filas con el mismo `full_name` bailan entre consultas y un mismo usuario sale en dos paginas
+    # (mientras otro no sale en ninguna).
+    assert len(vistos) == len(set(vistos)), "Hay usuarios repetidos entre paginas: la ordenacion no es estable"
+
+    assert len(set(totales)) == 1, f"El total cambio entre paginas: {totales}"
+    total = totales[0]
+    assert total >= objetivo
+    assert paginas == [-(-total // 25)] * 3
+
+    # Una pagina por encima del total NO es un error (REQ-074): consulta valida, sin filas.
+    desbordada = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"page": paginas[0] + 50}, **cabecera)
+    assert desbordada.status_code == 200, desbordada.content
+    assert desbordada.json()["items"] == []
+
+
+@SALTAR_SIN_DOCKER
+@pytest.mark.django_db
+def test_el_listado_rechaza_una_busqueda_de_menos_de_tres_caracteres(cliente_api) -> None:
+    """[REQ-074 validacion 4] La busqueda libre exige al menos 3 caracteres."""
+
+    admin = sembrar_usuario(ROL_ADMINISTRADOR, "busqueda.admin")
+    cabecera = abrir_sesion(admin)
+
+    respuesta = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"search": "ab"}, **cabecera)
+
+    # 400 y no 422: el manejador unico (`apps/core_security/manejadores.py`) traduce TODA
+    # `ValidationError` de DRF a `HTTP_400_BAD_REQUEST` con `code = "VAL_INVALID_REQUEST"`. El
+    # status se comprobo en el codigo del repo, no se escribio de memoria.
+    assert respuesta.status_code == 400, respuesta.content
+    cuerpo = respuesta.json()
+    assert cuerpo["code"] == "VAL_INVALID_REQUEST"
+    assert "items" not in cuerpo
+
+    # Y con la longitud minima la misma consulta es valida: lo que se rechaza es el texto corto, no
+    # el parametro `search`.
+    aceptada = cliente_api.get(RUTA_ESTADO_CREDENCIAL, {"search": "abc"}, **cabecera)
+    assert aceptada.status_code == 200, aceptada.content
