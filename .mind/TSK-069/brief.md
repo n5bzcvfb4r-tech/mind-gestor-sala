@@ -2142,3 +2142,15 @@ La sesión previa **no entregó**. Corrige la causa antes de ampliar alcance:
 
 Acciones:
 - Fallo de infraestructura (gateway/runtime). No «arregles» el producto a ciegas; reintenta la entrega mínima del DoD.
+
+## Código ya presente en la zona (zone-extend) — OBLIGATORIO
+
+En el tip actual del workspace YA hay código bajo tus `zone_paths` (típicamente de una TSK predecesora mergeada). **Léelo antes de escribir.**
+
+Ficheros presentes (muestra):
+- `sources/apps/usuarios/urls.py`
+
+Disciplina:
+1. **EDIT/EXTIENDE** símbolos existentes (`class`/`def`/exports) — **PROHIBIDO** una segunda declaración con el mismo nombre en el mismo fichero.
+2. Añade routers/handlers nuevos en ficheros dedicados o ampliando el existente sin redefinir tipos ya presentes.
+3. Si el DoD pide API pública sobre el mismo dominio, reutiliza servicios/modelos del CRUD previo; no copies otra `MembershipPlanService`.
