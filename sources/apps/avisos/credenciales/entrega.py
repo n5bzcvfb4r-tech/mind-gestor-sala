@@ -60,21 +60,33 @@ nunca el contenido del correo, nunca la direccion en claro y nunca la contrasena
 """
 
 import html
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from django.db import transaction
+
 from apps.avisos.alta.composicion import configuracion_composicion
 from apps.avisos.motor.configuracion import ConfiguracionMotorAvisos, configuracion_motor
+from apps.avisos.motor.despachador import RESULTADO_ENVIADO
 from apps.avisos.motor.errores import ErrorMotorAvisos
-from apps.avisos.motor.estados import EstadoAviso, validar_transicion
+from apps.avisos.motor.estados import RESULTADOS_INTENTO, EstadoAviso, validar_transicion
 from apps.avisos.motor.outbox import (
     TIPO_CREDENCIAL_EMITIDA,
     TIPO_RESTABLECIMIENTO,
     TIPOS_CREDENCIAL,
     ServicioOutboxAvisos,
     outbox,
+)
+from apps.avisos.motor.repositorio import RepositorioAvisoCorreo
+from apps.avisos.motor.transporte import (
+    RESULTADO_TRANSITORIO,
+    MensajeCorreo,
+    ResultadoEntrega,
+    TransporteCorreo,
+    transporte_por_defecto,
 )
 from apps.core.contexto import utc_now
 
@@ -496,6 +508,124 @@ TRAZA_SOLICITUD_TOMADA = "Solicitud de aviso de credencial tomada para la entreg
 TRAZA_SOLICITUD_PREEXISTENTE = "La solicitud de aviso de credencial ya estaba encolada: no se toma ni se reescribe su estado"
 
 
+# --- Textos de error de entrega (sin acentos: son mensajes tecnicos persistidos) ----------
+#: Los dos mensajes de usuario del 502 NO se redeclaran aqui: ya los publica este modulo mas arriba
+#: (`MENSAJE_502_CREDENCIAL`, `MENSAJE_502_RESTABLECIMIENTO`) y los indexa `MENSAJE_502_POR_TIPO`.
+#: Son los literales CON acentos de REQ-038 y REQ-073, y la entrega los reutiliza tal cual.
+
+#: Motivo de no haber llegado siquiera a intentar la entrega. Va a `aviso_correo_intento.error_message`
+#: (maximo 500 caracteres), asi que es tecnico y sin acentos, y nombra la tabla donde mirar.
+SIN_CONFIGURACION_SMTP = "No hay configuracion SMTP activa y completa en `configuracion_smtp`: el aviso de credencial no se intenta entregar."
+
+#: Motivo de un fallo que el transporte no supo clasificar. Se registra como intento REINTENTABLE
+#: porque un error desconocido no demuestra que el correo sea inentregable, solo que esta entrega no
+#: prospero; la excepcion original nunca se vuelca aqui, para que su `repr` no arrastre la credencial.
+FALLO_INESPERADO_ENTREGA = "Fallo inesperado al entregar el aviso de credencial ({tipo}): se registra un intento reintentable."
+
+# --- Textos de traza de la fase de entrega (identificadores y codigos, nunca secretos) ----
+TRAZA_ENTREGADO = "Aviso de credencial entregado al buzon corporativo del usuario"
+TRAZA_NO_ENTREGADO = "El intento de entrega del aviso de credencial no ha prosperado: la solicitud queda FALLIDO"
+TRAZA_SIN_CONFIGURACION = "Sin configuracion SMTP activa: el aviso de credencial no se intenta entregar"
+TRAZA_ENTREGA_OMITIDA = "La entrega del aviso de credencial se omite: la solicitud no pertenece a esta peticion o ya consta entregada"
+TRAZA_FALLO_INESPERADO = "Fallo inesperado del transporte al entregar el aviso de credencial"
+
+
+@dataclass(frozen=True, slots=True)
+class ResultadoEntregaCredencial:
+    """
+    Desenlace de la fase 2: lo que el servicio de negocio recibe DESPUES del commit.
+
+    `entregado=False` NUNCA significa «deshaz la operacion». Cuando este resultado llega, el usuario
+    ya esta creado y el restablecimiento ya esta confirmado: la transaccion de negocio cerro en la
+    fase 1 y no hay nada que revertir (DoD de TSK-020, AC-AVI-05, REQ-038 regla 6). Lo unico que
+    procede es responder 502 con `mensaje_usuario` -el literal del requisito, ya en castellano- y
+    dejar que el ADMINISTRADOR REEMITA la credencial, que es generar un secreto nuevo con un
+    `discriminante` nuevo, no reintentar el envio del anterior.
+
+    `omitida=True` separa el caso en que NO hay fallo que reportar: esta peticion no es duena de la
+    solicitud -ya estaba encolada con la misma clave de idempotencia (REQ-130, AC-AVI-01) y la tomo
+    otra- o la solicitud ya consta `ENVIADO`. Ahi no se intento entregar nada y, por tanto, NO se
+    responde 502; por eso el llamante no puede mirar `entregado` a secas y mira `debe_responder_502`.
+
+    El resultado NO transporta la credencial ni la direccion del destinatario: solo identificadores,
+    el identificador de mensaje que devolvio el transporte y un codigo de error (REQ-076, REQ-079).
+    """
+
+    entregado: bool
+    notification_id: str
+    omitida: bool = False
+    message_id: str | None = None
+    codigo_error: str | None = None
+    mensaje_usuario: str | None = None
+
+    @property
+    def debe_responder_502(self) -> bool:
+        """
+        Unica senal que el servicio de negocio necesita para decidir el 502 de REQ-038 y REQ-073.
+
+        Se expone como propiedad y no se deja que el llamante componga la condicion a mano porque la
+        omision es exactamente el caso que se escapa al leer solo `entregado`: una entrega omitida
+        tambien tiene `entregado=False` y, sin embargo, no es un fallo que deba llegar al usuario.
+
+        Returns:
+            bool: `True` solo si hubo intento de entrega y no prospero.
+        """
+
+        return not self.entregado and not self.omitida
+
+    @classmethod
+    def entregado_con(cls, *, notification_id: str, message_id: str | None) -> "ResultadoEntregaCredencial":
+        """
+        Construye el desenlace de una entrega que SI prospero.
+
+        Args:
+            notification_id: identificador de la solicitud entregada.
+            message_id: identificador que devolvio el transporte, si lo publico.
+
+        Returns:
+            ResultadoEntregaCredencial: resultado entregado, sin mensaje de usuario que publicar.
+        """
+
+        return cls(entregado=True, notification_id=notification_id, message_id=message_id)
+
+    @classmethod
+    def no_entregado(cls, *, notification_id: str, codigo_error: str | None, mensaje_usuario: str) -> "ResultadoEntregaCredencial":
+        """
+        Construye el desenlace de un intento de entrega que no prospero.
+
+        `mensaje_usuario` es obligatorio a proposito: un fallo de entrega SIEMPRE acaba en una
+        respuesta 502 que el usuario lee, y dejar ese texto opcional permitiria devolver un 502 mudo.
+
+        Args:
+            notification_id: identificador de la solicitud que no se pudo entregar.
+            codigo_error: codigo de clasificacion del fallo, si el transporte lo publico.
+            mensaje_usuario: literal en castellano que el llamante devuelve en el 502.
+
+        Returns:
+            ResultadoEntregaCredencial: resultado no entregado, con `debe_responder_502` a `True`.
+        """
+
+        return cls(
+            entregado=False,
+            notification_id=notification_id,
+            codigo_error=codigo_error,
+            mensaje_usuario=mensaje_usuario,
+        )
+
+    @classmethod
+    def omitido(cls, *, notification_id: str) -> "ResultadoEntregaCredencial":
+        """
+        Construye el desenlace de una entrega que ni se intento, y que NO es un fallo.
+
+        Args:
+            notification_id: identificador de la solicitud cuya entrega se omite.
+
+        Returns:
+            ResultadoEntregaCredencial: resultado omitido, con `debe_responder_502` a `False`.
+        """
+
+        return cls(entregado=False, notification_id=notification_id, omitida=True)
+
 class ServicioEntregaCredencial:
     """
     Entrega de los avisos de credencial en DOS FASES, que es la unica forma en que el DoD se sostiene.
@@ -531,23 +661,37 @@ class ServicioEntregaCredencial:
     que la solicitud se tome en la fase 1 y que un fallo de entrega no revierta nada se deciden aqui.
     """
 
-    def __init__(self, *, outbox_servicio: ServicioOutboxAvisos | None = None, config: ConfiguracionMotorAvisos | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        outbox_servicio: ServicioOutboxAvisos | None = None,
+        config: ConfiguracionMotorAvisos | None = None,
+        transporte: TransporteCorreo | None = None,
+        repositorio: RepositorioAvisoCorreo | None = None,
+    ) -> None:
         """
         Construye el servicio guardando sus colaboradores SIN resolverlos.
 
         La resolucion es PEREZOSA, igual que en `ServicioOutboxAvisos`: este modulo se importa al
         cargar las URLs y los servicios de negocio, antes de que `django.setup()` haya terminado, y
-        tanto el outbox (que toca modelos del ORM) como `configuracion_motor()` (que lee `settings`)
+        tanto el outbox y el repositorio (que tocan modelos del ORM) como `configuracion_motor()`
+        (que lee `settings`) y el transporte (que lee la fila activa de `configuracion_smtp`)
         reventarian si se construyeran a nivel de modulo o en el constructor.
 
         Args:
             outbox_servicio: servicio de encolado; por defecto, el real (`outbox()`).
             config: configuracion del motor, de donde sale el identificador del trabajador; por
                 defecto, la vigente en `settings.AVISOS_MOTOR`.
+            transporte: puerto de entrega SMTP; por defecto, el que fabrica `transporte_por_defecto`
+                con la configuracion SMTP activa.
+            repositorio: acceso a datos de la cola para la traza del intento y el cierre de la
+                transicion; por defecto, el real (`RepositorioAvisoCorreo()`).
         """
 
         self._outbox: ServicioOutboxAvisos | None = outbox_servicio
         self._config: ConfiguracionMotorAvisos | None = config
+        self._transporte: TransporteCorreo | None = transporte
+        self._repositorio: RepositorioAvisoCorreo | None = repositorio
 
     # --- Resolucion perezosa de dependencias -------------------------------
 
@@ -564,6 +708,45 @@ class ServicioEntregaCredencial:
         if self._config is None:
             self._config = configuracion_motor()
         return self._config
+
+    def _resolver_repositorio(self) -> RepositorioAvisoCorreo:
+        """
+        Devuelve el repositorio inyectado o construye el real en el primer uso, nunca a nivel de modulo.
+
+        NO se reutiliza el repositorio del outbox a proposito: `ServicioOutboxAvisos` lo mantiene
+        PRIVADO (`_repositorio`, resuelto por `_resolver_repositorio`) y no publica ningun accesor,
+        asi que alcanzarlo seria hurgar en el estado interno de otro servicio y atar esta fase a un
+        detalle suyo que puede cambiar. `RepositorioAvisoCorreo` no guarda estado de negocio -solo
+        los modelos que resuelve de forma perezosa- y la conexion de base de datos la gestiona
+        Django por hilo, de modo que una instancia propia no abre nada adicional.
+
+        Returns:
+            RepositorioAvisoCorreo: acceso a datos de la cola de avisos y de su traza de intentos.
+        """
+
+        if self._repositorio is None:
+            self._repositorio = RepositorioAvisoCorreo()
+        return self._repositorio
+
+    def _resolver_transporte(self) -> TransporteCorreo | None:
+        """
+        Devuelve el transporte inyectado o fabrica el de produccion con la configuracion SMTP activa.
+
+        NO se memoriza el resultado de la fabrica: la fila activa de `configuracion_smtp` la puede
+        cambiar el ADMINISTRADOR en caliente y cada entrega debe trabajar con la vigente.
+
+        Devolver `None` NO es un error ni habilita ningun modo simulado: significa que no hay fila
+        activa en `configuracion_smtp`, y quien llama lo traduce a un intento `CONFIG_ERROR` con la
+        solicitud cerrada como `FALLIDO`. Sin transporte no se marca NADA como entregado.
+
+        Returns:
+            TransporteCorreo | None: el puerto de entrega vigente, o `None` si no hay configuracion
+            SMTP activa.
+        """
+
+        if self._transporte is not None:
+            return self._transporte
+        return transporte_por_defecto(self._resolver_config())
 
     # --- Fase 1: encolado dentro de la transaccion de negocio ---------------
 
@@ -672,3 +855,251 @@ class ServicioEntregaCredencial:
             TRAZA_SOLICITUD_TOMADA,
             extra={"data": {"notification_id": notification_id, "status": aviso.status, "locked_by": aviso.locked_by}},
         )
+
+    # --- Fase 2: entrega SMTP real, ya fuera de la transaccion de negocio ---
+
+    def entregar(self, solicitud: SolicitudCredencial, datos: DatosCredencial) -> ResultadoEntregaCredencial:
+        """
+        Entrega el aviso de credencial por SMTP y cierra su ciclo de vida, DESPUES del commit.
+
+        Se invoca SIEMPRE con la transaccion de negocio ya confirmada y NUNCA con ella abierta: abrir
+        una conexion SMTP dentro de la transaccion mantendria bloqueada la fila del usuario durante
+        todo el timeout del servidor de correo, atascando cualquier otra operacion sobre ese usuario.
+        El uso correcto es el que documenta la clase:
+
+        ```
+        servicio = servicio_entrega_credencial()
+        with transaction.atomic():
+            usuario = repositorio.crear(...)  # alta o restablecimiento
+            solicitud = servicio.encolar(datos)  # outbox, misma transaccion
+        resultado = servicio.entregar(solicitud, datos)  # ya fuera: SMTP real
+        if resultado.debe_responder_502:
+            raise AppError(502, resultado.mensaje_usuario)
+        ```
+
+        El cuerpo del correo se compone AQUI, en memoria, con la credencial todavia viva, y no se
+        persiste en ningun momento (ver la cabecera del modulo). El transporte no puede tumbar la
+        peticion: cualquier excepcion se captura y se convierte en un intento reintentable, porque la
+        operacion de negocio ya esta comprometida y no hay nada que revertir.
+
+        Args:
+            solicitud: la solicitud que devolvio `encolar` en la fase 1, ya confirmada en base.
+            datos: los mismos datos del aviso, con el secreto todavia en memoria.
+
+        Returns:
+            ResultadoEntregaCredencial: entregado, no entregado (con el literal del 502 que publica
+            `MENSAJE_502_POR_TIPO`) u omitido si la solicitud no pertenece a esta peticion o ya
+            constaba `ENVIADO`.
+
+        Raises:
+            ErrorEntregaCredencial: si los datos no bastan para redactar el aviso (defecto del
+                llamante; ver `DatosCredencial.validar`).
+            TransicionAvisoNoPermitidaError: si el estado de la solicitud no admite el cierre que
+                corresponde al desenlace de la entrega.
+        """
+
+        notification_id = solicitud.notification_id
+        aviso = solicitud.aviso
+
+        # GUARDA DE PROPIEDAD E IDEMPOTENCIA. Son dos casos distintos con el mismo desenlace:
+        # - `creada=False`: la solicitud ya estaba encolada con esa misma clave (REQ-130, AC-AVI-01),
+        #   asi que pertenece a OTRA emision y esta peticion no la tomo. Entregarla aqui duplicaria
+        #   el correo de aquella emision, y ademas con un secreto que no es el suyo.
+        # - `ENVIADO`: es estado TERMINAL (REQ-142 regla 2). Ese correo ya viajo y no se reenvia.
+        # Ninguno de los dos es un fallo, de modo que el llamante NO responde 502.
+        if not solicitud.creada or aviso.status == EstadoAviso.ENVIADO.value:
+            logger.info(
+                TRAZA_ENTREGA_OMITIDA,
+                extra={
+                    "data": {
+                        "notification_id": notification_id,
+                        "notification_type": datos.notification_type,
+                        "recipient_user_id": datos.user_id,
+                        "status": aviso.status,
+                        "creada": solicitud.creada,
+                    }
+                },
+            )
+            return ResultadoEntregaCredencial.omitido(notification_id=notification_id)
+
+        # El contenido se redacta en MEMORIA y no se escribe en la fila: lleva la credencial en claro
+        # (REQ-038 regla 1, REQ-073 regla 4). Se valida antes de tocar el transporte.
+        datos.validar()
+        contenido = componer_contenido(datos)
+
+        # Foto del destinatario del intento, en el MISMO formato que `componer_snapshot` del aviso de
+        # alta (REQ-135, AC-SMTP-11): array JSON con EXACTAMENTE `user_id`, `full_name` y
+        # `corporate_email`. Un aviso de credencial tiene siempre UN destinatario: el dueno del
+        # secreto. La direccion solo vive aqui, en la columna de auditoria; nunca en un log.
+        snapshot = json.dumps(
+            [
+                {
+                    "user_id": datos.user_id,
+                    "full_name": datos.full_name.strip(),
+                    "corporate_email": datos.corporate_email.strip(),
+                }
+            ],
+            ensure_ascii=False,
+        )
+        recuento = 1
+
+        transporte = self._resolver_transporte()
+        if transporte is None:
+            # Sin fila activa en `configuracion_smtp` no se intenta NADA y no se finge ningun envio:
+            # se deja un intento `CONFIG_ERROR` trazado y la solicitud cerrada sin entrega.
+            logger.warning(
+                TRAZA_SIN_CONFIGURACION,
+                extra={
+                    "data": {
+                        "notification_id": notification_id,
+                        "notification_type": datos.notification_type,
+                        "recipient_user_id": datos.user_id,
+                    }
+                },
+            )
+            resultado = ResultadoEntrega.de_configuracion(SIN_CONFIGURACION_SMTP)
+        else:
+            try:
+                resultado = transporte.enviar(
+                    MensajeCorreo(
+                        destinatarios=(datos.corporate_email.strip(),),
+                        asunto=contenido.subject,
+                        cuerpo_texto=contenido.body_text,
+                        cuerpo_html=contenido.body_html,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - el transporte NO puede tumbar una peticion ya comprometida
+                # El contrato del puerto dice que `enviar` no lanza, pero un transporte mal
+                # implementado no puede llevarse por delante un alta que ya esta confirmada. El
+                # detalle de la excepcion queda en el log (su `repr` no publica la credencial: ver
+                # `DatosCredencial.__repr__`) y lo que se persiste es un texto fijo y sin secretos.
+                logger.exception(
+                    TRAZA_FALLO_INESPERADO,
+                    extra={
+                        "data": {
+                            "notification_id": notification_id,
+                            "notification_type": datos.notification_type,
+                            "recipient_user_id": datos.user_id,
+                        }
+                    },
+                )
+                resultado = ResultadoEntrega.transitorio(FALLO_INESPERADO_ENTREGA.format(tipo=datos.notification_type))
+
+        return self._cerrar_entrega(aviso, resultado=resultado, snapshot=snapshot, recuento=recuento, datos=datos)
+
+    def _cerrar_entrega(
+        self,
+        aviso: "AvisoCorreoEntity",
+        *,
+        resultado: ResultadoEntrega,
+        snapshot: str,
+        recuento: int,
+        datos: DatosCredencial,
+    ) -> ResultadoEntregaCredencial:
+        """
+        Persiste el desenlace de la entrega: traza del intento y transicion, en UNA sola transaccion.
+
+        El intento y la transicion van juntos en el mismo `transaction.atomic()` a proposito: si se
+        escribieran por separado, un fallo entre ambos dejaria un intento trazado sin su transicion
+        -o una solicitud cerrada sin rastro de por que- y la auditoria de REQ-135 dejaria de cuadrar.
+
+        DECISION CENTRAL: un fallo NO devuelve la solicitud a `PENDIENTE`, a diferencia de lo que
+        hace el despachador de fondo con el resto de avisos. El motivo es el mismo que justifica todo
+        este modulo: el cuerpo NO esta persistido, porque lleva la credencial en claro. El despachador
+        de fondo solo sabe reenviar el contenido CONGELADO de la fila, de modo que reprogramar un
+        reintento solo conseguiria que encontrase la solicitud sin contenido y la cerrara como
+        `COMPOSICION_INCOMPLETA`: un reintento que no puede prosperar jamas. La via de reintento
+        correcta de REQ-038 (AC-USR-04) y de REQ-073 es REEMITIR la credencial -una emision nueva, con
+        un `discriminante` nuevo, que encola una solicitud distinta sin duplicar el registro del
+        usuario-, nunca reenviar esta. Por eso el cierre es `FALLIDO`, que es el estado honesto: sin
+        continuacion automatica y visible para el ADMINISTRADOR en las vistas de EP-047 y EP-048.
+
+        Args:
+            aviso: la solicitud tomada en la fase 1, en `ENVIANDO`.
+            resultado: desenlace que devolvio el transporte (o el `CONFIG_ERROR` sintetico si no lo hay).
+            snapshot: foto JSON del destinatario del intento.
+            recuento: numero de destinatarios del intento (siempre 1 en los avisos de credencial).
+            datos: datos del aviso, de donde salen el tipo y el literal del 502.
+
+        Returns:
+            ResultadoEntregaCredencial: entregado o no entregado, nunca omitido.
+
+        Raises:
+            TransicionAvisoNoPermitidaError: si el estado de la solicitud no admite el cierre.
+            ErrorMotorAvisos: si el transporte dijo `entregado` sin publicar `message_id`.
+        """
+
+        notification_id = str(aviso.pk)
+        repositorio = self._resolver_repositorio()
+
+        # Misma regla que `MotorAvisos._resultado_de_intento` (es privado, asi que se replica): un
+        # codigo ausente o ajeno al catalogo cerrado `RESULTADOS_INTENTO` se trata como
+        # `TRANSIENT_ERROR`, que es el lado seguro y evita tumbar el INSERT del intento con la CHECK
+        # `ck_aviso_intento_result`.
+        codigo = (resultado.error_code or "").strip().upper()
+        result_code = RESULTADO_ENVIADO if resultado.entregado else (codigo if codigo in RESULTADOS_INTENTO else RESULTADO_TRANSITORIO)
+
+        with transaction.atomic():
+            # El contador sube en memoria y lo persiste el UPDATE del cierre, que es lo que espera
+            # `registrar_intento` para numerar el intento (`uk_aviso_intento_correlativo`).
+            repositorio.incrementar_intento(aviso)
+            repositorio.registrar_intento(
+                aviso,
+                result_code=result_code,
+                smtp_response_code=resultado.smtp_response_code,
+                error_code=resultado.error_code,
+                error_message=resultado.error_message,
+                recipients_snapshot=snapshot,
+                recipient_count=recuento,
+                message_id=resultado.message_id,
+            )
+            if resultado.entregado:
+                repositorio.marcar_enviado(aviso, message_id=resultado.message_id)
+            else:
+                repositorio.marcar_fallido(
+                    aviso,
+                    last_error_code=resultado.error_code,
+                    last_error_message=resultado.error_message,
+                )
+
+        # Trazas con IDENTIFICADORES y codigos unicamente: ni la credencial, ni el cuerpo, ni la
+        # direccion corporativa del destinatario (REQ-063, REQ-076, REQ-079).
+        traza = {
+            "notification_id": notification_id,
+            "notification_type": datos.notification_type,
+            "recipient_user_id": datos.user_id,
+            "status": aviso.status,
+            "result": result_code,
+            "smtp_response_code": resultado.smtp_response_code,
+            "message_id": resultado.message_id,
+        }
+        if resultado.entregado:
+            logger.info(TRAZA_ENTREGADO, extra={"data": traza})
+            return ResultadoEntregaCredencial.entregado_con(notification_id=notification_id, message_id=resultado.message_id)
+
+        logger.warning(TRAZA_NO_ENTREGADO, extra={"data": traza})
+        return ResultadoEntregaCredencial.no_entregado(
+            notification_id=notification_id,
+            codigo_error=resultado.error_code,
+            mensaje_usuario=MENSAJE_502_POR_TIPO[datos.notification_type],
+        )
+
+
+def servicio_entrega_credencial() -> ServicioEntregaCredencial:
+    """
+    Punto de entrada de PRODUCCION del aviso de credencial: el servicio con sus colaboradores reales.
+
+    Es el UNICO punto que cablean el alta de usuario (EP-007, REQ-038) y el restablecimiento de
+    contrasena (EP-017, REQ-073), de modo que ninguno de los dos instancia la clase a mano ni decide
+    que transporte usar. Todos los colaboradores quedan sin resolver: el repositorio, el outbox, la
+    configuracion y el transporte se construyen en su primer uso, ya con `django.setup()` hecho.
+
+    Aqui NO existe ningun modo simulado ni de pruebas: si no hay configuracion SMTP activa, el
+    transporte es `None` y la entrega se cierra como `FALLIDO` con un intento `CONFIG_ERROR`. Los
+    dobles se inyectan por constructor desde las pruebas, nunca desde esta fabrica.
+
+    Returns:
+        ServicioEntregaCredencial: servicio listo para `encolar` (fase 1) y `entregar` (fase 2).
+    """
+
+    return ServicioEntregaCredencial()
