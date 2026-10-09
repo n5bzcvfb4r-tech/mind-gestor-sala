@@ -200,6 +200,14 @@ REST_FRAMEWORK = {
 SESION_INACTIVIDAD_MINUTOS = int(os.environ.get("SESION_INACTIVIDAD_MINUTOS", "30"))
 SESION_VIGENCIA_ABSOLUTA_HORAS = int(os.environ.get("SESION_VIGENCIA_ABSOLUTA_HORAS", "12"))
 
+# BLOQUEO TEMPORAL DE CUENTA POR INTENTOS FALLIDOS (ARC-013)
+# -------------------------------------------------------------
+# Umbral y duracion son parametros de politica, no constantes de negocio: el RFP no los
+# aporta (gap declarado en REQ-055/REQ-072) y el valor inferido -5 intentos, 15 minutos-
+# debe poder ajustarse por entorno sin tocar el codigo.
+BLOQUEO_UMBRAL_INTENTOS_FALLIDOS = int(os.environ.get("BLOQUEO_UMBRAL_INTENTOS_FALLIDOS", "5"))
+BLOQUEO_DURACION_MINUTOS = int(os.environ.get("BLOQUEO_DURACION_MINUTOS", "15"))
+
 # Argon2id es el algoritmo adaptativo del proyecto y el unico que admite el CHECK
 # `ck_usuario_pwd_algorithm` junto con bcrypt. La contrasenia se guarda SOLO como hash.
 PASSWORD_HASHERS = [
