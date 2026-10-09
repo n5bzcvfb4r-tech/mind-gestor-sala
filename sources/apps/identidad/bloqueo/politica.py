@@ -117,10 +117,10 @@ class PoliticaBloqueo:
         """
         Fija los parametros de la politica, tomandolos de `settings` si no se indican.
 
-        La lectura de `django.conf.settings` ocurre AQUI y no al importar el modulo: asi el
-        import sigue siendo dominio puro -no exige `django.setup()`- y un `override_settings`
-        en pruebas o un cambio de variable de entorno afecta a la siguiente instancia en vez de
-        quedar congelado en el primer import del proceso.
+        La lectura de `django.conf.settings` ocurre AQUI y no al importar el modulo: asi la
+        carga del modulo sigue siendo dominio puro -no exige `django.setup()`- y un
+        `override_settings` en pruebas o un cambio de variable de entorno afecta a la siguiente
+        instancia en vez de quedar congelado en la primera carga del proceso.
 
         Args:
             umbral: intentos fallidos consecutivos que disparan el bloqueo. `None` toma
