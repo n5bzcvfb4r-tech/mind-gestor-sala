@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-071",
+  "attempt": 1,
+  "at": "2026-10-09T14:23:21.906112+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-071 — Asignación y cambio de rol funcional con histórico inmutable (ARC-013).\n\n## Qué se ha construido\nMódulo nuevo `sources/apps/usuarios/roles/` (zona de la tarea), sobre el arquetipo real del repo (Django 5.2 + DRF + Oracle/oracledb, NO FastAPI), extendiendo el servicio de usuarios sin redeclarar sus modelos: `apps.core.models` sigue siendo el punto de entrada único al esquema T.5 y `usuario`/`usuario_historico` se usan con sus nombres físicos.\n\n- `mensajes.py` / `errores.py`: literales e",
+  "model": "claude-opus-5",
+  "input_tokens": 8407051,
+  "output_tokens": 70480,
+  "llm_calls": 275,
+  "cost_usd": 16.725331199999992,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "fe170b08d14570ae257e034c59a880b748e85a69",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
