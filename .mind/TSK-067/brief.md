@@ -2205,3 +2205,28 @@ El intento anterior dejó el módulo COMPILANDO, pero el artefacto entregado **n
 ```
 dependency-manifest: el código importa paquetes no declarados en requirements/pyproject: `aiosmtpd`. Añade pin `paquete==x.y.z` al manifiesto del host antes de entregar.
 ```
+
+## Código ya presente en la zona (zone-extend) — OBLIGATORIO
+
+En el tip actual del workspace YA hay código bajo tus `zone_paths` (típicamente de una TSK predecesora mergeada). **Léelo antes de escribir.**
+
+Ficheros presentes (muestra):
+- `sources/apps/identidad/reposicion/__init__.py`
+- `sources/apps/identidad/reposicion/auditoria.py`
+- `sources/apps/identidad/reposicion/consulta.py`
+- `sources/apps/identidad/reposicion/errores.py`
+- `sources/apps/identidad/reposicion/generador.py`
+- `sources/apps/identidad/reposicion/mensajes.py`
+- `sources/apps/identidad/reposicion/repositorio.py`
+- `sources/apps/identidad/reposicion/serializers.py`
+- `sources/apps/identidad/reposicion/servicio.py`
+- `sources/apps/identidad/reposicion/tests/__init__.py`
+- `sources/apps/identidad/reposicion/tests/conftest.py`
+- `sources/apps/identidad/reposicion/tests/test_entrega_credencial_smtp.py`
+- `sources/apps/identidad/reposicion/tests/test_reposicion_oracle_api.py`
+- `sources/apps/identidad/reposicion/views.py`
+
+Disciplina:
+1. **EDIT/EXTIENDE** símbolos existentes (`class`/`def`/exports) — **PROHIBIDO** una segunda declaración con el mismo nombre en el mismo fichero.
+2. Añade routers/handlers nuevos en ficheros dedicados o ampliando el existente sin redefinir tipos ya presentes.
+3. Si el DoD pide API pública sobre el mismo dominio, reutiliza servicios/modelos del CRUD previo; no copies otra `MembershipPlanService`.

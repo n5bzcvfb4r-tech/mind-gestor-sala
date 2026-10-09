@@ -42,6 +42,17 @@ dependencies = [
     # `oracledb`, ya pineado mas arriba.
     "testcontainers==4.13.2",
     "docker==7.2.0",
+    # Servidor SMTP de PRUEBA en proceso: lo exige el DoD de TSK-067 para acreditar AC-RST-03
+    # con un oraculo de comportamiento y no con una traza. El aviso de credencial se entrega
+    # contra un `aiosmtpd` escuchando en localhost a traves del transporte SMTP REAL del
+    # producto (`apps.avisos.motor.transporte.TransporteSmtp`): lo que se verifica es que un
+    # mensaje dirigido al `corporate_email` del usuario llega de verdad al servidor, porque un
+    # `log.info("correo enviado")` NO acredita el envio. Solo se importa desde
+    # `apps/identidad/reposicion/tests/`, nunca desde codigo de producto: la fabrica de
+    # produccion (`transporte_por_defecto`) no tiene ningun modo simulado. Se declara aqui, en
+    # el manifiesto del host y con pin exacto, por la misma razon que `testcontainers` y
+    # `docker`: ningun import de terceros puede quedar sin pin explicito.
+    "aiosmtpd==1.4.6",
     # ALIAS DE NOMBRE DE MODULO (no instala nada). El codigo importa `rest_framework`, pero
     # ese modulo lo publica la distribucion `djangorestframework`, pineada arriba, y no
     # existe ninguna distribucion llamada `rest_framework` en el indice. Esta linea declara
@@ -118,16 +129,8 @@ pytest-mock = "^3.14.1"
 # cuantificacion universal sobre un espacio de entradas, no una lista de ejemplos escogidos a
 # mano. Solo se importa desde `apps/avisos/resolucion/tests/`, nunca desde codigo de producto.
 hypothesis = "^6.140.3"
-# Servidor SMTP de PRUEBA en proceso (aiosmtpd): lo exige el DoD de TSK-067 para acreditar
-# AC-RST-03 con un oraculo de comportamiento y no con una traza. El aviso de credencial se
-# entrega contra un `aiosmtpd` escuchando en localhost a traves del transporte SMTP REAL del
-# producto (`apps.avisos.motor.transporte.TransporteSmtp`), de modo que lo que se verifica es
-# que un mensaje dirigido al `corporate_email` del usuario llega de verdad al servidor. Un
-# `log.info("correo enviado")` NO acredita el envio. Solo se importa desde
-# `apps/identidad/reposicion/tests/`, nunca desde codigo de producto: la fabrica de produccion
-# (`transporte_por_defecto`) no tiene ningun modo simulado.
-aiosmtpd = "^1.4.6"  # import: aiosmtpd
-# `testcontainers` y `docker` van pineados en [project].dependencies (manifiesto del host).
+# `testcontainers`, `docker` y `aiosmtpd` van pineados en [project].dependencies (manifiesto
+# del host) con pin exacto `==`, no aqui: alli esta documentado por que.
 
 # --- Pytest - Unit Testing ------------------------------------------
 [tool.pytest.ini_options]
