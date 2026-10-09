@@ -294,6 +294,29 @@ def actor_administrador() -> ContextoSesion:
     )
 
 
+class AsignacionDeRolFalsa:
+    """
+    Doble del servicio de asignacion de rol (`apps.usuarios.roles.ServicioRolUsuario`).
+
+    El alta REGISTRA el asiento de rol dentro de su propia transaccion (AC-ROL-01), y el servicio
+    real de roles escribe en `usuario_historico`, que aqui no existe: esta propiedad no toca Oracle
+    (ver el docstring del modulo). El doble no simula la tabla, solo ANOTA la asignacion que el alta
+    le pidio registrar, que es lo unico que esta propiedad necesita saber del rol.
+
+    Que anote en vez de no hacer nada importa: permite afirmar, sin mirar la base, que el asiento se
+    pide para el usuario recien creado, con SU rol y con el ADMINISTRADOR de la sesion como autor, y
+    no con un actor tomado del payload (REQ-004 RN-04, REQ-064).
+    """
+
+    def __init__(self) -> None:
+        self.asignaciones: list[tuple[int, str, int]] = []
+
+    def asignar_en_alta(self, usuario: Any, *, actor: ContextoSesion) -> None:
+        """Anota `(user_id, role_code, actor)` de la asignacion pedida por el alta."""
+
+        self.asignaciones.append((usuario.user_id, usuario.role_code_id, actor.user_id))
+
+
 def construir_servicio(censo: CensoFalso, parche: pytest.MonkeyPatch) -> ServicioAltaUsuario:
     """
     Arma el servicio REAL con el censo y la entrega dobles, y con la custodia de verdad.
@@ -309,7 +332,12 @@ def construir_servicio(censo: CensoFalso, parche: pytest.MonkeyPatch) -> Servici
     from apps.identidad.credenciales.servicio import ServicioCustodiaCredenciales
 
     parche.setattr(modulo_servicio, "transaction", TransaccionFalsa(censo))
-    return ServicioAltaUsuario(repositorio=censo, custodia=ServicioCustodiaCredenciales(), entrega=EntregaFalsa())
+    return ServicioAltaUsuario(
+        repositorio=censo,
+        custodia=ServicioCustodiaCredenciales(),
+        entrega=EntregaFalsa(),
+        roles=AsignacionDeRolFalsa(),
+    )
 
 
 @st.composite

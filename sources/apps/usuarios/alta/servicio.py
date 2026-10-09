@@ -57,6 +57,7 @@ from apps.identidad.reposicion.generador import caducidad_credencial_temporal, g
 from apps.usuarios.alta.errores import CorreoDuplicadoError, EntregaCredencialInicialFallidaError
 from apps.usuarios.alta.normalizacion import normalizar_correo, normalizar_nombre
 from apps.usuarios.alta.repositorio import ESTADO_ACTIVO, INDICADOR_SI, RepositorioAltaUsuario
+from apps.usuarios.roles.servicio import ServicioRolUsuario
 
 
 if TYPE_CHECKING:  # pragma: no cover - solo tipado: evita importar modelos antes de django.setup()
@@ -205,6 +206,7 @@ class ServicioAltaUsuario:
         repositorio: RepositorioAltaUsuario | None = None,
         custodia: ServicioCustodiaCredenciales | None = None,
         entrega: ServicioEntregaCredencial | None = None,
+        roles: ServicioRolUsuario | None = None,
     ) -> None:
         # Los tres colaboradores se resuelven de forma PEREZOSA (ver las propiedades de abajo),
         # igual que en `ServicioReposicionCredencial`: el repositorio resuelve modelos del ORM y la
@@ -218,6 +220,7 @@ class ServicioAltaUsuario:
         self._repositorio_inyectado = repositorio
         self._custodia_inyectada = custodia
         self._entrega_inyectada = entrega
+        self._roles_inyectado = roles
 
     @property
     def _repositorio(self) -> RepositorioAltaUsuario:
@@ -247,6 +250,19 @@ class ServicioAltaUsuario:
         if self._entrega_inyectada is None:
             self._entrega_inyectada = servicio_entrega_credencial()
         return self._entrega_inyectada
+
+    @property
+    def _roles(self) -> ServicioRolUsuario:
+        """
+        Servicio de asignacion de rol (ARC-013), instanciado en su primer uso.
+
+        Se inyecta por constructor por el mismo motivo que los otros tres colaboradores: poder
+        ejercitar el alta sin base de datos. En produccion se construye solo.
+        """
+
+        if self._roles_inyectado is None:
+            self._roles_inyectado = ServicioRolUsuario()
+        return self._roles_inyectado
 
     def crear(self, datos: DatosAltaUsuario, *, actor: ContextoSesion) -> UsuarioCreado:
         """
@@ -344,6 +360,17 @@ class ServicioAltaUsuario:
                         password_expires_at=expira_en,
                         credential_issued_at=ahora,
                     )
+
+                    # LA ASIGNACION DE ROL SE REGISTRA EN EL MISMO ACTO DEL ALTA Y EN LA MISMA
+                    # TRANSACCION (REQ-004 RN-01, REQ-043 RN-01, AC-ROL-01). No existe asignacion
+                    # diferida: o el usuario nace con su asiento de rol en `usuario_historico` -con
+                    # su actor y su instante- o no nace. Encadenarlo aqui dentro es lo que hace
+                    # imposible que quede una fila de `usuario` con un `role_code` que el historico
+                    # no respalda, que es justo el estado que ninguna consulta posterior sabria
+                    # reparar. El asiento lo escribe el modulo DUENO del rol (`apps.usuarios.roles`,
+                    # ARC-013); este caso de uso no conoce la forma de la tabla del historico ni la
+                    # semantica de `valid_from`/`valid_to`, solo el hecho de negocio.
+                    self._roles.asignar_en_alta(usuario, actor=actor)
 
                     # EL AVISO SE COMPONE AQUI DENTRO, Y NO ANTES, porque `user_id` no existe hasta
                     # despues del INSERT: lo genera la IDENTITY de Oracle. Encolar dentro de la
