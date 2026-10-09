@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-067",
+  "attempt": 1,
+  "at": "2026-10-09T12:24:47.100849+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-067 — Emisión/reposición de credenciales por el ADMINISTRADOR (EP-017) y estado de credencial (EP-019), sobre el arquetipo real del repo (Django 5.2 + DRF + Oracle, `managed=False`), NO sobre las plantillas FastAPI/SQLAlchemy del handbook.\n\n## Qué se ha construido\n\n**Zona `sources/apps/identidad/reposicion/` (nueva):**\n- `generador.py` — credencial temporal de 16 caracteres con `secrets` (entropía criptográfica), por encima del mínimo de 12 de REQ-073 regla 4. Cumple por construcción la polí",
+  "model": "claude-opus-5",
+  "input_tokens": 14683340,
+  "output_tokens": 83219,
+  "llm_calls": 443,
+  "cost_usd": 23.886282100000017,
+  "build_status": "artifact_red",
+  "build_output": "dependency-manifest: el código importa paquetes no declarados en requirements/pyproject: `aiosmtpd`. Añade pin `paquete==x.y.z` al manifiesto del host antes de entregar.",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "7dd2566bd0c9f3c4673816fbd5082eb44cb37ef2",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
