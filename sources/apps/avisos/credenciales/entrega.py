@@ -515,7 +515,9 @@ TRAZA_SOLICITUD_PREEXISTENTE = "La solicitud de aviso de credencial ya estaba en
 
 #: Motivo de no haber llegado siquiera a intentar la entrega. Va a `aviso_correo_intento.error_message`
 #: (maximo 500 caracteres), asi que es tecnico y sin acentos, y nombra la tabla donde mirar.
-SIN_CONFIGURACION_SMTP = "No hay configuracion SMTP activa y completa en `configuracion_smtp`: el aviso de credencial no se intenta entregar."
+SIN_CONFIGURACION_SMTP = (
+    "No hay configuracion SMTP activa y completa en `configuracion_smtp`: el aviso de credencial no se intenta entregar."
+)
 
 #: Motivo de un fallo que el transporte no supo clasificar. Se registra como intento REINTENTABLE
 #: porque un error desconocido no demuestra que el correo sea inentregable, solo que esta entrega no
@@ -625,6 +627,7 @@ class ResultadoEntregaCredencial:
         """
 
         return cls(entregado=False, notification_id=notification_id, omitida=True)
+
 
 class ServicioEntregaCredencial:
     """
@@ -968,7 +971,7 @@ class ServicioEntregaCredencial:
                         cuerpo_html=contenido.body_html,
                     )
                 )
-            except Exception:  # noqa: BLE001 - el transporte NO puede tumbar una peticion ya comprometida
+            except Exception:
                 # El contrato del puerto dice que `enviar` no lanza, pero un transporte mal
                 # implementado no puede llevarse por delante un alta que ya esta confirmada. El
                 # detalle de la excepcion queda en el log (su `repr` no publica la credencial: ver
