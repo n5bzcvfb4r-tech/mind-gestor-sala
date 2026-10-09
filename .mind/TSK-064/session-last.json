@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-064",
+  "attempt": 1,
+  "at": "2026-10-09T10:33:08.480546+00:00",
+  "construction_id": "51e97585-b86c-4242-bf21-d9b7f3fc0c47",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-064 · Custodia de credenciales: hashing con sal, política única e historial (ARC-013)\n\n## Qué se ha construido\n\nZona nueva `sources/apps/identidad/credenciales/` (6 módulos + paquete de tests), extendiendo la app `identidad` de TSK-02 y REUTILIZANDO sus entidades: no se ha redeclarado ningún modelo ni ninguna ruta de sesión; `UsuarioEntity` y `UsuarioPasswordHistoricoEntity` se consumen desde `apps.core.models` (todas `managed=False`, DDL gobernado por Liquibase).\n\n- `politica.py` — **políti",
+  "model": "claude-opus-5",
+  "input_tokens": 5196434,
+  "output_tokens": 39764,
+  "llm_calls": 193,
+  "cost_usd": 10.509432549999993,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "unavailable",
+  "environment_detail": "no hay engine Docker alcanzable (DOCKER_HOST=tcp://docker-proxy:2375): failed to connect to the docker API at tcp://docker-proxy:2375: lookup docker-proxy on 127.0.0.11:53: no such host",
+  "schema_status": "skipped",
+  "commit_sha": "4e1897f66bbb65f9c23b2325c76f32809b15f828",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}
