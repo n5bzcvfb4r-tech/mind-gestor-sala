@@ -42,6 +42,16 @@ from apps.identidad.bloqueo.politica import EstadoBloqueo, PoliticaBloqueo
 from apps.identidad.bloqueo.servicio import ServicioBloqueoCuenta
 
 
+# LA VISTA DE EP-018 (`views.DesbloqueoCuentaView`) NO SE RE-EXPORTA AQUI, Y ES DELIBERADO.
+# Se ha comprobado: `apps.identidad.bloqueo.views` importa `UsuarioEntity` y la guardia de
+# permisos, que arrastran `apps.core.models` y DRF, y ese import ANTES de `django.setup()`
+# revienta con `AppRegistryNotReady: Apps aren't loaded yet.`. Como el paquete lo importa
+# `apps.identidad.autenticacion.servicio` -y este, a su vez, cadenas que pueden evaluarse
+# durante el arranque-, colgar la vista de la fachada convertiria el orden de importacion del
+# proyecto en algo fragil. El unico consumidor de la vista es `apps.identidad.urls`, que ya la
+# importa por su ruta completa y se carga cuando el registro de apps esta listo.
+
+
 __all__ = [
     "CuentaBloqueadaTemporalmenteError",
     "CuentaInactivaError",
