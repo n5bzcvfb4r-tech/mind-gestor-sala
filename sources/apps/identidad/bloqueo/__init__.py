@@ -27,8 +27,9 @@ Este modulo es la FACHADA del paquete: los consumidores importan desde
 `apps.identidad.bloqueo` y no desde los submodulos, para que la reorganizacion interna no
 rompa a nadie. Aqui NO vive logica alguna: solo re-exportacion.
 
-Importar el paquete es seguro ANTES de `django.setup()`: la politica es dominio puro y lee
-`settings` de forma PEREZOSA dentro del constructor, nunca al importar.
+Importar el paquete es seguro ANTES de `django.setup()`: la politica es dominio puro, el
+servicio difiere el import de modelos al cuerpo de sus funciones y `settings` se lee de
+forma PEREZOSA dentro de los constructores, nunca al importar.
 """
 
 from apps.identidad.bloqueo.errores import (
@@ -38,6 +39,7 @@ from apps.identidad.bloqueo.errores import (
     UsuarioNoEncontradoError,
 )
 from apps.identidad.bloqueo.politica import EstadoBloqueo, PoliticaBloqueo
+from apps.identidad.bloqueo.servicio import ServicioBloqueoCuenta
 
 
 __all__ = [
@@ -46,5 +48,6 @@ __all__ = [
     "CuentaNoBloqueadaError",
     "EstadoBloqueo",
     "PoliticaBloqueo",
+    "ServicioBloqueoCuenta",
     "UsuarioNoEncontradoError",
 ]
