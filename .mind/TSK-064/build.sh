@@ -15,7 +15,13 @@ export PYTHONPATH="$RAIZ/sources"
 case "${1:-check}" in
   check)  exec "$PY" manage.py check "${@:2}" ;;
   smoke)  exec "$PY" -c "import django,os;os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings');django.setup();from config.urls import urlpatterns;print('urls OK', len(urlpatterns))" ;;
-  test)   exec "$PY" -m pytest -p no:cacheprovider --no-cov "${@:2}" ;;
+  test)
+    # `--no-cov` solo es valido si pytest-cov esta instalado; en este venv NO lo esta y el flag
+    # abortaba pytest con "unrecognized arguments". Se anade solo cuando el plugin existe.
+    SIN_COV=()
+    if "$PY" -c "import pytest_cov" >/dev/null 2>&1; then SIN_COV=(--no-cov); fi
+    exec "$PY" -m pytest -p no:cacheprovider "${SIN_COV[@]}" "${@:2}"
+    ;;
   lint)   exec ruff check "${@:2}" ;;
   *)      exec "$PY" "$@" ;;
 esac

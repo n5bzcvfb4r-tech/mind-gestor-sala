@@ -23,18 +23,30 @@ los tres casos debe ser INFERIOR A 50 ms sobre 100 intentos.
 
 Por eso aqui NO hay short-circuit en los caminos indistinguibles:
 
-* Cuando el usuario NO existe se verifica igualmente la contrasenia recibida contra un HASH
-  SENUELO precalculado con el MISMO algoritmo y los MISMOS parametros de coste que los hashes
-  reales (`make_password` usa el primer elemento de `PASSWORD_HASHERS`, Argon2id). Se consume
-  asi el mismo trabajo criptografico que en el camino "el usuario existe".
+* Cuando el usuario NO existe se verifica igualmente la contrasenia recibida: se pasa un hash
+  AUSENTE (`None`) al servicio de custodia, que lo sustituye por su HASH SENUELO -mismo
+  algoritmo y mismos parametros de coste que los hashes reales, Argon2id- y consume asi el
+  mismo trabajo criptografico que en el camino "el usuario existe".
 * Cuando el usuario existe pero esta INACTIVO se verifica contra su hash real, exactamente
   igual que si estuviera activo; el estado solo participa en la decision final.
 * La decision se ACUMULA en una variable booleana y la excepcion se lanza UNA SOLA VEZ, al
   final, despues de haber hecho siempre el mismo trabajo.
 
-El hash senuelo se calcula UNA vez por proceso y se cachea (`functools.lru_cache`): hacerlo
-en cada intento seria correcto en tiempo pero gastaria CPU sin motivo, y hacerlo en el import
-encareceria el arranque del servicio.
+LA VERIFICACION LA HACE EL SERVICIO UNICO DE CUSTODIA (REQ-054, REQ-069)
+------------------------------------------------------------------------
+Este modulo ya NO calcula ni compara hashes por su cuenta: delega en
+`apps.identidad.credenciales.ServicioCustodiaCredenciales.verificar`, que es el UNICO punto del
+servicio que hashea una contrasenia y el unico que la compara en tiempo constante (REQ-054:
+«verificacion en login -> recalculo y comparacion en tiempo constante»). Mantener aqui una
+segunda implementacion de la misma comprobacion era justo el defecto que REQ-069 prohibe:
+bastaria con endurecer una de las dos -o cambiar de hasher en una sola- para que la misma
+credencial se tratase de forma distinta segun la puerta por la que entrase.
+
+EL SENUELO TAMBIEN LO APORTA ESE SERVICIO, y por eso ya no vive en este fichero. `verificar`
+acepta un `password_hash` ausente o vacio y, en ese caso, verifica igualmente contra su propio
+hash senuelo, calculado una vez por proceso y cacheado. La propiedad de indistinguibilidad
+temporal se conserva intacta -el trabajo Argon2id se hace SIEMPRE, exista o no el usuario-,
+pero deja de depender de que dos modulos mantengan por separado senuelos de coste equivalente.
 
 CUENTA BLOQUEADA, CASO APARTE A PROPOSITO
 -----------------------------------------
@@ -51,36 +63,16 @@ logs, trazas ni mensajes de error. Este modulo no registra ninguna traza por ese
 """
 
 from datetime import datetime
-from functools import lru_cache
-
-from django.contrib.auth.hashers import check_password, make_password
 
 from apps.core.contexto import ContextoSesion, contexto_de_sesion, utc_now
 from apps.core.models import UsuarioEntity
 from apps.core_security.errores import CredencialesInvalidasError, CuentaBloqueadaError
+from apps.identidad.credenciales import ServicioCustodiaCredenciales
 
 # Valor del enumerado cerrado `ck_usuario_status_enum` que habilita el acceso. Se replica como
 # literal local -y no se importa de otro servicio- para no crear una dependencia circular
 # cuando la capa de sesion delegue en este servicio.
 ESTADO_USUARIO_ACTIVO = "ACTIVO"
-
-# Texto interno del que se deriva el hash senuelo. NO es una credencial: no se persiste, no
-# autentica a nadie y ninguna cuenta puede tenerlo, porque el hash que produce solo vive en
-# memoria y jamas se compara contra una fila real. Su unica funcion es dar a `check_password`
-# algo valido contra lo que trabajar cuando el usuario no existe.
-_TEXTO_SENUELO = "credencial-senuelo-sin-uso-real"
-
-
-@lru_cache(maxsize=1)
-def _hash_senuelo() -> str:
-    """
-    Hash senuelo del proceso, calculado de forma PEREZOSA y una sola vez.
-
-    Lo produce `make_password`, que usa el primer hasher de `PASSWORD_HASHERS` (Argon2id), de
-    modo que verificarlo cuesta lo mismo que verificar el hash real de cualquier usuario.
-    """
-
-    return make_password(_TEXTO_SENUELO)
 
 
 class ServicioAutenticacion:
@@ -91,7 +83,15 @@ class ServicioAutenticacion:
     sesiones), no toca el contador de intentos fallidos mas alla de ponerlo a cero tras un
     inicio de sesion correcto (REQ-053 RN-04) y no escribe `locked_until`: el umbral de
     bloqueo lo gobierna el flujo de intentos fallidos, fuera de esta unidad.
+
+    La comprobacion de la credencial NO se hace aqui: la aporta
+    `ServicioCustodiaCredenciales`, el servicio unico de hashing y verificacion (REQ-054,
+    REQ-069). Se recibe por constructor con un valor por defecto para que el consumidor
+    habitual no tenga que construirlo y una prueba pueda inyectar el suyo.
     """
+
+    def __init__(self, custodia: ServicioCustodiaCredenciales | None = None) -> None:
+        self._custodia = custodia if custodia is not None else ServicioCustodiaCredenciales()
 
     def autenticar(self, username: str, password: str) -> UsuarioEntity:
         """
@@ -109,10 +109,11 @@ class ServicioAutenticacion:
 
         usuario = self._buscar_usuario(username)
 
-        # Siempre se verifica UN hash: el real si el usuario existe, el senuelo si no. Nunca
-        # se salta este paso, porque saltarlo es exactamente lo que delata el caso por tiempo.
-        hash_a_verificar = usuario.password_hash if usuario is not None else _hash_senuelo()
-        contrasenia_correcta = check_password(password, hash_a_verificar)
+        # Siempre se verifica UN hash: el real si el usuario existe y, si no, el senuelo que el
+        # propio servicio de custodia pone cuando recibe un hash ausente. Nunca se salta este
+        # paso, porque saltarlo es exactamente lo que delata el caso por tiempo.
+        hash_a_verificar = usuario.password_hash if usuario is not None else None
+        contrasenia_correcta = self._custodia.verificar(password, hash_a_verificar)
 
         # Decision ACUMULADA: los tres casos indistinguibles recorren el mismo camino y
         # confluyen en un unico `raise` al final del bloque.
