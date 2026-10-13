@@ -1,5 +1,16 @@
 """
-Resolucion del contexto de autorizacion de la peticion: el rol SIEMPRE se relee de la base.
+Fachada de ARC-012 sobre el contexto de autorizacion: el rol SIEMPRE se relee de la base.
+
+QUIEN HACE QUE
+--------------
+La LECTURA FAIL-CLOSED del rol efectivo YA NO se implementa aqui: la PROVEE
+`apps.usuarios.autorizacion` (ARC-013), que es el proveedor unico de esa logica y el unico
+evaluador de la matriz. `ServicioAutorizacion.rol_efectivo()` relee la fila de `usuario`,
+comprueba estado y pertenencia a `cat_rol` y lanza los mismos errores de siempre.
+
+Lo que SIGUE SIENDO de ARC-012 y NO se redeclara en el dominio es lo que queda en este modulo:
+el DESCARTE ESTRUCTURAL de la identidad enviada por el cliente y el REFRESCO DE CAPACIDADES de
+la fila de `sesion_usuario`.
 
 REQ-018. En cada peticion autenticada el backend obtiene el `role_code` de la tabla `usuario`
 a partir del `session_user_id` de la sesion. Cualquier rol, alcance o identificador de usuario
@@ -7,11 +18,12 @@ que el cliente envie en el cuerpo, en la query string o en una cabecera se desca
 SILENCIO: no produce error ni 400, simplemente no participa en ninguna decision. El descarte
 es ESTRUCTURAL, no una limpieza defensiva: `ResolutorContextoSesion.resolver()` solo recibe la
 fila de `sesion_usuario`, de modo que le resulta imposible leer el payload aunque alguien
-quisiera hacerlo.
+quisiera hacerlo, y lo unico que le pasa al dominio es el `user_id` de esa fila.
 
 FAIL-CLOSED (REQ-018, AC-ROL-02). Si el usuario no tiene rol, si su rol no pertenece a
 `cat_rol` o si esta inactivo, se deniega con 403 y el texto uniforme `mensajes.SIN_PERMISOS`;
-nunca se degrada a un permiso mas amplio ni se asume un rol por defecto.
+nunca se degrada a un permiso mas amplio ni se asume un rol por defecto. Quien lo decide -y
+quien lanza- es el dominio: aqui solo se propaga.
 
 SIN RELOGIN (REQ-011, AC-PERM-05). Releer el rol en cada peticion es justo lo que hace que un
 cambio de rol del ADMINISTRADOR surta efecto en la SIGUIENTE peticion del usuario sin obligarle
@@ -25,16 +37,13 @@ jamas de un `user_id` enviado por el cliente.
 SECRETOS (REQ-063, REQ-076). El `session_id` es una credencial: no se escribe en ningun log ni
 traza de este modulo. Para identificar la sesion en las trazas se usa el `session_user_id`.
 """
-
 import logging
 
 from django.http import HttpRequest
 
 from apps.core.contexto import ContextoSesion, utc_now
-from apps.core.models.catalogos import RolEntity
-from apps.core.models.transaccional import SesionUsuarioEntity, UsuarioEntity
-from apps.core_security.errores import RolNoResolubleError, SesionInvalidaError
-from apps.core_security.servicios.sesiones import ESTADO_USUARIO_ACTIVO
+from apps.core.models.transaccional import SesionUsuarioEntity
+from apps.usuarios.autorizacion.servicio import ServicioAutorizacion
 
 
 logger = logging.getLogger(__name__)
@@ -134,52 +143,46 @@ class ResolutorContextoSesion:
 
     La resolucion es FAIL-CLOSED: usuario inexistente, usuario inactivo, usuario sin rol o rol
     fuera del catalogo cortan la peticion; en ningun caso se sustituye por un rol mas amplio ni
-    por un valor por defecto.
+    por un valor por defecto. Esa lectura la PROVEE `apps.usuarios.autorizacion` (ARC-013); lo
+    propio de este resolutor es recibir SOLO la fila de sesion y refrescar sus capacidades.
     """
+
+    def __init__(self) -> None:
+        self._autorizacion = ServicioAutorizacion()
 
     def resolver(self, sesion: SesionUsuarioEntity) -> ContextoSesion:
         """
         Resuelve la identidad efectiva de la peticion releyendo al usuario de la base de datos.
 
         Recibe UNICAMENTE la fila de sesion: no tiene acceso a la peticion, de modo que no puede
-        leer rol, alcance ni `user_id` del cliente ni por error ni por descuido (REQ-018).
+        leer rol, alcance ni `user_id` del cliente ni por error ni por descuido (REQ-018). Lo
+        unico que viaja al dominio es el `session_user_id` de esa fila.
 
-        Lanza `SesionInvalidaError` (401) si la sesion apunta a un usuario que ya no existe, y
-        `RolNoResolubleError` (403, `mensajes.SIN_PERMISOS`) si el rol no se puede resolver.
+        La relectura del rol y sus cuatro comprobaciones fail-closed -existencia, estado, rol
+        asignado y pertenencia a `cat_rol`, EN ESE ORDEN- las hace integramente
+        `ServicioAutorizacion.rol_efectivo()`, que es el proveedor unico de esa regla.
+
+        Propaga `SesionInvalidaError` (401, motivo `usuario_no_encontrado`) si la sesion apunta
+        a un usuario que ya no existe, y `RolNoResolubleError` (403, `mensajes.SIN_PERMISOS`,
+        motivos `usuario_inactivo`, `sin_rol` o `rol_desconocido`) si el rol no se puede
+        resolver. El orden de comprobacion es parte del contrato y lo fija el dominio: invertirlo
+        cambiaria el codigo de estado de casos ya acreditados por las pruebas.
         """
 
-        usuario = UsuarioEntity.objects.select_related("role_code").filter(pk=sesion.user_id).first()
-        if usuario is None:
-            # No es un problema de permisos sino de sesion: la credencial apunta a un usuario
-            # que ya no esta, asi que la sesion deja de autenticar a nadie.
-            raise SesionInvalidaError(motivo="usuario_no_encontrado")
+        identidad = self._autorizacion.rol_efectivo(sesion.user_id)
 
-        if usuario.status != ESTADO_USUARIO_ACTIVO:
-            # REQ-018, campo `is_active`: "false -> 403 sin efecto". La peticion se deniega y no
-            # produce ningun cambio.
-            raise RolNoResolubleError(motivo="usuario_inactivo")
-
-        role_code: str = usuario.role_code_id
-        if not role_code:
-            raise RolNoResolubleError(motivo="sin_rol")
-
-        # Se comprueba la pertenencia al catalogo aunque Oracle declare la clave ajena: es la
-        # validacion explicita FAIL-CLOSED que exige REQ-018 (un `role_code` fuera de `cat_rol`
-        # no concede ningun permiso) y cubre el caso de una fila escrita por fuera del ORM.
-        # NO se filtra por `is_active`: el brief no declara que un rol dado de baja logica
-        # deniegue, y aqui no se inventan reglas de negocio.
-        if not RolEntity.objects.filter(pk=role_code).exists():
-            raise RolNoResolubleError(motivo="rol_desconocido")
+        # `role_code` ya no puede ser `None` aqui: el dominio ha denegado antes si lo era.
+        role_code: str = identidad.role_code or ""
 
         self.refrescar_capacidades(sesion, role_code)
 
         # `data_scope` se deja en su valor por defecto del dataclass: el alcance efectivo es POR
         # OPERACION y lo resuelve la matriz `permiso_rol_operacion`, no este resolutor.
         return ContextoSesion(
-            user_id=usuario.user_id,
+            user_id=identidad.user_id,
             role_code=role_code,
             session_id=sesion.session_id,
-            display_name=usuario.full_name,
+            display_name=identidad.full_name,
         )
 
     def refrescar_capacidades(self, sesion: SesionUsuarioEntity, role_code_vigente: str) -> bool:
