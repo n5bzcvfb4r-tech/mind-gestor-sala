@@ -1,0 +1,29 @@
+{
+  "task_code": "TSK-072",
+  "attempt": 1,
+  "at": "2026-10-13T10:19:15.337480+00:00",
+  "construction_id": "8fc6c02d-a495-46c7-a360-e2e4c0d69720",
+  "status": "delivered",
+  "delivered": true,
+  "error": null,
+  "summary": "TSK-072 — Resolución del rol efectivo y matriz rol × operación con denegación por defecto.\n\nQUÉ SE HA CONSTRUIDO (zona `sources/apps/usuarios/autorizacion/`, arquetipo container-python/Django respetado):\n1. `repositorio.py` — `RepositorioAutorizacion` (solo lectura, sin transacciones, sin decidir): `identidad_de(user_id)` lee `role_code` y `status` de la tabla `usuario`; `rol_pertenece_al_catalogo()` contra `cat_rol`; `permiso_de(role, operation)` y `permisos_de_rol()` contra `permiso_rol_operac",
+  "model": "claude-opus-5",
+  "input_tokens": 21256350,
+  "output_tokens": 93156,
+  "llm_calls": 272,
+  "cost_usd": 17.99499195,
+  "build_status": "green",
+  "build_output": "",
+  "environment_status": "realized",
+  "environment_detail": "oracle=gvenzl/oracle-free:23-slim",
+  "schema_status": "skipped",
+  "commit_sha": "ca0d1a5708920152d1049cd1d47a39b7d7f4fae3",
+  "browser_status": "skipped",
+  "browser_coverage": {
+    "mapped": [],
+    "unmapped": [],
+    "tagged_specs_found": [],
+    "canonical_ran": false,
+    "selection_strategy": "none"
+  }
+}

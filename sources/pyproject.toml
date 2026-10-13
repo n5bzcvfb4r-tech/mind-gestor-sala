@@ -26,7 +26,16 @@ dependencies = [
     "djangorestframework==3.16.1",  # import: rest_framework
     "drf-spectacular==0.28.0",  # import: drf_spectacular
     "drf-spectacular-sidecar==2025.9.1",
-    "oracledb==3.4.1",
+    # Driver Oracle en modo thin (dialecto `django.db.backends.oracle`). SE QUEDA EN LA SERIE 2.x
+    # A PROPOSITO: python-oracledb 3.x convirtio `oracledb.Binary` de alias de `bytes` en una
+    # FUNCION, y el backend Oracle de Django 5.2.7 todavia hace
+    # `isinstance(param, (Database.Binary, datetime.timedelta))` (django/db/backends/oracle/base.py:441),
+    # de modo que CUALQUIER consulta revienta con
+    # `TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union`.
+    # Verificado en esta sesion contra el Oracle 23ai real: con 3.4.1 no se puede ni leer `cat_rol`;
+    # con 2.5.1 el mismo codigo consulta sin tocar nada mas. El pin cumple ademas el handbook
+    # ("python-oracledb thin 2.5.x o superior"). No subir a 3.x hasta que Django lo soporte.
+    "oracledb==2.5.1",
     "python-json-logger==4.0.0",  # import: pythonjsonlogger
     # Argon2id: hasher de la credencial de usuario (PASSWORD_HASHERS). Lo importa Django
     # a traves de `django.contrib.auth.hashers.Argon2PasswordHasher`.

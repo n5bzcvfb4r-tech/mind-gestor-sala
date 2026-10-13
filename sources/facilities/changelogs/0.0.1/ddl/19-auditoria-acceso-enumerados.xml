@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!--
+        TSK-072 (AC-ROL-06, REQ-044 RN-04). La traza de accesos denegados NO se estaba
+        escribiendo: ni una sola fila llegaba a `auditoria_acceso`. La causa son dos CHECK del
+        changeset `ddl-0.0.1-09-01` que no casan con el enumerado del modelo T.5 (ARC-117) ni
+        con lo que escribe el codigo de producto.
+
+        VERIFICADO CONTRA EL ORACLE 23ai REAL de la sesion antes de escribir este changelog:
+        una denegacion 403 de un EMPLEADO sobre `/api/users` producia
+        `ORA-02290: check constraint (CK_AUDITORIA_EVENT_TYPE) violated`, y la denegacion 401
+        `ORA-02290: ... (CK_AUDITORIA_USER_NULO) violated`. Como la escritura de la traza es
+        best-effort -no puede convertir un 403 limpio en un 500-, el fallo se tragaba en un
+        `logger.error` y el hueco de evidencia pasaba inadvertido: la API respondia bien y la
+        auditoria quedaba vacia.
+
+        Se corrige con una REVISION NUEVA, nunca editando la ya promocionada.
+    -->
+
+    <changeSet id="ddl-0.0.1-19-01" author="MIND">
+        <comment>Enumerado de event_type de auditoria_acceso alineado con el modelo T.5 (ARC-117)</comment>
+        <!--
+            T.5 ARC-117 fija `event_type` como
+            LOGIN_OK|LOGIN_FAILED|ACCOUNT_LOCKED|ACCOUNT_UNLOCKED|LOGOUT|PERMISSION_DENIED|PASSWORD_CHANGED|PASSWORD_RESET,
+            en MAYUSCULAS, y es lo que escriben TODOS los puntos de producto que auditan:
+            `apps.core_security.auditoria.EVENTO_PERMISO_DENEGADO = "PERMISSION_DENIED"`,
+            `apps.identidad.bloqueo.auditoria` (LOGIN_FAILED, ACCOUNT_LOCKED, ACCOUNT_UNLOCKED) y
+            `apps.identidad.reposicion.auditoria` (PASSWORD_RESET).
+
+            El CHECK original listaba cinco valores EN MINUSCULAS, de modo que rechazaba el 100 %
+            de los INSERT del servicio y ademas no contemplaba ACCOUNT_UNLOCKED, PASSWORD_CHANGED
+            ni PASSWORD_RESET. Aqui manda el modelo de datos aprobado (schema-names): se recrea el
+            CHECK con el enumerado completo y en mayusculas, sin tocar ninguna columna.
+        -->
+        <sql>ALTER TABLE auditoria_acceso DROP CONSTRAINT ck_auditoria_event_type</sql>
+        <sql>ALTER TABLE auditoria_acceso ADD CONSTRAINT ck_auditoria_event_type CHECK (event_type IN ('LOGIN_OK','LOGIN_FAILED','ACCOUNT_LOCKED','ACCOUNT_UNLOCKED','LOGOUT','PERMISSION_DENIED','PASSWORD_CHANGED','PASSWORD_RESET'))</sql>
+        <rollback>
+            <sql>ALTER TABLE auditoria_acceso DROP CONSTRAINT ck_auditoria_event_type</sql>
+            <sql>ALTER TABLE auditoria_acceso ADD CONSTRAINT ck_auditoria_event_type CHECK (event_type IN ('login_ok','login_failed','account_locked','logout','permission_denied'))</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="ddl-0.0.1-19-02" author="MIND">
+        <comment>user_id puede ser nulo tambien en la denegacion sin sesion (REQ-044: outcome DENIED_401)</comment>
+        <!--
+            REQ-044 declara `user_id` como OPCIONAL en la traza de accesos denegados y lo dice sin
+            ambiguedad: "Nulo si la peticion no estaba autenticada (401)". AC-ROL-06 exige ademas
+            una entrada para el 100 % de los intentos denegados, de modo que el 401 TIENE que poder
+            registrarse: es justo el intento del que menos se sabe y del que mas interesa la traza.
+
+            El CHECK original solo admitia `user_id` nulo con `event_type = 'login_failed'`, asi que
+            convertia en imposible la fila que el requisito describe. Se amplia con el caso de la
+            denegacion no autenticada, identificada por su `outcome` observable (`DENIED_401`), y se
+            conserva la regla de fondo: cualquier otro evento sigue exigiendo a quien atribuirselo.
+        -->
+        <sql>ALTER TABLE auditoria_acceso DROP CONSTRAINT ck_auditoria_user_nulo</sql>
+        <sql>ALTER TABLE auditoria_acceso ADD CONSTRAINT ck_auditoria_user_nulo CHECK (user_id IS NOT NULL OR event_type = 'LOGIN_FAILED' OR outcome = 'DENIED_401')</sql>
+        <rollback>
+            <sql>ALTER TABLE auditoria_acceso DROP CONSTRAINT ck_auditoria_user_nulo</sql>
+            <sql>ALTER TABLE auditoria_acceso ADD CONSTRAINT ck_auditoria_user_nulo CHECK (user_id IS NOT NULL OR event_type = 'login_failed')</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
